@@ -1,0 +1,15 @@
+INSTAGRAM BOT SCHEDULER - INSTRUCTIONS
+
+The desktop shortcut "Instagram Bot Scheduler" will:
+1. Run with administrator privileges (required for scheduling tasks)
+2. Set up the Instagram bot to run every 45 minutes
+3. Start the first run immediately
+
+IMPORTANT NOTES:
+- The bot will continue to run in the background according to the schedule
+- Each run is limited to 5 minutes maximum to prevent Instagram rate limits
+- You can check the status anytime by running: schtasks /query /tn "Instagram Bot" /fo list
+- To stop the scheduled task, run: schtasks /end /tn "Instagram Bot"
+- To remove the scheduled task, run: schtasks /delete /tn "Instagram Bot" /f
+
+If you want to modify the schedule, edit the setup-scheduler.ps1 file and run the shortcut again.

@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+build/
+dist/
+
+# Logs
+*.log
+logs/
+*.gz
+agent-startup.log
+combined.log
+connection-test.log
+error.log
+instagram-bot.log
+
+# Environment and secrets
+.env
+.env.local
+*.env
+supabase-env.txt
+secret/
+cookies/
+*.json
+!package.json
+!tsconfig.json
+!jest.config.mjs
+!ecosystem.config.js
+
+# Artifacts and screenshots
+artifacts/
+*.png
+!google.png
+!httpbin.png
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Test outputs
+test-output.txt
+comprehensive-test-output.txt
+
+# Temporary files
+query
+*.backup.*
+
