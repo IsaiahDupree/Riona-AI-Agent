@@ -38,6 +38,13 @@ import {
     processPosts
 } from './Instagram-Core';
 
+// Import DM functionality
+import {
+    processDMs,
+    initDMStorage,
+    DMProcessResult
+} from './InstagramDM';
+
 // Load environment variables
 dotenv.config();
 
@@ -385,6 +392,43 @@ export class InstagramAI {
         }
     }
 
+    async processDMs(options: { autoRespond?: boolean; maxConversations?: number; trace?: any } = {}): Promise<DMProcessResult | null> {
+        try {
+            if (!this.page) {
+                throw new Error('Page not initialized');
+            }
+
+            logger.info('Processing DMs', {
+                component: 'Instagram-AI',
+                event: 'dm_processing_start',
+                autoRespond: options.autoRespond
+            });
+
+            const result = await processDMs(this.page, {
+                maxConversations: options.maxConversations || 5,
+                autoRespond: options.autoRespond || false,
+                onlyUnread: true,
+                trace: options.trace
+            });
+
+            logger.info('DM processing completed', {
+                component: 'Instagram-AI',
+                event: 'dm_processing_complete',
+                conversationsProcessed: result.conversationsProcessed,
+                messagesSent: result.messagesSent
+            });
+
+            return result;
+        } catch (error) {
+            logger.error('Error processing DMs:', {
+                error: error instanceof Error ? error.message : String(error),
+                component: 'Instagram-AI',
+                event: 'dm_processing_error'
+            });
+            return null;
+        }
+    }
+
     async processHashtagFeed(hashtag: string): Promise<void> {
         try {
             if (!this.page) {
@@ -539,6 +583,23 @@ export async function startInteractionLoop(username: string, trace?: any): Promi
                 if (trace) pushStep(trace, { name: `process_batch_${batchCount}`, status: 'ok' });
                 await instagramAI.processHomeFeed(trace);
 
+                // Process DMs (check every batch)
+                const dmEnabled = process.env.INSTAGRAM_DM_ENABLED === 'true';
+                const dmAutoRespond = process.env.INSTAGRAM_DM_AUTO_RESPOND === 'true';
+                if (dmEnabled) {
+                    if (trace) pushStep(trace, { name: `process_dms_batch_${batchCount}`, status: 'ok' });
+                    try {
+                        await instagramAI.processDMs({
+                            autoRespond: dmAutoRespond,
+                            maxConversations: 5,
+                            trace
+                        });
+                    } catch (dmError: any) {
+                        logger.warn('DM processing failed, continuing with main loop:', dmError?.message);
+                        if (trace) pushStep(trace, { name: `dms_error_batch_${batchCount}`, status: 'error', notes: dmError?.message });
+                    }
+                }
+
                 // If limit is configured, re-check after batch
                 if (dailyLimit > 0) {
                     const used = await countCommentsToday();
@@ -594,6 +655,10 @@ export async function runInstagram(externalTrace?: any): Promise<void> {
         // Initialize Storage
         pushStep(trace, { name: 'init_storage', status: 'ok' });
         await initStorage();
+
+        // Initialize DM Storage
+        pushStep(trace, { name: 'init_dm_storage', status: 'ok' });
+        await initDMStorage();
 
         pushStep(trace, { name: 'start_automation_loop', status: 'ok' });
         await startInteractionLoop(username, trace);
