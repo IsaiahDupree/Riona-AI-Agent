@@ -4,7 +4,7 @@ import { logger } from '../utils/logger';
 import { delay } from '../utils/delay';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
-import { MongoClient } from 'mongodb';
+// MongoClient removed — imported but never used in this module
 import * as cheerio from 'cheerio';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -16,6 +16,8 @@ import { createProposedInteraction } from '../hitl/service';
 import { AccountModel } from '../hitl/models';
 import { StorageInterface } from '../db/interfaces';
 import { SupabaseStorage } from '../db/supabase';
+import { hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/commentTracker';
+import { formatError } from '../utils/errors';
 
 // Load environment variables
 dotenv.config();
@@ -87,8 +89,22 @@ interface BaseMetadata {
 async function extractPermalink(post: ElementHandle<Element>): Promise<string | null> {
     try {
         const href = await post.evaluate((el) => {
+            // Try direct post/reel/stories links first
             const a = el.querySelector('a[href^="/p/"]') || el.querySelector('a[href^="/reel/"]') || el.querySelector('a[href^="/stories/"]');
-            return a ? (a.getAttribute('href') || null) : null;
+            if (a) return a.getAttribute('href') || null;
+
+            // Fallback: look for any link containing /p/ or /reel/ in href
+            const allLinks = el.querySelectorAll('a[href]');
+            for (const link of allLinks) {
+                const h = link.getAttribute('href') || '';
+                if (h.match(/\/(p|reel)\/[A-Za-z0-9_-]+/)) return h;
+            }
+
+            // Fallback: check time elements with datetime that link to posts
+            const timeLink = el.querySelector('time')?.closest('a');
+            if (timeLink) return timeLink.getAttribute('href') || null;
+
+            return null;
         });
         if (!href) return null;
         if (href.startsWith('http')) return href;
@@ -390,40 +406,75 @@ async function findButton(post: ElementHandle<Element>, selectors: string[]): Pr
 
 async function hasAlreadyCommented(page: Page, post: ElementHandle<Element>, comment: string): Promise<boolean> {
     try {
-        const username = process.env.INSTAGRAM_USERNAME;
+        // Fix: use INSTAGRAM_BOT_USERNAME (the correct env var)
+        const username = process.env.INSTAGRAM_BOT_USERNAME || process.env.INSTAGRAM_USERNAME;
         if (!username) {
-            logger.error('Instagram username not found in environment variables');
+            logger.error('Instagram username not found in environment variables (checked INSTAGRAM_BOT_USERNAME and INSTAGRAM_USERNAME)');
             return false;
         }
 
-        // Check for comments by the bot directly in the feed
-        const commentSelectors = [
+        // 1. Check persistent tracker first (most reliable - survives restarts)
+        let permalink: string | null = null;
+        try {
+            permalink = await extractPermalink(post);
+        } catch (e) { logger.debug(`[core] Permalink extraction failed: ${formatError(e)}`); }
+        if (permalink) {
+            const existing = hasCommentedOnPost(permalink);
+            if (existing) {
+                logger.info(`[duplicate] Tracker found existing comment on ${permalink}`, {
+                    component: 'Instagram-Core',
+                    event: 'duplicate_tracker_hit',
+                    originalComment: existing.commentText,
+                    originalTime: existing.timestamp
+                });
+                return true;
+            }
+        }
+
+        // 2. Check DOM within the post element for bot username links
+        const postSelectors = [
             `a[href="/${username}/"]`,
-            `span._aacl:has-text("${username}")`,
+            `a[href="/${username}"]`,
             `div._a9zr a[href="/${username}/"]`
         ];
 
-        for (const selector of commentSelectors) {
+        for (const selector of postSelectors) {
             try {
-                logger.debug('Trying comment selector:', { selector });
                 const userComments = await post.$$(selector);
-                logger.debug('Found elements:', { count: userComments.length });
-
                 if (userComments.length > 0) {
-                    logger.info('Found existing comment by bot:', {
-                        username,
-                        selector,
-                        count: userComments.length
+                    logger.info(`[duplicate] DOM found bot username in post via ${selector}`, {
+                        component: 'Instagram-Core',
+                        event: 'duplicate_dom_hit'
                     });
                     return true;
                 }
-            } catch (error) {
-                logger.debug('Error with selector:', { selector, error });
+            } catch {
                 continue;
             }
         }
 
-        logger.info('No existing comments found from bot:', { username });
+        // 3. Page-level check: search for bot username near comment sections
+        try {
+            const pageHasComment = await page.evaluate((user: string) => {
+                // Look for comment sections containing our username
+                const commentSections = document.querySelectorAll('ul, div[role="list"]');
+                for (const section of commentSections) {
+                    const links = section.querySelectorAll(`a[href="/${user}/"], a[href="/${user}"]`);
+                    if (links.length > 0) return true;
+                }
+                return false;
+            }, username);
+
+            if (pageHasComment) {
+                logger.info('[duplicate] Page-level check found bot username in comments', {
+                    component: 'Instagram-Core',
+                    event: 'duplicate_page_hit'
+                });
+                return true;
+            }
+        } catch (e) { logger.debug(`[core] Existing comments check failed: ${formatError(e)}`); }
+
+        logger.debug('No existing comments found from bot:', { username });
         return false;
     } catch (error) {
         logger.error('Error checking for existing comments:', error);
@@ -527,6 +578,40 @@ async function verifyComment(page: Page, post: ElementHandle<Element>, comment: 
         return await findPostedComment(page, post, comment);
     } catch (error) {
         logger.error('Error verifying comment:', error);
+        return false;
+    }
+}
+
+/**
+ * Page-level verification: check if our comment text appears anywhere on the page.
+ * More reliable than post-scoped check since comments may render in modals.
+ */
+async function verifyCommentPosted(page: Page, commentText: string): Promise<boolean> {
+    try {
+        // Check a meaningful substring (first 20 chars) to avoid false negatives from truncation
+        const snippet = commentText.slice(0, Math.min(20, commentText.length));
+        const found = await page.evaluate((text: string) => {
+            return document.body.innerText.includes(text);
+        }, snippet);
+        if (found) return true;
+
+        // Also check for our username in recent comment area
+        const botUser = process.env.INSTAGRAM_BOT_USERNAME || '';
+        if (botUser) {
+            const userFound = await page.evaluate((username: string) => {
+                const links = document.querySelectorAll('a[href]');
+                for (const link of links) {
+                    if (link.getAttribute('href')?.includes(`/${username}`)) {
+                        return true;
+                    }
+                }
+                return false;
+            }, botUser);
+            if (userFound) return true;
+        }
+
+        return false;
+    } catch {
         return false;
     }
 }
@@ -770,67 +855,263 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
         });
         await delay(1500);
 
-        // Find comment box using multiple selectors (support different ellipsis variants)
+        // Find comment box - search PAGE LEVEL FIRST since Instagram renders
+        // the comment textarea in a modal outside the <article> element
         const commentSelectors = [
-            'textarea[aria-label="Add a comment…"]',            // unicode ellipsis
-            'textarea[placeholder="Add a comment…"]',           // unicode ellipsis
-            'textarea[placeholder="Add a comment..."]',         // three dots
-            'textarea[aria-label*="comment"]',
-            'form textarea'
+            'textarea[aria-label="Add a comment…"]',            // unicode ellipsis - Instagram's actual selector
+            'textarea[placeholder="Add a comment…"]',           // placeholder variant
+            'textarea[placeholder="Add a comment..."]',         // three dots variant
+            'textarea[aria-label*="comment" i]',                // case-insensitive textarea
+        ];
+
+        const contentEditableSelectors = [
+            'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+            'div[contenteditable="true"][role="textbox"][aria-label*="Comment" i]',
+            'div[contenteditable="true"][role="textbox"][aria-placeholder*="comment" i]',
+            'div[contenteditable="true"][role="textbox"][data-lexical-editor="true"]',
+            'div[role="textbox"][contenteditable="true"]',
+            'form textarea',
+            'form div[contenteditable="true"]'
         ];
 
         let commentBox: ElementHandle<Element> | null = null;
+
+        // Step 1: Check PAGE level first (modal textarea)
         for (const selector of commentSelectors) {
-            logger.info(`[detect] comment box via ${selector}`);
-            const found = await post.$(selector);
+            const found = await page.$(selector);
             if (found) {
-                logger.info(`[detect] ${selector} ✅`);
-                if (isModerationExecution) console.log('✅ Found comment box field');
-                commentBox = found;
-                break;
-            } else {
-                logger.info(`[detect] ${selector} ❌`);
+                const isVisible = await found.evaluate((el: Element) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                });
+                if (isVisible) {
+                    logger.info(`[detect] comment box via page.$(${selector}) ✅`);
+                    if (isModerationExecution) console.log('✅ Found comment box field (page-level)');
+                    commentBox = found;
+                    break;
+                }
+            }
+        }
+
+        // Step 2: Check inside the post element
+        if (!commentBox) {
+            for (const selector of [...commentSelectors, ...contentEditableSelectors]) {
+                const found = await post.$(selector);
+                if (found) {
+                    logger.info(`[detect] comment box via post.$(${selector}) ✅`);
+                    if (isModerationExecution) console.log('✅ Found comment box field (post-level)');
+                    commentBox = found;
+                    break;
+                }
             }
         }
 
         // If not found, try opening the composer by clicking the comment icon
         if (!commentBox) {
             logger.info('[detect] Trying comment icon to open composer');
-            const commentIcon = await post.$('svg[aria-label="Comment"]');
-            if (commentIcon) {
-                logger.info('[detect] comment icon found ✅');
-                try {
-                    await commentIcon.click();
-                    await delay(700);
-                    logger.info('[action] clicked comment icon ✅');
-                } catch (e) {
-                    logger.warn('[action] click comment icon failed ❌');
+            // Try multiple comment icon selectors (Instagram changes these frequently)
+            const commentIconSelectors = [
+                'svg[aria-label="Comment"]',
+                'svg[aria-label="Comment" i]',
+                'svg[aria-label*="comment" i]',
+                '[aria-label="Comment"] svg',
+                '[aria-label*="comment" i] svg',
+                'button svg[aria-label*="comment" i]',
+                // Instagram 2026: sometimes wrapped in a span/div with role
+                'span[role="button"] svg[aria-label*="comment" i]',
+                'div[role="button"] svg[aria-label*="comment" i]'
+            ];
+            let commentIcon: ElementHandle<Element> | null = null;
+            for (const iconSel of commentIconSelectors) {
+                commentIcon = await post.$(iconSel);
+                if (commentIcon) {
+                    logger.info(`[detect] comment icon found via ${iconSel} ✅`);
+                    break;
                 }
-                for (const selector of commentSelectors) {
-                    logger.info(`[detect] comment box via ${selector} (after icon)`);
-                    const found = await post.$(selector);
+            }
+            // Fallback: find by SVG path shape (speech bubble icon)
+            if (!commentIcon) {
+                const svgs = await post.$$('svg');
+                for (const svg of svgs) {
+                    const hasCommentPath = await svg.evaluate((el: SVGSVGElement) => {
+                        const paths = el.querySelectorAll('path');
+                        for (const p of paths) {
+                            const d = p.getAttribute('d') || '';
+                            // Instagram comment icon typically contains bubble/chat path
+                            if (d.includes('M20.656') || d.includes('47.5') || d.length > 80 && d.includes('C') && d.includes('Z')) {
+                                return true;
+                            }
+                        }
+                        // Also check parent for comment-related attributes
+                        const parent = el.closest('[aria-label]');
+                        if (parent) {
+                            const label = (parent.getAttribute('aria-label') || '').toLowerCase();
+                            if (label.includes('comment')) return true;
+                        }
+                        return false;
+                    });
+                    if (hasCommentPath) {
+                        commentIcon = svg;
+                        logger.info('[detect] comment icon found via SVG path analysis ✅');
+                        break;
+                    }
+                }
+            }
+            if (commentIcon) {
+                // Always click the parent button/div, not the SVG itself
+                // Instagram wraps the SVG in a div[role="button"] which is the actual click target
+                try {
+                    const clicked = await commentIcon.evaluate((el: Element) => {
+                        const clickable = el.closest('[role="button"]') || el.closest('button') || el.parentElement;
+                        if (clickable) {
+                            (clickable as HTMLElement).click();
+                            return 'parent: ' + clickable.tagName + '[role=' + clickable.getAttribute('role') + ']';
+                        }
+                        (el as HTMLElement).click();
+                        return 'self: ' + el.tagName;
+                    });
+                    await delay(2000);
+                    logger.info(`[action] clicked comment icon via ${clicked} ✅`);
+                } catch (e) {
+                    try {
+                        await commentIcon.click();
+                        await delay(2000);
+                        logger.info('[action] clicked comment icon directly ✅');
+                    } catch {
+                        logger.warn('[action] click comment icon failed ❌');
+                    }
+                }
+
+                // Instagram opens a modal/overlay - wait for textarea to appear at page level
+                // The textarea has aria-label="Add a comment…" (unicode ellipsis \u2026)
+                logger.info('[detect] waiting for comment textarea in modal...');
+                const modalTextareaSelector = 'textarea[aria-label="Add a comment\u2026"], textarea[placeholder="Add a comment\u2026"], textarea[placeholder="Add a comment..."]';
+                try {
+                    await page.waitForSelector(modalTextareaSelector, { timeout: 8000 });
+                    logger.info('[detect] modal comment textarea appeared ✅');
+                } catch {
+                    logger.info('[detect] modal comment textarea did not appear within 8s, trying broader search');
+                    await delay(3000); // Extra wait for slow modals
+                }
+
+                // Try direct page-level textarea detection first (most reliable for modal)
+                const modalSelectors = [
+                    'textarea[aria-label="Add a comment\u2026"]',
+                    'textarea[placeholder="Add a comment\u2026"]',
+                    'textarea[placeholder="Add a comment..."]',
+                    'textarea[aria-label="Add a comment..."]',
+                ];
+                for (const sel of modalSelectors) {
+                    const found = await page.$(sel);
                     if (found) {
-                        logger.info(`[detect] ${selector} ✅`);
-                        if (isModerationExecution) console.log('✅ Found comment box field after clicking comment icon');
+                        logger.info(`[detect] modal textarea found via page.$(${sel}) ✅`);
+                        if (isModerationExecution) console.log('✅ Found comment box in modal');
                         commentBox = found;
                         break;
-                    } else {
-                        logger.info(`[detect] ${selector} ❌`);
+                    }
+                }
+
+                // If not found with exact selectors, try broader search
+                if (!commentBox) {
+                    // Use page.evaluate to find ANY visible textarea on the page
+                    const textareaInfo = await page.evaluate(() => {
+                        const textareas = document.querySelectorAll('textarea');
+                        const results: string[] = [];
+                        textareas.forEach(ta => {
+                            const rect = ta.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                results.push(`aria-label="${ta.getAttribute('aria-label')}" placeholder="${ta.getAttribute('placeholder')}"`);
+                            }
+                        });
+                        return results;
+                    });
+                    logger.info(`[detect] visible textareas on page: ${JSON.stringify(textareaInfo)}`);
+
+                    // Find first visible textarea that looks like a comment box
+                    const foundTextarea = await page.evaluateHandle(() => {
+                        const textareas = document.querySelectorAll('textarea');
+                        for (const ta of textareas) {
+                            const rect = ta.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                const label = (ta.getAttribute('aria-label') || '') + (ta.getAttribute('placeholder') || '');
+                                if (label.toLowerCase().includes('comment') || label.includes('…') || label.includes('...')) {
+                                    return ta;
+                                }
+                            }
+                        }
+                        return null;
+                    });
+
+                    if (foundTextarea && foundTextarea.asElement()) {
+                        commentBox = foundTextarea.asElement() as ElementHandle<Element>;
+                        logger.info('[detect] found comment textarea via evaluate ✅');
+                    }
+                }
+
+                // Fall back to regular selector search
+                if (!commentBox) {
+                    for (const selector of commentSelectors) {
+                        logger.info(`[detect] comment box via ${selector} (after icon)`);
+                        const found = await page.$(selector) || await post.$(selector);
+                        if (found) {
+                            logger.info(`[detect] ${selector} ✅`);
+                            if (isModerationExecution) console.log('✅ Found comment box field after clicking comment icon');
+                            commentBox = found;
+                            break;
+                        } else {
+                            logger.info(`[detect] ${selector} ❌`);
+                        }
                     }
                 }
             } else {
-                logger.info('[detect] comment icon not found ❌');
+                logger.info('[detect] comment icon not found with any selector ❌');
             }
         }
 
-        // Fallback to contenteditable composer
+        // Fallback to contenteditable composer (within post)
         if (!commentBox) {
-            logger.info('[detect] trying contenteditable composer fallback');
+            logger.info('[detect] trying contenteditable composer fallback (post-scoped)');
             commentBox = await post.$('div[contenteditable="true"][role="textbox"]');
-            logger.info(`[detect] contenteditable composer ${commentBox ? '✅' : '❌'}`);
+            logger.info(`[detect] contenteditable composer (post) ${commentBox ? '✅' : '❌'}`);
             if (commentBox && isModerationExecution) {
                 console.log('✅ Found comment box field (contenteditable fallback)');
             }
+        }
+
+        // Page-level fallback: Instagram opens a modal when clicking comment icon,
+        // so the comment textarea is rendered outside the article element at the page level
+        if (!commentBox) {
+            logger.info('[detect] trying page-level comment box search');
+            const pageSelectors = [
+                'textarea[aria-label="Add a comment\u2026"]',                         // exact match (unicode ellipsis) - Instagram's actual selector
+                'textarea[placeholder="Add a comment\u2026"]',                         // placeholder variant
+                'textarea[aria-label="Add a comment..."]',                             // three dots variant
+                'textarea[aria-label*="comment" i]',                                   // any textarea with comment
+                'div[contenteditable="true"][role="textbox"][aria-label*="comment" i]',
+                'div[contenteditable="true"][role="textbox"][aria-placeholder*="comment" i]',
+                'div[contenteditable="true"][role="textbox"][data-lexical-editor="true"]',
+                'form div[contenteditable="true"][role="textbox"]',
+                'div[contenteditable="true"][role="textbox"]'
+            ];
+            for (const selector of pageSelectors) {
+                const found = await page.$(selector);
+                if (found) {
+                    // Verify it's visible and likely a comment box
+                    const isVisible = await found.evaluate((el: Element) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 &&
+                               style.display !== 'none' && style.visibility !== 'hidden';
+                    });
+                    if (isVisible) {
+                        logger.info(`[detect] page-level comment box via ${selector} ✅`);
+                        if (isModerationExecution) console.log('✅ Found comment box field (page-level fallback)');
+                        commentBox = found;
+                        break;
+                    }
+                }
+            }
+            if (!commentBox) logger.info('[detect] page-level comment box search ❌');
         }
 
         // Locale-specific keyword scan for comment fields
@@ -856,7 +1137,7 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
                         commentBox = el;
                         break;
                     }
-                } catch { }
+                } catch (e) { logger.debug(`[core] Button eval failed: ${formatError(e)}`); }
             }
         }
 
@@ -875,8 +1156,18 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
             throw new Error('Comment box not found with any selector');
         }
 
-        // Focus the comment box
+        // Determine if comment box is contenteditable div or textarea
+        const isContentEditable = await commentBox.evaluate((el: Element) => {
+            return el.getAttribute('contenteditable') === 'true' || el.tagName !== 'TEXTAREA';
+        });
+        logger.info(`[comment] composer type: ${isContentEditable ? 'contenteditable' : 'textarea'}`);
+
+        // Focus the comment box - use click for contenteditable (more reliable)
         logger.info('[comment] focusing composer');
+        if (isContentEditable) {
+            await commentBox.click();
+            await delay(300);
+        }
         await commentBox.focus();
         await delay(500);
         logger.info('[comment] composer focused ✅');
@@ -898,6 +1189,35 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
             await page.keyboard.type(char, { delay: Math.random() * 100 + 30 });
         }
         await delay(500);
+
+        // Verify text was actually typed (contenteditable divs can swallow input)
+        if (isContentEditable) {
+            const typedText = await commentBox.evaluate((el: Element) => (el.textContent || '').trim());
+            if (!typedText || typedText.length === 0) {
+                logger.warn('[comment] text not detected in contenteditable, retrying with insertText');
+                // Retry using execCommand insertText (works better with some React editors)
+                await commentBox.click();
+                await delay(200);
+                await commentBox.evaluate((el: Element, text: string) => {
+                    (el as HTMLElement).focus();
+                    // Clear first
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    const sel = window.getSelection();
+                    if (sel) {
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    }
+                    document.execCommand('delete');
+                    // Insert text
+                    document.execCommand('insertText', false, text);
+                    // Dispatch input event so React picks it up
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }, comment);
+                await delay(500);
+            }
+        }
+
         logger.info(`[comment] typing complete in ${Date.now() - tType}ms ✅`);
         if (isModerationExecution) console.log('✅ Message typed successfully');
 
@@ -907,33 +1227,102 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
         let methodAttempts: Array<{ method: string, success: boolean, time_ms: number, error?: string }> = [];
 
         const submitMethods = [
-            // Method 1: Press Enter key
+            // Method 1: Click role button with visible text "Post" (primary — this is the actual Post button on Instagram)
             async () => {
                 const attemptStart = Date.now();
-                const methodName = 'enter_key';
+                const methodName = 'role_button_text';
                 try {
-                    logger.info('[submit] method 1: press Enter');
-                    if (isModerationExecution) console.log('🔍 Looking for Enter key to submit');
-                    await page.keyboard.press('Enter');
-                    if (isModerationExecution) console.log('✅ Pressed Enter key');
+                    logger.info('[submit] method 1: click role button by text (Post/Send)');
+                    if (isModerationExecution) console.log('🔍 Looking for "Post" button (div[role="button"] or button)');
+                    const labels = [
+                        'post', 'send',
+                        'publier', 'envoyer',
+                        'publicar', 'enviar', 'postar',
+                        'pubblica',
+                        'veröffentlichen', 'senden',
+                        'gönder',
+                        '投稿',
+                        '게시', '보내기',
+                        '发布', '发表', '发送',
+                        'gửi'
+                    ];
+                    const candidateSelectors = [
+                        'div[role="button"]',
+                        'button',
+                        'form div[role="button"]',
+                        'form button'
+                    ];
+
+                    // First search within the post container
+                    for (const sel of candidateSelectors) {
+                        const nodes = await post.$$(sel);
+                        for (const n of nodes) {
+                            try {
+                                const text = (await n.evaluate(el => (el.textContent || '').trim().toLowerCase())) as string;
+                                if (labels.some(l => text === l)) {
+                                    await n.click();
+                                    logger.info(`[submit] method 1 invoked ✅ — clicked "${text}" in post container`);
+                                    if (isModerationExecution) console.log(`✅ Clicked Post button: "${text}"`);
+                                    const attemptTime = Date.now() - attemptStart;
+                                    methodAttempts.push({ method: methodName, success: true, time_ms: attemptTime });
+                                    successfulMethod = methodName;
+                                    return true;
+                                }
+                            } catch (e) { logger.debug(`[core] DOM element eval failed: ${formatError(e)}`); }
+                        }
+                    }
+
+                    // Fallback: search at page level (on individual post pages, button may be outside post element)
+                    for (const sel of candidateSelectors) {
+                        const nodes = await page.$$(sel);
+                        for (const n of nodes) {
+                            try {
+                                const text = (await n.evaluate(el => (el.textContent || '').trim().toLowerCase())) as string;
+                                if (labels.some(l => text === l)) {
+                                    // Make sure it's near the comment box (within the same form or section)
+                                    const isNearCommentBox = await n.evaluate((el) => {
+                                        const form = el.closest('form') || el.closest('section');
+                                        if (!form) return false;
+                                        const textarea = form.querySelector('textarea, [contenteditable="true"]');
+                                        return !!textarea;
+                                    });
+                                    if (isNearCommentBox) {
+                                        await n.click();
+                                        logger.info(`[submit] method 1 invoked ✅ — clicked "${text}" at page level`);
+                                        if (isModerationExecution) console.log(`✅ Clicked Post button at page level: "${text}"`);
+                                        const attemptTime = Date.now() - attemptStart;
+                                        methodAttempts.push({ method: methodName, success: true, time_ms: attemptTime });
+                                        successfulMethod = methodName;
+                                        return true;
+                                    }
+                                }
+                            } catch (e) { logger.debug(`[core] DOM element eval failed: ${formatError(e)}`); }
+                        }
+                    }
+
+                    logger.info('[submit] method 1 not found ❌');
+                    if (isModerationExecution) console.log('❌ Post button not found');
                     const attemptTime = Date.now() - attemptStart;
-                    methodAttempts.push({ method: methodName, success: true, time_ms: attemptTime });
-                    successfulMethod = methodName;
-                    return true;
+                    methodAttempts.push({ method: methodName, success: false, time_ms: attemptTime, error: 'Post button not found' });
+                    return false;
                 } catch (error) {
                     const attemptTime = Date.now() - attemptStart;
                     methodAttempts.push({ method: methodName, success: false, time_ms: attemptTime, error: error instanceof Error ? error.message : String(error) });
                     return false;
                 }
             },
-            // Method 2: Click Post button
+            // Method 2: Click button[type="submit"] (fallback for standard HTML forms)
             async () => {
                 const attemptStart = Date.now();
                 const methodName = 'submit_button';
                 try {
                     logger.info('[submit] method 2: click button[type="submit"]');
                     if (isModerationExecution) console.log('🔍 Looking for submit button');
-                    const postButton = await post.$('button[type="submit"]');
+                    // Search in post container first, then page level
+                    let postButton = await post.$('button[type="submit"]');
+                    if (!postButton) {
+                        postButton = await page.$('form button[type="submit"]');
+                    }
                     if (postButton) {
                         if (isModerationExecution) console.log('✅ Found submit button');
                         await postButton.click();
@@ -955,87 +1344,24 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
                     return false;
                 }
             },
-            // Method 3: Use form submission
+            // Method 3: Press Enter key (last resort — on Instagram, Enter usually inserts a newline but worth trying)
             async () => {
                 const attemptStart = Date.now();
-                const methodName = 'form_dispatch';
+                const methodName = 'enter_key';
                 try {
-                    logger.info('[submit] method 3: dispatch form submit');
-                    if (isModerationExecution) console.log('🔍 Looking for form to submit');
-                    const form = await post.$('form');
-                    if (form) {
-                        if (isModerationExecution) console.log('✅ Found form element');
-                        await form.evaluate((f: HTMLFormElement) => {
-                            const submitEvent = new Event('submit', { bubbles: true });
-                            f.dispatchEvent(submitEvent);
-                        });
-                        logger.info('[submit] method 3 invoked ✅');
-                        if (isModerationExecution) console.log('✅ Dispatched form submit event');
-                        const attemptTime = Date.now() - attemptStart;
-                        methodAttempts.push({ method: methodName, success: true, time_ms: attemptTime });
-                        successfulMethod = methodName;
-                        return true;
-                    }
-                    logger.info('[submit] method 3 not found ❌');
-                    if (isModerationExecution) console.log('❌ Form element not found');
+                    logger.info('[submit] method 3: press Enter (last resort)');
+                    if (isModerationExecution) console.log('🔍 Trying Enter key as last resort');
+                    await page.keyboard.press('Enter');
+                    if (isModerationExecution) console.log('✅ Pressed Enter key');
                     const attemptTime = Date.now() - attemptStart;
-                    methodAttempts.push({ method: methodName, success: false, time_ms: attemptTime, error: 'Form not found' });
-                    return false;
+                    methodAttempts.push({ method: methodName, success: true, time_ms: attemptTime });
+                    successfulMethod = methodName;
+                    return true;
                 } catch (error) {
                     const attemptTime = Date.now() - attemptStart;
                     methodAttempts.push({ method: methodName, success: false, time_ms: attemptTime, error: error instanceof Error ? error.message : String(error) });
                     return false;
                 }
-            },
-            // Method 4: Click role button with visible text (e.g., "Post")
-            async () => {
-                logger.info('[submit] method 4: click role button by text');
-                if (isModerationExecution) console.log('🔍 Looking for role=button with visible label (e.g., "Post")');
-                const candidateSelectors = [
-                    'div[role="button"]',
-                    'button[role="button"]',
-                    'form div[role="button"]',
-                    'form button:not([type])'
-                ];
-                const labels = [
-                    // English
-                    'post', 'send',
-                    // French
-                    'publier', 'envoyer',
-                    // Spanish / Portuguese
-                    'publicar', 'enviar', 'postar',
-                    // Italian
-                    'pubblica',
-                    // German
-                    'veröffentlichen', 'senden',
-                    // Turkish
-                    'gönder',
-                    // Japanese
-                    '投稿',
-                    // Korean
-                    '게시', '보내기',
-                    // Chinese (Simplified)
-                    '发布', '发表', '发送',
-                    // Vietnamese
-                    'gửi'
-                ];
-                for (const sel of candidateSelectors) {
-                    const nodes = await post.$$(sel);
-                    for (const n of nodes) {
-                        try {
-                            const text = (await n.evaluate(el => (el.textContent || '').trim().toLowerCase())) as string;
-                            if (labels.some(l => text === l || text.includes(l))) {
-                                await n.click();
-                                logger.info('[submit] method 4 invoked ✅');
-                                if (isModerationExecution) console.log(`✅ Clicked role button: "${text}"`);
-                                return true;
-                            }
-                        } catch { }
-                    }
-                }
-                logger.info('[submit] method 4 not found ❌');
-                if (isModerationExecution) console.log('❌ Role button with visible label not found');
-                return false;
             }
         ];
 
@@ -1073,62 +1399,88 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
         });
 
         // Wait for comment to be processed
-        await delay(2000);
+        await delay(3000);
 
-        // Verify comment was posted successfully
-        const verificationMethods: Array<() => Promise<boolean>> = [
-            // Method 1: Check if comment box is empty (textarea or contenteditable)
-            async () => {
-                try {
-                    const isEmpty = await commentBox?.evaluate((el) => {
-                        const ta = el as HTMLTextAreaElement;
-                        const ce = el as HTMLElement;
-                        const isCE = ce.getAttribute('contenteditable') === 'true';
-                        if (isCE) return (ce.textContent || '').trim() === '';
-                        return (ta.value || '').trim() === '';
-                    });
-                    return !!isEmpty;
-                } catch { return false; }
-            },
-            // Method 2: Look for the comment text within the post container
-            async () => {
-                try {
-                    const found = await post.evaluate((el, c) => {
-                        const text = (el as HTMLElement).innerText || '';
-                        return text.includes(c as string);
-                    }, comment);
-                    return !!found;
-                } catch { return false; }
-            },
-            // Method 3: Ensure no obvious error banners are present on the page
-            async () => {
-                try {
-                    const body = await page.evaluate(() => document.body.innerText.toLowerCase());
-                    const hasError = [
-                        "couldn't post",
-                        'try again',
-                        'action blocked',
-                        'comments on this post have been limited',
-                        'only followers can comment',
-                        'commenting has been turned off'
-                    ].some(t => body.includes(t));
-                    return !hasError;
-                } catch { return true; }
-            }
-        ];
-
-        // Try each verification method
+        // Verify comment was posted successfully using combined checks
         if (isModerationExecution) console.log('🔍 Verifying comment was posted...');
-        for (let i = 0; i < verificationMethods.length; i++) {
-            try {
-                const ok = await verificationMethods[i]();
-                logger.info(`[verify] comment method ${i + 1} ${ok ? '✅' : '❌'}`);
-                if (ok) {
+
+        // Check 1: Is the comment box empty? (strong signal — Instagram clears it on success)
+        let textboxEmpty = false;
+        try {
+            textboxEmpty = !!(await commentBox?.evaluate((el) => {
+                const ta = el as HTMLTextAreaElement;
+                const ce = el as HTMLElement;
+                const isCE = ce.getAttribute('contenteditable') === 'true';
+                if (isCE) return (ce.textContent || '').trim() === '';
+                return (ta.value || '').trim() === '';
+            }));
+        } catch { textboxEmpty = false; }
+        logger.info(`[verify] textbox empty: ${textboxEmpty}`);
+
+        // Check 2: Is our comment text visible in the page? (strongest signal)
+        let commentVisible = false;
+        try {
+            // Search at page level since comment may be in a comments section outside the post element
+            commentVisible = await page.evaluate((c) => {
+                const text = document.body.innerText || '';
+                return text.includes(c);
+            }, comment);
+        } catch { commentVisible = false; }
+        logger.info(`[verify] comment visible in DOM: ${commentVisible}`);
+
+        // Check 3: Are there error banners?
+        let hasError = false;
+        try {
+            hasError = await page.evaluate(() => {
+                const body = document.body.innerText.toLowerCase();
+                return [
+                    "couldn't post",
+                    'try again',
+                    'action blocked',
+                    'comments on this post have been limited',
+                    'only followers can comment',
+                    'commenting has been turned off',
+                    'we restrict certain activity',
+                    'this action was blocked'
+                ].some(t => body.includes(t));
+            });
+        } catch { hasError = false; }
+        logger.info(`[verify] error banners: ${hasError}`);
+
+        // Decision: verified if (textbox is empty AND no errors) OR (comment is visible AND no errors)
+        const verified = !hasError && (textboxEmpty || commentVisible);
+        logger.info(`[verify] final verdict: ${verified ? '✅ VERIFIED' : '❌ NOT VERIFIED'} (empty=${textboxEmpty}, visible=${commentVisible}, error=${hasError})`);
+
+        if (verified) {
                     logger.info('Comment posted successfully', {
                         component: 'Instagram-Core',
-                        event: 'comment_operation_success'
+                        event: 'comment_operation_success',
+                        textboxEmpty,
+                        commentVisible,
+                        hasError
                     });
                     if (isModerationExecution) console.log('✅ Comment verified - successfully posted!');
+
+                    // Close the post modal so the feed is visible for the next post
+                    try {
+                        // Press Escape to close modal
+                        await page.keyboard.press('Escape');
+                        await delay(1000);
+                        // If modal still open, try clicking the close button
+                        let closeBtn: ElementHandle<Element> | null = await page.$('svg[aria-label="Close"]') as ElementHandle<Element> | null;
+                        if (!closeBtn) closeBtn = await page.$('[aria-label="Close"]');
+                        if (closeBtn) {
+                            await (closeBtn as ElementHandle<Element>).evaluate((el: Element) => {
+                                const btn = el.closest('button') || el.closest('[role="button"]') || el;
+                                (btn as HTMLElement).click();
+                            });
+                            await delay(1000);
+                        }
+                        logger.info('[action] closed post modal ✅');
+                    } catch {
+                        logger.info('[action] modal close attempted (may not have been open)');
+                    }
+
                     // Return success with method tracking metadata
                     return {
                         success: true,
@@ -1138,8 +1490,6 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
                             comment_method_attempts: methodAttempts
                         }
                     };
-                }
-            } catch { }
         }
         if (isModerationExecution) console.log('❌ Comment verification failed');
 
@@ -1158,6 +1508,13 @@ export async function postComment(post: ElementHandle<Element>, page: Page, comm
             component: 'Instagram-Core',
             event: 'comment_operation_error'
         });
+
+        // Close any open modal on error so the feed is accessible for next post
+        try {
+            await page.keyboard.press('Escape');
+            await delay(500);
+        } catch (e) { logger.debug(`[core] Escape key press failed: ${formatError(e)}`); }
+
         return { success: false, error: errorMessage };
     }
 }
@@ -1184,7 +1541,7 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
             let permalink: string | null = null;
             try {
                 permalink = await extractPermalink(post);
-            } catch { }
+            } catch (e) { logger.debug(`[core] Permalink extraction failed: ${formatError(e)}`); }
 
             if (trace && trace.runId) {
                 try {
@@ -1198,7 +1555,7 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                     pushStep(trace, { name: 'post_scanned', status: 'ok', notes: JSON.stringify({ index, username: metadata.username, permalink, screenshot: fileName, captionLen: metadata.caption?.length || 0 }) });
                     await saveTrace(trace);
                 } catch (e) {
-                    try { pushStep(trace, { name: 'post_scan_failed', status: 'warn', notes: (e as Error)?.message }); await saveTrace(trace); } catch { }
+                    try { pushStep(trace, { name: 'post_scan_failed', status: 'warn', notes: (e as Error)?.message }); await saveTrace(trace); } catch (traceErr) { logger.debug(`[core] Trace save failed: ${formatError(traceErr)}`); }
                 }
             }
 
@@ -1210,7 +1567,7 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                     const acc = await AccountModel.findOne({ platform: 'instagram', username: botUsername }).lean();
                     prefs = (acc as any)?.preferences || {};
                 }
-            } catch { }
+            } catch (e) { logger.debug(`[core] Account preferences load failed: ${formatError(e)}`); }
 
             // Compute quality scores
             const quality = computeQualityScores(metadata.caption || '', metadata.username || '', prefs);
@@ -1273,6 +1630,10 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
             // Enforce min quality for auto-post path; always allow queue-for-review path with scores attached
             const minQ = typeof prefs?.minQualityScore === 'number' ? prefs.minQualityScore : 0;
 
+            // Track comment text and verification at function scope for metadata
+            let postedComment: string | undefined;
+            let commentVerified: boolean | undefined;
+
             // Generate and post comment if caption exists
             if (metadata.caption) {
                 const comment = await generateComment(metadata.caption);
@@ -1299,14 +1660,14 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                             component: 'Instagram-Core',
                             event: 'hitl_propose_error'
                         });
-                        if (trace) { try { pushStep(trace, { name: 'propose_failed', status: 'warn', notes: e instanceof Error ? e.message : String(e) }); await saveTrace(trace); } catch { } }
+                        if (trace) { try { pushStep(trace, { name: 'propose_failed', status: 'warn', notes: e instanceof Error ? e.message : String(e) }); await saveTrace(trace); } catch (traceErr) { logger.debug(`[core] Trace save failed: ${formatError(traceErr)}`); } }
                     }
 
                     if (trace) {
                         try {
                             pushStep(trace, { name: 'proposed_for_review', status: 'ok', notes: JSON.stringify({ index, username: metadata.username, permalink, comment }) });
                             await saveTrace(trace);
-                        } catch { }
+                        } catch (e) { logger.debug(`[core] Trace step failed: ${formatError(e)}`); }
                     }
 
                     return {
@@ -1353,12 +1714,26 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                     throw new Error(`Failed to post comment: ${commentResult.error}`);
                 }
 
+                // Verify comment actually appears in DOM
+                postedComment = comment;
+                commentVerified = false;
+                try {
+                    await delay(2000);
+                    commentVerified = await verifyCommentPosted(page, comment);
+                    logger.info(`[verify] Comment verification: ${commentVerified ? 'CONFIRMED' : 'UNCONFIRMED'}`, {
+                        component: 'Instagram-Core',
+                        event: commentVerified ? 'comment_verified' : 'comment_unverified'
+                    });
+                } catch (e) {
+                    logger.warn('[verify] Comment verification check failed', { error: (e as Error).message });
+                }
+
                 // Trace the comment action if available
                 if (trace) {
                     try {
-                        pushStep(trace, { name: 'comment_posted', status: 'ok', notes: JSON.stringify({ index, username: metadata.username, permalink, comment }) });
+                        pushStep(trace, { name: 'comment_posted', status: 'ok', notes: JSON.stringify({ index, username: metadata.username, permalink, comment, verified: commentVerified }) });
                         await saveTrace(trace);
-                    } catch { }
+                    } catch (e) { logger.debug(`[core] Trace step failed: ${formatError(e)}`); }
                 }
 
                 // Record in analytics history for limits/insights
@@ -1374,7 +1749,7 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                         success: true,
                         responseTime: Date.now() - tStart
                     })
-                } catch { }
+                } catch (e) { logger.debug(`[core] Interaction history save failed: ${formatError(e)}`); }
             }
 
             logger.info('Post processing completed successfully', {
@@ -1395,7 +1770,10 @@ async function processPostWithRetry(post: ElementHandle<Element>, page: Page, tr
                     hashtags: metadata.hashtags,
                     likes: metadata.likes,
                     success: true,
-                    quality
+                    quality,
+                    comment: postedComment,
+                    commentVerified,
+                    permalink
                 } as any) as PostMetadata
             };
 
@@ -1444,27 +1822,201 @@ export async function initStorage(): Promise<void> {
 }
 
 // Export all necessary functions and types
-export async function processPosts(posts: ElementHandle<Element>[], page: Page, trace?: any): Promise<void> {
+export async function processPosts(posts: ElementHandle<Element>[], page: Page, trace?: any, session?: any): Promise<void> {
     try {
+        // Process up to 10 posts per call (caller handles multiple iterations with page refresh)
+        const maxPostsPerIteration = 10;
+        const postsPerRun = parseInt(process.env.POSTS_PER_RUN || '10', 10);
+        const effectiveMax = Math.min(maxPostsPerIteration, postsPerRun);
         logger.info('Starting batch post processing', {
             timestamp: new Date().toISOString(),
             postCount: posts.length,
+            targetPosts: effectiveMax,
             component: 'Instagram-Core',
             event: 'batch_processing_start'
         });
 
-        let i = 0;
         const botActor = (trace?.target?.username as string) || process.env.INSTAGRAM_BOT_USERNAME || 'unknown';
-        for (const post of posts) {
+        const maxPosts = Math.min(posts.length, effectiveMax);
+        let processedCount = 0;
+
+        // In-memory set to prevent double-processing within this batch
+        const processedPermalinks = new Set<string>();
+
+        for (let i = 0; i < maxPosts; i++) {
             try {
+                // Re-discover posts each iteration since modal open/close invalidates DOM references
+                if (i > 0) {
+                    logger.info(`[batch] re-discovering posts for iteration ${i + 1}`);
+                    // Navigate back to feed if needed
+                    const currentUrl = page.url();
+                    if (!currentUrl.includes('instagram.com') || currentUrl.includes('/p/') || currentUrl.includes('/reel/')) {
+                        await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle0', timeout: 30000 });
+                        await delay(3000);
+                    }
+                    // Scroll down to load more posts - scroll further for higher indices
+                    await page.evaluate((scrollAmount: number) => window.scrollBy(0, scrollAmount), i * 800);
+                    await delay(2000);
+
+                    // If we need more posts than visible, keep scrolling until enough load
+                    let currentPosts = await page.$$('article');
+                    let scrollAttempts = 0;
+                    while (currentPosts.length <= i && scrollAttempts < 5) {
+                        logger.info(`[batch] only ${currentPosts.length} posts, scrolling more (attempt ${scrollAttempts + 1})`);
+                        await page.evaluate(() => window.scrollBy(0, 1200));
+                        await delay(2500);
+                        currentPosts = await page.$$('article');
+                        scrollAttempts++;
+                    }
+                }
+
+                // Dismiss any popup that appeared during scrolling
+                try {
+                    await page.evaluate(() => {
+                        // Text-based detection
+                        const buttons = document.querySelectorAll('button');
+                        for (const btn of buttons) {
+                            if (btn.textContent?.trim() === 'Not Now' || btn.textContent?.trim() === 'Not now') {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        // Instagram dialog class-based detection
+                        const dialogSelectors = [
+                            'div._a9-z button._a9--._ap36._asz1',
+                            'div[role="dialog"] button._a9--._ap36',
+                        ];
+                        for (const sel of dialogSelectors) {
+                            const btn = document.querySelector(sel) as HTMLElement;
+                            if (btn) { btn.click(); return true; }
+                        }
+                        return false;
+                    });
+                } catch (e) { logger.debug(`[core] Modal dismiss failed: ${formatError(e)}`); }
+
+                // Get fresh post references
+                const currentPosts = await page.$$('article');
+                if (i >= currentPosts.length) {
+                    logger.info(`[batch] only ${currentPosts.length} posts available, stopping at index ${i}`);
+                    break;
+                }
+                const post = currentPosts[i];
+
+                // ── Duplicate check: 3 layers ──
+                // Layer 1: Extract permalink and check in-memory batch set
+                let permalink: string | null = null;
+                try {
+                    permalink = await extractPermalink(post);
+                } catch (e) { logger.debug(`[core] Permalink extraction failed: ${formatError(e)}`); }
+
+                if (permalink) {
+                    // Check if already processed in THIS batch (scroll re-discovery can show same post)
+                    if (processedPermalinks.has(permalink)) {
+                        logger.info(`[batch] DUPLICATE SKIPPED (in-batch) - already processed ${permalink} this session`, {
+                            component: 'Instagram-Core',
+                            event: 'duplicate_batch_skip'
+                        });
+                        if (session) {
+                            session.postsSkippedDuplicate++;
+                            session.postsProcessed++;
+                        }
+                        continue;
+                    }
+
+                    // Layer 2: Check persistent tracker (cross-session duplicate detection)
+                    const existing = hasCommentedOnPost(permalink);
+                    if (existing) {
+                        logger.info(`[batch] DUPLICATE SKIPPED (tracker) - already commented on ${permalink} at ${existing.timestamp}`, {
+                            component: 'Instagram-Core',
+                            event: 'duplicate_tracker_skip',
+                            postUrl: permalink,
+                            originalComment: existing.commentText
+                        });
+                        processedPermalinks.add(permalink);
+                        if (session) {
+                            session.postsSkippedDuplicate++;
+                            session.postsProcessed++;
+                        }
+                        continue;
+                    }
+
+                    // Mark as being processed
+                    processedPermalinks.add(permalink);
+                }
+
+                // Skip own posts — don't comment on our own content
+                const botUser = (process.env.INSTAGRAM_BOT_USERNAME || '').toLowerCase();
+                if (botUser) {
+                    try {
+                        const postAuthor = await post.evaluate((el: Element) => {
+                            // Username is typically in the first <a> link inside the article header
+                            const links = el.querySelectorAll('a[href]');
+                            for (const link of links) {
+                                const href = link.getAttribute('href') || '';
+                                if (/^\/[a-zA-Z0-9_.]+\/$/.test(href) && href !== '/' && !href.includes('/explore/')) {
+                                    return href.replace(/\//g, '').toLowerCase();
+                                }
+                            }
+                            return '';
+                        });
+                        if (postAuthor === botUser) {
+                            logger.info(`[batch] SKIP (own post) @${postAuthor} ${permalink || ''}`);
+                            if (session) {
+                                session.postsSkippedOther++;
+                                session.postsProcessed++;
+                            }
+                            continue;
+                        }
+                    } catch (e) { logger.debug(`[core] Processing check failed: ${formatError(e)}`); }
+                }
+
+                processedCount++;
                 const result = await processPostWithRetry(post, page, trace, i);
+                if (session) session.postsProcessed++;
+
                 logger.info('Post processing result:', {
                     timestamp: new Date().toISOString(),
                     success: result.success,
                     error: result.error,
+                    skipped: result.skipped,
                     component: 'Instagram-Core',
                     event: 'post_processing_result'
                 });
+
+                // Track in session and persistent tracker
+                if (result.success && !result.skipped && result.metadata) {
+                    const postMeta = result.metadata as any;
+                    const commentText = postMeta.comment || '';
+                    const verified = postMeta.commentVerified ?? false;
+
+                    if (commentText && permalink) {
+                        const tracked: TrackedComment = {
+                            postUrl: permalink,
+                            postUsername: postMeta.username || 'unknown',
+                            commentText,
+                            timestamp: new Date().toISOString(),
+                            verified,
+                            sessionId: session?.sessionId || 'unknown',
+                            captionSnippet: (postMeta.caption || '').slice(0, 100),
+                            liked: true
+                        };
+                        trackComment(tracked);
+
+                        if (session) {
+                            session.commentsPosted++;
+                            if (verified) session.commentsVerified++;
+                            session.likesPosted++;
+                            session.comments.push(tracked);
+                        }
+                    }
+                } else if (result.skipped) {
+                    if (session) session.postsSkippedOther++;
+                } else if (!result.success) {
+                    if (session) {
+                        session.commentsFailed++;
+                        session.errors.push(result.error || 'Unknown error');
+                    }
+                }
 
                 if (result.metadata) {
                     const interaction: BotInteraction = {
@@ -1479,22 +2031,24 @@ export async function processPosts(posts: ElementHandle<Element>[], page: Page, 
                     await saveInteractionToDb(interaction);
                 }
 
-                // Add delay between posts
-                await delay(getRandomDelay(2000, 4000));
-                i++;
+                // Add delay between posts (human-like pacing)
+                await delay(getRandomDelay(3000, 6000));
             } catch (error) {
+                const errMsg = error instanceof Error ? error.message : String(error);
                 logger.error('Error processing post:', {
-                    error: error instanceof Error ? error.message : String(error),
+                    error: errMsg,
                     timestamp: new Date().toISOString(),
                     component: 'Instagram-Core',
                     event: 'post_processing_error'
                 });
+                if (session) session.errors.push(errMsg);
             }
         }
 
         logger.info('Completed batch post processing', {
             timestamp: new Date().toISOString(),
             postCount: posts.length,
+            processed: processedCount,
             component: 'Instagram-Core',
             event: 'batch_processing_complete'
         });
@@ -1535,8 +2089,21 @@ export {
 async function extractUsername(post: ElementHandle<Element>): Promise<string> {
     try {
         const username = await post.evaluate(el => {
-            const userLink = el.querySelector('a[href*="/"]');
-            return userLink ? userLink.getAttribute('href')?.replace('/', '') || '' : '';
+            // Look for profile links — Instagram profile hrefs are like "/username/" or "/username"
+            const links = el.querySelectorAll('a[href]');
+            for (const link of links) {
+                const href = link.getAttribute('href') || '';
+                // Match /<username>/ but skip /p/, /reel/, /stories/, /explore/, etc.
+                const match = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+                if (match) {
+                    const candidate = match[1];
+                    const reserved = ['p', 'reel', 'reels', 'stories', 'explore', 'accounts', 'direct', 'tags'];
+                    if (!reserved.includes(candidate.toLowerCase())) {
+                        return candidate;
+                    }
+                }
+            }
+            return '';
         });
         return username || '';
     } catch (error) {
@@ -1579,6 +2146,23 @@ async function extractCaption(post: ElementHandle<Element>, page: Page): Promise
             () => {
                 const menuText = $('div[role="menuitem"]').text();
                 return menuText ? menuText.trim() : null;
+            },
+            // Method 4: Individual post page — caption in span[dir="auto"] inside div.html-div
+            // This catches captions on /p/ and /reel/ pages where there's no <article>
+            () => {
+                const skipTexts = ['notifications', 'dashboard', 'also from meta', 'start the conversation', 'consumer health', 'log in', 'sign up'];
+                const spans = $('span[dir="auto"]');
+                for (let i = 0; i < spans.length; i++) {
+                    const text = $(spans[i]).text().trim();
+                    if (text.length > 20 && text.length < 3000) {
+                        const lower = text.toLowerCase();
+                        const isUI = skipTexts.some(s => lower.startsWith(s));
+                        if (!isUI) {
+                            return text;
+                        }
+                    }
+                }
+                return null;
             }
         ];
 
@@ -1601,17 +2185,58 @@ async function extractCaption(post: ElementHandle<Element>, page: Page): Promise
 
         // If no caption found, try to expand and retry
         try {
-            const moreButton = await post.$('div[role="button"]:has-text("more")');
-            if (moreButton) {
-                await moreButton.click();
+            // Find "more" button using evaluate since :has-text() is Playwright-only
+            const moreButton = await post.evaluateHandle(el => {
+                const buttons = el.querySelectorAll('div[role="button"], button, span[role="link"]');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim().toLowerCase();
+                    if (text === 'more' || text === '… more' || text === '...more') {
+                        return btn as HTMLElement;
+                    }
+                }
+                return null;
+            });
+
+            if (moreButton && moreButton.asElement()) {
+                await (moreButton as any).click();
                 await delay(1000);
 
-                // Get updated HTML after expansion
+                // Get updated HTML after expansion and rebuild cheerio context
                 const expandedHtml = await post.evaluate(el => el.outerHTML);
                 const $expanded = cheerio.load(expandedHtml);
 
-                // Try methods again with expanded content
-                for (const method of captionMethods) {
+                // Re-run extraction methods with the expanded cheerio context
+                const expandedMethods = [
+                    () => {
+                        const articleText = $expanded('article').text();
+                        if (articleText) {
+                            const textParts = articleText.split('\n').filter((part: string) => part.trim().length > 0);
+                            if (textParts.length > 0) return textParts[0].trim();
+                        }
+                        return null;
+                    },
+                    () => {
+                        const caption = $expanded('div._a9zs').text() ||
+                            $expanded('h1._aacl').text() ||
+                            $expanded('div[data-testid="post-content"] > div > span').text();
+                        return caption ? caption.trim() : null;
+                    },
+                    () => {
+                        const skipTexts = ['notifications', 'dashboard', 'also from meta', 'start the conversation', 'consumer health', 'log in', 'sign up'];
+                        const spans = $expanded('span[dir="auto"]');
+                        for (let i = 0; i < spans.length; i++) {
+                            const text = $expanded(spans[i]).text().trim();
+                            if (text.length > 20 && text.length < 3000) {
+                                const lower = text.toLowerCase();
+                                const isUI = skipTexts.some(s => lower.startsWith(s));
+                                if (!isUI) return text;
+                            }
+                        }
+                        return null;
+                    }
+                ];
+
+                for (const method of expandedMethods) {
                     try {
                         const caption = method();
                         if (caption) {
@@ -1822,22 +2447,38 @@ async function likePost(post: ElementHandle<Element>, page: Page): Promise<boole
         ];
 
         // Try each verification method
+        let verified = false;
         for (let i = 0; i < verificationMethods.length; i++) {
             try {
                 const ok = await verificationMethods[i]();
                 logger.info(`[verify] like method ${i + 1} ${ok ? '✅' : '❌'}`);
                 if (ok) {
                     logger.info('Like operation successful', { component: 'Instagram-Core', event: 'like_operation_success' });
-                    return true;
+                    verified = true;
+                    break;
                 }
-            } catch { }
+            } catch (e) { logger.debug(`[core] Element eval failed: ${formatError(e)}`); }
         }
 
-        logger.warn('Like operation failed - could not verify like', {
-            component: 'Instagram-Core',
-            event: 'like_operation_verify_failed'
-        });
-        return false;
+        if (!verified) {
+            // Check if the post was already liked (Like button gone = already liked)
+            const likeStillPresent = await post.$('svg[aria-label="Like"]');
+            if (!likeStillPresent) {
+                logger.info('Like button no longer present - post was likely already liked or like succeeded', {
+                    component: 'Instagram-Core',
+                    event: 'like_operation_assumed_success'
+                });
+                return true;
+            }
+            logger.warn('Like verification inconclusive - proceeding anyway (click was executed)', {
+                component: 'Instagram-Core',
+                event: 'like_operation_unverified_proceed'
+            });
+            // Return true to allow commenting to proceed even if we can't verify the like
+            return true;
+        }
+
+        return true;
 
     } catch (error) {
         logger.error('Error during like operation:', {

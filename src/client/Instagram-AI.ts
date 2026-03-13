@@ -1,7 +1,8 @@
 import { Page, ElementHandle } from 'puppeteer';
 import { logger } from '../utils/logger';
+import { formatError } from '../utils/errors';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
+// AdblockerPlugin removed — imported but never used (commented out at line 48)
 import puppeteer from 'puppeteer-extra';
 import dotenv from 'dotenv';
 import { OpenAI } from 'openai';
@@ -10,7 +11,7 @@ import * as fs from 'fs';
 import { delay } from '../utils/delay';
 import { startRun, pushStep, finishRun } from '../trace/runtime';
 import { AccountModel } from '../hitl/models';
-import { InteractionHistory } from '../analytics/interactionHistory';
+// InteractionHistory removed — imported but never used
 import { saveTrace } from '../trace/store';
 import { sendTraceEvent } from '../trace/webhook';
 
@@ -37,6 +38,7 @@ import {
     ProcessPostResult,
     processPosts
 } from './Instagram-Core';
+import { createSession, saveSession, updateDailyStats, SessionLog, hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/commentTracker';
 
 // Import DM functionality
 import {
@@ -187,20 +189,124 @@ export class InstagramAI {
         await new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    /**
+     * Dismiss Instagram dialogs like "Turn on Notifications", "Save Login Info", etc.
+     * Finds buttons containing "Not Now" text within a dialog that contains the given heading text.
+     */
+    private async dismissDialog(headingText?: string): Promise<boolean> {
+        if (!this.page) return false;
+        try {
+            // Strategy 1: Find "Not Now" button by evaluating text content
+            const dismissed = await this.page.evaluate((heading: string | undefined) => {
+                // If heading specified, check if dialog with that text exists
+                if (heading) {
+                    const hasDialog = document.body.innerText.includes(heading);
+                    if (!hasDialog) return false;
+                }
+
+                // Find all buttons and look for "Not Now"
+                const buttons = document.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = btn.textContent?.trim();
+                    if (text === 'Not Now' || text === 'Not now') {
+                        btn.click();
+                        return true;
+                    }
+                }
+
+                // Also check div[role="button"] elements
+                const roleBtns = document.querySelectorAll('div[role="button"]');
+                for (const btn of roleBtns) {
+                    const text = btn.textContent?.trim();
+                    if (text === 'Not Now' || text === 'Not now') {
+                        (btn as HTMLElement).click();
+                        return true;
+                    }
+                }
+                return false;
+            }, headingText);
+
+            if (dismissed) {
+                logger.info(`Dismissed dialog: "${headingText || 'unknown'}"`, {
+                    component: 'Instagram-AI',
+                    event: 'dialog_dismissed'
+                });
+                await this.delay(1500);
+                return true;
+            }
+
+            // Strategy 2: Try aria-label based selectors
+            const notNowSelectors = [
+                'button[aria-label="Not Now"]',
+                'button[aria-label="Not now"]',
+                '[role="button"][aria-label="Not Now"]'
+            ];
+            for (const sel of notNowSelectors) {
+                const btn = await this.page.$(sel);
+                if (btn) {
+                    await btn.click();
+                    logger.info(`Dismissed dialog via ${sel}`, { component: 'Instagram-AI', event: 'dialog_dismissed' });
+                    await this.delay(1500);
+                    return true;
+                }
+            }
+
+            // Strategy 3: Instagram dialog button class selectors (notifications/login popups)
+            const classBasedDismissed = await this.page.evaluate(() => {
+                // Target the specific Instagram dialog button classes
+                const dialogSelectors = [
+                    'div._a9-z button._a9--._ap36._asz1',
+                    'div[role="dialog"] button._a9--._ap36',
+                    'div[role="dialog"] button:first-child'
+                ];
+                for (const sel of dialogSelectors) {
+                    const btn = document.querySelector(sel) as HTMLElement;
+                    if (btn) {
+                        const text = btn.textContent?.trim()?.toLowerCase() || '';
+                        // Only click if it looks like a dismiss button (Not Now, Cancel, etc.)
+                        if (text === 'not now' || text === 'not now' || text === 'cancel' || text === 'close' || text.length < 20) {
+                            btn.click();
+                            return text || 'dialog-button';
+                        }
+                    }
+                }
+                return null;
+            });
+
+            if (classBasedDismissed) {
+                logger.info(`Dismissed dialog via class selector: "${classBasedDismissed}"`, {
+                    component: 'Instagram-AI',
+                    event: 'dialog_dismissed_class'
+                });
+                await this.delay(1500);
+                return true;
+            }
+
+            return false;
+        } catch (error) {
+            logger.debug(`No dialog to dismiss: ${headingText || 'unknown'}`);
+            return false;
+        }
+    }
+
     async initialize(): Promise<void> {
         try {
             // Initialize browser with stealth mode
             this.browser = await puppeteer.launch({
                 headless: false,  // Keep browser visible
                 defaultViewport: null,  // Use default viewport
+                executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-infobars',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-notifications',
                     '--window-position=0,0',
-                    '--ignore-certifcate-errors',
-                    '--ignore-certifcate-errors-spki-list',
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    '--ignore-certificate-errors',
+                    '--ignore-certificate-errors-spki-list',
+                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                     '--start-maximized'  // Start with maximized window
                 ]
             });
@@ -243,6 +349,10 @@ export class InstagramAI {
                 } else {
                     logger.info('Cookies are valid');
                     this.isLoggedIn = true;
+                    // Dismiss any dialogs that appear after cookie login
+                    await this.delay(2000);
+                    await this.dismissDialog('Turn on Notifications');
+                    await this.dismissDialog('Save Your Login Info');
                 }
             } else {
                 logger.info('No cookies found, performing fresh login');
@@ -305,26 +415,10 @@ export class InstagramAI {
             this.isLoggedIn = true;
 
             // Handle "Save Login Info" dialog if it appears
-            try {
-                const saveLoginButton = await this.page.$('button:has-text("Not Now")');
-                if (saveLoginButton) {
-                    await saveLoginButton.click();
-                    await this.delay(1000);
-                }
-            } catch (error) {
-                logger.info('No save login dialog found');
-            }
+            await this.dismissDialog('Save Your Login Info');
 
             // Handle notifications dialog if it appears
-            try {
-                const notifyButton = await this.page.$('button:has-text("Not Now")');
-                if (notifyButton) {
-                    await notifyButton.click();
-                    await this.delay(1000);
-                }
-            } catch (error) {
-                logger.info('No notifications dialog found');
-            }
+            await this.dismissDialog('Turn on Notifications');
 
         } catch (error) {
             logger.error('Login failed:', error);
@@ -513,118 +607,561 @@ export class InstagramAI {
     public getPage(): Page | null {
         return this.page;
     }
+
+    // Get a fresh page from the browser (recovers from detached frame)
+    public async getFreshPage(): Promise<Page | null> {
+        try {
+            // Try to reuse existing browser pages first
+            if (this.browser) {
+                try {
+                    const pages = await this.browser.pages();
+                    if (pages.length > 0) {
+                        // Use the first available page
+                        const existingPage = pages[0] as Page;
+                        this.page = existingPage;
+                        await existingPage.bringToFront();
+                        return existingPage;
+                    }
+                } catch (e) { logger.debug('[niche] Failed to reuse existing page: ' + formatError(e)); }
+
+                // No usable pages — create a new one
+                try {
+                    const newPage = await this.browser.newPage();
+                    this.page = newPage;
+                    await newPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36');
+                    const fsMod = await import('fs');
+                    const cookiePath = './cookies.json';
+                    if (fsMod.existsSync(cookiePath)) {
+                        const cookies = JSON.parse(fsMod.readFileSync(cookiePath, 'utf-8'));
+                        await newPage.setCookie(...cookies);
+                    }
+                    return newPage;
+                } catch (e) { logger.debug('[niche] Failed to create new page: ' + formatError(e)); }
+            }
+
+            // Browser connection is dead — relaunch entirely
+            logger.info('[niche] Browser died, relaunching...');
+            await this.initialize();
+            return this.page;
+        } catch (e) {
+            logger.error(`[niche] Failed to get fresh page: ${e}`);
+            return null;
+        }
+    }
 }
 
-// Main interaction loop
-export async function startInteractionLoop(username: string, trace?: any): Promise<void> {
+/**
+ * Dismiss any Instagram popup dialogs (notifications, save login, etc.)
+ * Uses multiple strategies: text matching, aria-labels, and Instagram's dialog CSS classes.
+ */
+async function dismissPopups(page: any, logPrefix: string = ''): Promise<boolean> {
+    try {
+        const result = await page.evaluate(() => {
+            // Strategy 1: Text-based "Not Now" button detection
+            const buttons = document.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = btn.textContent?.trim();
+                if (text === 'Not Now' || text === 'Not now') {
+                    btn.click();
+                    return 'Not Now (text)';
+                }
+            }
+
+            // Strategy 2: div[role="button"] with "Not Now"
+            const roleBtns = document.querySelectorAll('div[role="button"]');
+            for (const btn of roleBtns) {
+                const text = btn.textContent?.trim();
+                if (text === 'Not Now' || text === 'Not now') {
+                    (btn as HTMLElement).click();
+                    return 'Not Now (role-button)';
+                }
+            }
+
+            // Strategy 3: Instagram dialog class-based selectors
+            // These catch popups where button text might not be "Not Now"
+            const dialogSelectors = [
+                'div._a9-z button._a9--._ap36._asz1',
+                'div[role="dialog"] button._a9--._ap36',
+            ];
+            for (const sel of dialogSelectors) {
+                const btn = document.querySelector(sel) as HTMLElement;
+                if (btn) {
+                    const text = btn.textContent?.trim() || '';
+                    btn.click();
+                    return `dialog-class: "${text}" via ${sel}`;
+                }
+            }
+
+            // Strategy 4: Generic dialog first-button (dismiss/cancel is typically first)
+            const dialog = document.querySelector('div[role="dialog"]');
+            if (dialog) {
+                const dialogBtns = dialog.querySelectorAll('button');
+                for (const btn of dialogBtns) {
+                    const text = btn.textContent?.trim()?.toLowerCase() || '';
+                    if (text === 'not now' || text === 'cancel' || text === 'close' || text === 'dismiss') {
+                        btn.click();
+                        return `dialog-generic: "${text}"`;
+                    }
+                }
+            }
+
+            return null;
+        });
+
+        if (result) {
+            logger.info(`${logPrefix} Dismissed popup: ${result}`, {
+                component: 'Instagram-AI',
+                event: 'popup_dismissed'
+            });
+            await new Promise(r => setTimeout(r, 1500));
+            return true;
+        }
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+// Single-batch run: open browser, comment on posts, close browser, exit
+// Designed to be called by a scheduler that spins this up periodically
+export async function runSingleBatch(username: string, trace?: any): Promise<{ commentsPosted: number; session: SessionLog }> {
     const instagramAI = new InstagramAI();
+    const session = createSession();
+    let commentsPosted = 0;
 
     try {
-        // Initialize browser and login
         if (trace) pushStep(trace, { name: 'init_browser', status: 'ok' });
         await instagramAI.initialize();
 
-        // Load account preferences for scheduling and limits
-        const account = await AccountModel.findOne({ platform: 'instagram', username }).lean();
-        const prefs: any = (account as any)?.preferences || {};
-        const dailyLimit: number = typeof prefs.dailyCommentLimit === 'number' ? prefs.dailyCommentLimit : 0;
+        const postsPerRun = parseInt(process.env.POSTS_PER_RUN || '10', 10);
+        logger.info(`Single batch run: targeting ${postsPerRun} posts`);
 
-        const withinWorkingWindow = (d: Date) => {
-            try {
-                const day = d.getDay(); // 0=Sun
-                if (Array.isArray(prefs.daysOfWeek) && prefs.daysOfWeek.length > 0 && !prefs.daysOfWeek.includes(day)) return false;
-                if (prefs.workingHours && prefs.workingHours.start && prefs.workingHours.end) {
-                    const hhmm = (n: number) => String(n).padStart(2, '0');
-                    const cur = `${hhmm(d.getHours())}:${hhmm(d.getMinutes())}`;
-                    return cur >= prefs.workingHours.start && cur <= prefs.workingHours.end;
-                }
-                return true;
-            } catch { return true; }
-        };
+        if (trace) pushStep(trace, { name: 'process_batch', status: 'ok' });
 
-        const startOfToday = () => {
-            const now = new Date();
-            return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-        };
+        if (!instagramAI.getPage()) throw new Error('Page not initialized');
+        const page = instagramAI.getPage()!;
 
-        const countCommentsToday = async (): Promise<number> => {
-            try {
-                const accId = (account as any)?.id || username;
-                const from = startOfToday();
-                return await InteractionHistory.countDocuments({
-                    accountId: accId,
-                    interactionType: 'comment',
-                    createdAt: { $gte: from }
-                });
-            } catch { return 0; }
-        };
+        // Navigate to home feed
+        await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle0', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 5000));
 
-        let continueScraping = true;
-        let batchCount = 0;
-        while (continueScraping) {
-            try {
-                batchCount++;
-                // Respect working window
-                if (!withinWorkingWindow(new Date())) {
-                    logger.info('Outside working window. Sleeping 5 minutes before re-check.');
-                    await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
-                    continue;
-                }
+        // Dismiss any popups (notifications, save login, etc.)
+        await dismissPopups(page, '[batch]');
 
-                // Respect daily comment limit (if configured)
-                if (dailyLimit > 0) {
-                    const used = await countCommentsToday();
-                    if (used >= dailyLimit) {
-                        logger.info(`Daily comment limit reached (${used}/${dailyLimit}). Stopping loop for today.`);
-                        break;
-                    }
-                }
+        // Process posts in multiple iterations, refreshing the page each time
+        // to discover new content that hasn't been commented on
+        const REFRESH_ITERATIONS = 3;
+        const POSTS_PER_ITERATION = 10;
 
-                if (trace) pushStep(trace, { name: `process_batch_${batchCount}`, status: 'ok' });
-                await instagramAI.processHomeFeed(trace);
+        for (let iteration = 0; iteration < REFRESH_ITERATIONS; iteration++) {
+            logger.info(`[batch] ── Iteration ${iteration + 1}/${REFRESH_ITERATIONS} ──`);
 
-                // Process DMs (check every batch)
-                const dmEnabled = process.env.INSTAGRAM_DM_ENABLED === 'true';
-                const dmAutoRespond = process.env.INSTAGRAM_DM_AUTO_RESPOND === 'true';
-                if (dmEnabled) {
-                    if (trace) pushStep(trace, { name: `process_dms_batch_${batchCount}`, status: 'ok' });
-                    try {
-                        await instagramAI.processDMs({
-                            autoRespond: dmAutoRespond,
-                            maxConversations: 5,
-                            trace
-                        });
-                    } catch (dmError: any) {
-                        logger.warn('DM processing failed, continuing with main loop:', dmError?.message);
-                        if (trace) pushStep(trace, { name: `dms_error_batch_${batchCount}`, status: 'error', notes: dmError?.message });
-                    }
-                }
+            if (iteration > 0) {
+                // Refresh the page to load fresh content
+                logger.info(`[batch] Refreshing page to discover new content...`);
+                await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle0', timeout: 30000 });
+                await new Promise(r => setTimeout(r, 5000));
 
-                // If limit is configured, re-check after batch
-                if (dailyLimit > 0) {
-                    const used = await countCommentsToday();
-                    if (used >= dailyLimit) {
-                        logger.info(`Daily comment limit reached after batch (${used}/${dailyLimit}). Ending loop.`);
-                        break;
-                    }
-                }
+                // Dismiss any popups after refresh
+                await dismissPopups(page, '[batch]');
+                await new Promise(r => setTimeout(r, 1500));
+            }
 
-                // Small randomized pause between batches
-                const waitMs = getRandomDelay(30000, 60000);
-                logger.info(`Waiting ${waitMs}ms before next batch`);
-                await new Promise(resolve => setTimeout(resolve, waitMs));
-            } catch (error: any) {
-                if (trace) pushStep(trace, { name: `batch_${batchCount}_error`, status: 'error', notes: error?.message });
-                logger.error('Error in interaction loop:', error);
-                const delay = getRandomDelay(60000, 120000);
-                logger.info(`Error occurred, waiting ${delay}ms before retry`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+            // Find posts - scroll down to pre-load more articles
+            await page.waitForSelector('article', { timeout: 15000 }).catch(() => {});
+            let posts = await page.$$('article');
+
+            // Scroll to load at least POSTS_PER_ITERATION posts
+            let scrollRounds = 0;
+            while (posts.length < POSTS_PER_ITERATION && scrollRounds < 8) {
+                await page.evaluate(() => window.scrollBy(0, 1200));
+                await new Promise(r => setTimeout(r, 2000));
+                posts = await page.$$('article');
+                scrollRounds++;
+            }
+            // Scroll back to top so we process from the beginning
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await new Promise(r => setTimeout(r, 1500));
+            posts = await page.$$('article');
+
+            logger.info(`[batch] Iteration ${iteration + 1}: found ${posts.length} posts (after ${scrollRounds} scroll rounds)`);
+
+            if (posts.length > 0) {
+                // Process posts with session tracking — persistent tracker handles cross-iteration dedup
+                await processPosts(posts, page, trace, session);
+            }
+
+            // If we've hit the daily target or run out of content, stop early
+            if (session.commentsPosted >= postsPerRun) {
+                logger.info(`[batch] Reached target of ${postsPerRun} comments, stopping iterations`);
+                break;
             }
         }
+
+        // Use session tracker for accurate count
+        commentsPosted = session.commentsPosted;
+
+        // Also check trace steps as backup
+        if (commentsPosted === 0 && trace && trace.steps) {
+            commentsPosted = trace.steps.filter((s: any) => s.name === 'comment_posted').length;
+        }
+
+        logger.info(`Batch complete: ${commentsPosted} comments posted, ${session.commentsVerified} verified, ${session.postsSkippedDuplicate} duplicates skipped`);
+    } catch (error: any) {
+        if (trace) pushStep(trace, { name: 'batch_error', status: 'error', notes: error?.message });
+        session.errors.push(error?.message || 'Unknown error');
+        logger.error('Error in single batch run:', error);
     } finally {
         if (trace) pushStep(trace, { name: 'close_browser', status: 'ok' });
         await instagramAI.close();
+
+        // Save session report and update daily stats
+        saveSession(session);
+        updateDailyStats(session);
     }
+
+    return { commentsPosted, session };
+}
+
+/**
+ * Niche-specific batch: navigate to hashtag pages, collect post URLs from the grid,
+ * then visit each post individually to comment on it.
+ *
+ * @param niche - hashtag or keyword (e.g. "artificialintelligence", "fitness")
+ * @param targetPosts - how many posts to collect and process (default 150)
+ */
+export async function runNicheBatch(
+    niche: string,
+    targetPosts: number = 150,
+    trace?: any
+): Promise<{ commentsPosted: number; session: SessionLog }> {
+    const instagramAI = new InstagramAI();
+    const session = createSession();
+    let commentsPosted = 0;
+
+    // Clean the niche: remove # prefix, spaces → no spaces for hashtag URL
+    const hashtag = niche.replace(/^#/, '').replace(/\s+/g, '').toLowerCase();
+
+    try {
+        await instagramAI.initialize();
+        if (!instagramAI.getPage()) throw new Error('Page not initialized');
+        let page = instagramAI.getPage()!;
+
+        logger.info(`[niche] Starting niche batch for #${hashtag}, target: ${targetPosts} posts`, {
+            component: 'Instagram-AI',
+            event: 'niche_batch_start',
+            hashtag,
+            targetPosts
+        });
+
+        // Navigate to hashtag explore page
+        const hashtagUrl = `https://www.instagram.com/explore/tags/${hashtag}/`;
+        await page.goto(hashtagUrl, { waitUntil: 'networkidle0', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 4000));
+
+        // Dismiss popups
+        await dismissPopups(page, '[niche]');
+
+        // ── Phase 1: Collect post URLs from the grid ──
+        logger.info(`[niche] Collecting post URLs from #${hashtag} grid...`);
+
+        let postUrls: string[] = [];
+        let scrollAttempts = 0;
+        const maxScrollAttempts = 50; // Safety cap
+        let noNewPostsCount = 0;
+
+        while (postUrls.length < targetPosts && scrollAttempts < maxScrollAttempts) {
+            // Extract all post links from the grid
+            const urls: string[] = await page.evaluate(() => {
+                const links = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
+                const hrefs: string[] = [];
+                for (const link of links) {
+                    const href = link.getAttribute('href');
+                    if (href && (href.startsWith('/p/') || href.startsWith('/reel/'))) {
+                        hrefs.push(`https://www.instagram.com${href}`);
+                    }
+                }
+                return [...new Set(hrefs)];
+            });
+
+            const prevCount = postUrls.length;
+            // Merge with existing, dedup
+            const urlSet = new Set(postUrls);
+            for (const url of urls) {
+                urlSet.add(url);
+            }
+            postUrls = [...urlSet];
+
+            if (postUrls.length === prevCount) {
+                noNewPostsCount++;
+                if (noNewPostsCount >= 5) {
+                    logger.info(`[niche] No new posts after ${noNewPostsCount} scrolls, stopping collection at ${postUrls.length} posts`);
+                    break;
+                }
+            } else {
+                noNewPostsCount = 0;
+            }
+
+            logger.info(`[niche] Scroll ${scrollAttempts + 1}: ${postUrls.length}/${targetPosts} posts collected`);
+
+            // Scroll down to load more grid items
+            await page.evaluate(() => window.scrollBy(0, 1500));
+            await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
+
+            // Dismiss popups during scroll
+            await dismissPopups(page, '[niche]');
+
+            scrollAttempts++;
+        }
+
+        logger.info(`[niche] Collection complete: ${postUrls.length} unique post URLs from #${hashtag}`, {
+            component: 'Instagram-AI',
+            event: 'niche_collection_complete',
+            hashtag,
+            postCount: postUrls.length,
+            scrollAttempts
+        });
+
+        if (postUrls.length === 0) {
+            logger.warn(`[niche] No posts found for #${hashtag}`);
+            return { commentsPosted: 0, session };
+        }
+
+        // ── Phase 2: Visit each post, extract caption via page.evaluate, like, comment ──
+        // We do NOT use processPostWithRetry() here because individual post pages
+        // don't have <article> and ElementHandles go stale after like clicks.
+        // Instead, we use page-level evaluate/$ calls for each step independently.
+        const processedPermalinks = new Set<string>();
+
+        for (let i = 0; i < postUrls.length; i++) {
+            const postUrl = postUrls[i];
+
+            try {
+                // Duplicate check: persistent tracker
+                if (hasCommentedOnPost(postUrl)) {
+                    logger.info(`[niche] SKIP (already commented) ${postUrl}`);
+                    session.postsSkippedDuplicate++;
+                    session.postsProcessed++;
+                    continue;
+                }
+
+                // In-batch duplicate check
+                if (processedPermalinks.has(postUrl)) {
+                    session.postsSkippedDuplicate++;
+                    session.postsProcessed++;
+                    continue;
+                }
+                processedPermalinks.add(postUrl);
+
+                logger.info(`[niche] Processing post ${i + 1}/${postUrls.length}: ${postUrl}`);
+
+                // Navigate to individual post
+                await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
+
+                // Dismiss popups on post page
+                await dismissPopups(page, '[niche]');
+
+                // ── Step 1: Extract metadata via page.evaluate (no ElementHandle needed) ──
+                const meta = await page.evaluate(() => {
+                    const reserved = ['', 'p', 'reel', 'reels', 'stories', 'explore', 'accounts', 'direct', 'tags'];
+
+                    // Strategy 1: Extract from post header — look inside <main> or <article> to avoid nav bar links
+                    let username = 'unknown';
+                    const contentArea = document.querySelector('main') || document.querySelector('article') || document.body;
+
+                    // On individual post pages, the author's profile link appears in the post header
+                    // Look for links that contain a profile-style href inside the content area
+                    const contentLinks = [...contentArea.querySelectorAll('a[href]')];
+
+                    // First, try to find header-style username links (usually near the top of the post)
+                    // These typically have the username as visible text AND as the href
+                    for (const a of contentLinks) {
+                        const href = a.getAttribute('href') || '';
+                        const match = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+                        if (match && !reserved.includes(match[1].toLowerCase())) {
+                            // Prefer links where the text matches the href username (header links)
+                            const linkText = (a.textContent || '').trim().toLowerCase();
+                            if (linkText === match[1].toLowerCase()) {
+                                username = match[1];
+                                break;
+                            }
+                        }
+                    }
+
+                    // Fallback: if no text-matching link found, use the first valid profile link in content
+                    if (username === 'unknown') {
+                        for (const a of contentLinks) {
+                            const href = a.getAttribute('href') || '';
+                            const match = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+                            if (match && !reserved.includes(match[1].toLowerCase())) {
+                                username = match[1];
+                                break;
+                            }
+                        }
+                    }
+
+                    // Caption: look for span[dir="auto"] with substantial text
+                    const uiTexts = ['notifications', 'dashboard', 'also from meta', 'start the conversation', 'consumer health', 'log in', 'sign up'];
+                    let caption = '';
+                    const spans = document.querySelectorAll('span[dir="auto"]');
+                    for (const span of spans) {
+                        const text = (span.textContent || '').trim();
+                        if (text.length > 20 && text.length < 3000) {
+                            const lower = text.toLowerCase();
+                            if (!uiTexts.some(u => lower.startsWith(u))) {
+                                caption = text;
+                                break;
+                            }
+                        }
+                    }
+
+                    const hasLikeBtn = Boolean(document.querySelector('svg[aria-label="Like"]'));
+                    const alreadyLiked = Boolean(document.querySelector('svg[aria-label="Unlike"]'));
+
+                    return { username, caption, hasLikeBtn, alreadyLiked };
+                });
+
+                session.postsProcessed++;
+
+                // Skip own posts
+                const botUsername = (process.env.INSTAGRAM_BOT_USERNAME || '').toLowerCase().replace(/\//g, '');
+                if (botUsername && meta.username.toLowerCase().replace(/\//g, '') === botUsername) {
+                    logger.info(`[niche] SKIP (own post) @${meta.username} ${postUrl}`);
+                    session.postsSkippedOther++;
+                    continue;
+                }
+
+                if (!meta.caption) {
+                    logger.warn(`[niche] No caption found on ${postUrl}, skipping comment`);
+                    session.postsSkippedOther++;
+                    continue;
+                }
+
+                logger.info(`[niche] @${meta.username}: "${meta.caption.slice(0, 80)}..."`);
+
+                // ── Step 2: Like the post ──
+                if (meta.hasLikeBtn && !meta.alreadyLiked) {
+                    const liked = await page.evaluate(() => {
+                        const svg = document.querySelector('svg[aria-label="Like"]');
+                        if (svg) {
+                            const btn = svg.closest('button') || svg.closest('div[role="button"]') || svg.parentElement;
+                            if (btn) { (btn as HTMLElement).click(); return true; }
+                        }
+                        return false;
+                    });
+                    if (liked) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        logger.info(`[niche] Liked post`);
+                    }
+                }
+
+                // ── Step 3: Generate comment via GPT ──
+                const comment = await generateComment(meta.caption);
+                if (!comment) {
+                    logger.warn(`[niche] Failed to generate comment for ${postUrl}`);
+                    session.commentsFailed++;
+                    continue;
+                }
+                logger.info(`[niche] Generated: "${comment}"`);
+
+                // ── Step 4: Post the comment ──
+                // Use the existing postComment() which handles all textarea/contenteditable
+                // variants, comment icon clicks, modal detection, and submission methods.
+                // We pass a fresh <main> handle — postComment searches at page level first.
+                const freshContainer = await page.$('main');
+                if (!freshContainer) {
+                    logger.warn(`[niche] No main element for comment on ${postUrl}`);
+                    session.commentsFailed++;
+                    continue;
+                }
+
+                const commentResult = await postComment(freshContainer, page, comment);
+                if (!commentResult.success) {
+                    logger.warn(`[niche] Comment failed on ${postUrl}: ${commentResult.error}`);
+                    session.commentsFailed++;
+                    session.errors.push(commentResult.error || `Comment failed on ${postUrl}`);
+                    continue;
+                }
+
+                // ── Step 5: Verify comment was posted ──
+                // postComment already waits and verifies internally
+                const verified = commentResult.metadata?.commentVerified ?? true;
+
+                const tracked: TrackedComment = {
+                    postUrl,
+                    postUsername: meta.username,
+                    commentText: comment,
+                    timestamp: new Date().toISOString(),
+                    verified,
+                    sessionId: session.sessionId,
+                    captionSnippet: meta.caption.slice(0, 100),
+                    liked: true
+                };
+                trackComment(tracked);
+                session.commentsPosted++;
+                if (verified) session.commentsVerified++;
+                session.likesPosted++;
+                session.comments.push(tracked);
+                commentsPosted++;
+
+                logger.info(`[niche] ✓ Comment ${commentsPosted} on ${postUrl} (@${meta.username}) verified=${verified}`);
+
+                // Human-like delay between posts
+                await new Promise(r => setTimeout(r, getRandomDelay(4000, 8000)));
+
+            } catch (error) {
+                const errMsg = error instanceof Error ? error.message : String(error);
+                logger.error(`[niche] Error on post ${postUrl}: ${errMsg}`);
+                session.errors.push(errMsg);
+                session.commentsFailed++;
+
+                // Recover from detached frame by getting a fresh page
+                if (errMsg.includes('detached Frame') || errMsg.includes('Session closed') || errMsg.includes('Target closed')) {
+                    logger.info(`[niche] Frame detached — recovering with fresh page...`);
+                    const freshPage = await instagramAI.getFreshPage();
+                    if (freshPage) {
+                        page = freshPage;
+                        logger.info(`[niche] Fresh page acquired, continuing...`);
+                    } else {
+                        logger.error(`[niche] Failed to recover, stopping batch`);
+                        break;
+                    }
+                }
+            }
+
+            // Progress log every 10 posts
+            if ((i + 1) % 10 === 0) {
+                logger.info(`[niche] Progress: ${i + 1}/${postUrls.length} visited, ${commentsPosted} comments posted, ${session.postsSkippedDuplicate} skipped`);
+            }
+        }
+
+        logger.info(`[niche] Batch complete for #${hashtag}: ${commentsPosted} comments on ${postUrls.length} posts`, {
+            component: 'Instagram-AI',
+            event: 'niche_batch_complete',
+            hashtag,
+            commentsPosted,
+            postsProcessed: session.postsProcessed,
+            duplicatesSkipped: session.postsSkippedDuplicate,
+            failed: session.commentsFailed
+        });
+
+    } catch (error: any) {
+        session.errors.push(error?.message || 'Unknown error');
+        logger.error(`[niche] Fatal error in niche batch for #${hashtag}:`, error);
+    } finally {
+        await instagramAI.close();
+        saveSession(session);
+        updateDailyStats(session);
+    }
+
+    return { commentsPosted, session };
+}
+
+// Legacy loop mode (kept for backwards compatibility)
+export async function startInteractionLoop(username: string, trace?: any): Promise<void> {
+    const result = await runSingleBatch(username, trace);
+    logger.info(`Interaction loop completed with ${result.commentsPosted} comments`);
 }
 
 export async function runInstagram(externalTrace?: any): Promise<void> {
@@ -652,9 +1189,15 @@ export async function runInstagram(externalTrace?: any): Promise<void> {
         pushStep(trace, { name: 'validate_credentials', status: 'ok', ms: 0 });
         logger.info('Starting Instagram automation');
 
-        // Initialize Storage
+        // Initialize Storage (non-blocking - agent can run without DB)
         pushStep(trace, { name: 'init_storage', status: 'ok' });
-        await initStorage();
+        try {
+            await initStorage();
+        } catch (storageError) {
+            logger.warn('Storage initialization failed - continuing without persistent storage', {
+                error: storageError instanceof Error ? storageError.message : String(storageError)
+            });
+        }
 
         // Initialize DM Storage
         pushStep(trace, { name: 'init_dm_storage', status: 'ok' });

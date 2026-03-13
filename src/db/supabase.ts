@@ -76,13 +76,14 @@ export class SupabaseStorage implements StorageInterface {
             logger.info('Created new account:', { accountId: this.accountId });
         } catch (error) {
             logger.error('Error ensuring default account:', error);
-            // Set a dummy account ID to allow tests to proceed
-            this.accountId = '00000000-0000-0000-0000-000000000000';
+            // Leave accountId null — operations will be skipped via null checks
+            // rather than writing to a dummy ID that pollutes the database
+            this.accountId = null;
         }
     }
 
     async saveInteraction(interaction: BotInteraction): Promise<void> {
-        if (!this.client) return;
+        if (!this.client || !this.accountId) return;
 
         try {
             // Map old BotInteraction format to new comprehensive schema
@@ -106,7 +107,7 @@ export class SupabaseStorage implements StorageInterface {
     }
 
     async getInteractions(filter: any): Promise<BotInteraction[]> {
-        if (!this.client) return [];
+        if (!this.client || !this.accountId) return [];
 
         try {
             let query = this.client.from('interactions').select('*').order('created_at', { ascending: false });

@@ -5,6 +5,8 @@ import { approveItem, denyItem, reviseItem, scheduleItem } from './service';
 import { executeCommentOnPermalink } from '../client/InstagramExecute';
 import { startRun, pushStep } from '../trace/runtime';
 import { saveTrace } from '../trace/store';
+import { logger } from '../utils/logger';
+import { formatError } from '../utils/errors';
 
 export const hitlRouter = express.Router();
 
@@ -75,7 +77,10 @@ hitlRouter.post('/interactions/:id/execute', requireRole('moderator'), async (re
       updatedAt: doc.updatedAt,
     }
     pushStep(trace, { name: 'moderation_context', status: 'ok', notes: JSON.stringify(ctx) })
-  } catch {}
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`[hitl] Trace context push failed: ${msg}`);
+  }
   await saveTrace(trace)
   await InteractionModel.updateOne({ id }, { $set: { traceRunId: trace.runId } }).exec()
   res.status(202).json({ runId: trace.runId })

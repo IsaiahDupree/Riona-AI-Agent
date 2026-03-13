@@ -4,6 +4,7 @@ import path from 'node:path';
 import { getTrace, listRunsByJob, listRecent, saveTrace } from '../trace/store';
 import { startRun, pushStep, finishRun } from '../trace/runtime';
 import { runInstagram } from '../client/Instagram-AI';
+import { logger } from '../utils/logger';
 
 export const traceRouter = express.Router();
 
@@ -30,21 +31,21 @@ traceRouter.post('/runs/start', (async (req: Request, res: Response) => {
     try {
       pushStep(trace, { name: 'init', status: 'ok', ms: 120 })
       await saveTrace(trace)
-    } catch {}
+    } catch (e) { logger.debug(`[trace] Step save failed: ${e}`); }
   }, 300)
 
   setTimeout(async () => {
     try {
       pushStep(trace, { name: 'work', status: 'ok', ms: 900 })
       await saveTrace(trace)
-    } catch {}
+    } catch (e) { logger.debug(`[trace] Step save failed: ${e}`); }
   }, 900)
 
   setTimeout(async () => {
     try {
       const finished = finishRun(trace, true)
       await saveTrace(finished)
-    } catch {}
+    } catch (e) { logger.debug(`[trace] Step save failed: ${e}`); }
   }, 1600)
 
   res.json({ runId: trace.runId })
@@ -91,7 +92,7 @@ traceRouter.post('/runs/start-full', (async (req: Request, res: Response) => {
         pushStep(trace, { name: 'fatal_error', status: 'error', notes: (e as Error)?.message })
         finishRun(trace, false)
         await saveTrace(trace)
-      } catch {}
+      } catch (traceErr) { logger.debug(`[trace] Fatal error trace save failed: ${traceErr}`); }
     }
   })()
 }) as unknown as RequestHandler);

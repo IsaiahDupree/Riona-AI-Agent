@@ -1,6 +1,7 @@
 import path from 'node:path'
 import fs from 'node:fs'
 import { logger } from '../utils/logger'
+import { formatError } from '../utils/errors'
 import { startRun, pushStep, finishRun } from '../trace/runtime'
 import { saveTrace } from '../trace/store'
 import { sendTraceEvent } from '../trace/webhook'
@@ -32,7 +33,7 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
     try {
       pushStep(trace, { name: 'nav_start', status: 'ok', notes: permalink })
       // Log if navigation is slow
-      const navSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'nav_slow_10s', status: 'warn' }) } catch {} }, 10_000)
+      const navSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'nav_slow_10s', status: 'warn' }) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); } }, 10_000)
       await page.goto(permalink, { waitUntil: 'domcontentloaded', timeout: 30000 })
       clearTimeout(navSlow10s)
       logger.info('[exec] goto done')
@@ -50,7 +51,7 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
     let uiReady = false
     try {
       pushStep(trace, { name: 'wait_article_start', status: 'ok' })
-      const waitSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'article_wait_slow_10s', status: 'warn' }) } catch {} }, 10_000)
+      const waitSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'article_wait_slow_10s', status: 'warn' }) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); } }, 10_000)
       await page.waitForSelector('article', { timeout: 15000 })
       clearTimeout(waitSlow10s)
       uiReady = true
@@ -62,7 +63,7 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
       // Fallback: wait for comment composer elements that imply the post UI is loaded
       try {
         pushStep(trace, { name: 'wait_composer_start', status: 'ok' })
-        const waitSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'composer_wait_slow_10s', status: 'warn' }) } catch {} }, 10_000)
+        const waitSlow10s = setTimeout(() => { try { pushStep(trace, { name: 'composer_wait_slow_10s', status: 'warn' }) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); } }, 10_000)
         await page.waitForFunction(() => !!(
           document.querySelector('form textarea') ||
           document.querySelector('textarea[aria-label="Add a comment…"]') ||
@@ -85,7 +86,7 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
     const navMs = Date.now() - tNav
     logger.info(`[exec] post UI ready ✅ (${navMs}ms from open_permalink)`) 
     console.log(`[exec] post UI ready ✅ (${navMs}ms from open_permalink)`) 
-    try { pushStep(trace, { name: 'ui_ready', status: 'ok', notes: `${navMs}ms` }); await saveTrace(trace) } catch {}
+    try { pushStep(trace, { name: 'ui_ready', status: 'ok', notes: `${navMs}ms` }); await saveTrace(trace) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); }
 
     // Choose a container to scope comment search: prefer article, then main, else body
     let container = await page.$('article')
@@ -114,7 +115,7 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
 
     // Post the provided comment
     logger.info('[exec] starting comment detection and typing flow')
-    try { pushStep(trace, { name: 'detect_comment_start', status: 'ok' }); await saveTrace(trace) } catch {}
+    try { pushStep(trace, { name: 'detect_comment_start', status: 'ok' }); await saveTrace(trace) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); }
     const result = await postComment(container as any, page, comment, true)
     if (result.success) {
       pushStep(trace, { name: 'comment_posted', status: 'ok', notes: JSON.stringify({ permalink, comment }) })
@@ -135,8 +136,8 @@ export async function executeCommentOnPermalink(permalink: string, comment: stri
     if (bot) {
       try {
         await bot.close()
-        try { pushStep(trace, { name: 'browser_closed', status: 'ok' }); await saveTrace(trace) } catch {}
-      } catch {}
+        try { pushStep(trace, { name: 'browser_closed', status: 'ok' }); await saveTrace(trace) } catch (e) { logger.debug('[exec] trace step failed: ' + formatError(e)); }
+      } catch (e) { logger.debug('[exec] Failed to close browser: ' + formatError(e)); }
     }
     await saveTrace(trace)
     await sendTraceEvent('run.completed', trace)

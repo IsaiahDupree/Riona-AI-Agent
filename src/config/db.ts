@@ -1,26 +1,33 @@
 import mongoose from 'mongoose';
 import logger from './logger';
 
+let isConnected = false;
+
 export const connectDB = async () => {
   try {
     const uri = process.env.MONGODB_URI;
     if (!uri) {
-      throw new Error('MONGODB_URI environment variable is not set');
+      logger.warn('MONGODB_URI not set — running without MongoDB (interaction history will not be saved)');
+      return;
     }
 
     logger.info('Connecting to MongoDB...');
     await mongoose.connect(uri);
-    
+    isConnected = true;
+
     mongoose.connection.on('connected', () => {
+      isConnected = true;
       logger.info('MongoDB connected successfully');
     });
 
     mongoose.connection.on('error', (err) => {
+      isConnected = false;
       logger.error('MongoDB connection error:', err);
     });
 
     mongoose.connection.on('disconnected', () => {
-      logger.warn('MongoDB disconnected');
+      isConnected = false;
+      logger.warn('MongoDB disconnected — will attempt to reconnect automatically');
     });
 
     // Handle process termination
@@ -36,7 +43,16 @@ export const connectDB = async () => {
     });
 
   } catch (error) {
-    logger.error('MongoDB connection error:', error);
-    process.exit(1);
+    isConnected = false;
+    logger.error('MongoDB connection failed:', error);
+    logger.warn('Continuing without MongoDB — interaction history will not be saved');
   }
 };
+
+/**
+ * Check if MongoDB is currently connected.
+ * Use this before DB operations to avoid silent failures.
+ */
+export function isDBConnected(): boolean {
+  return isConnected && mongoose.connection.readyState === 1;
+}
