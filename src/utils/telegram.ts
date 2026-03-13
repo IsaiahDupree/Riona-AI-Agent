@@ -58,7 +58,7 @@ async function sendTelegram(text: string, parseMode: string = 'HTML'): Promise<b
 }
 
 export interface RunSummary {
-    platform: 'Instagram' | 'Threads';
+    platform: 'Instagram' | 'Threads' | 'Twitter';
     runNumber: number;
     commentsPosted: number;
     commentsVerified: number;
@@ -74,7 +74,7 @@ export interface RunSummary {
 
 export async function notifyRunComplete(summary: RunSummary): Promise<void> {
     const pct = Math.round((summary.todayTotal / summary.dailyTarget) * 100);
-    const icon = summary.platform === 'Instagram' ? '📸' : '🧵';
+    const icon = summary.platform === 'Instagram' ? '📸' : summary.platform === 'Twitter' ? '🐦' : '🧵';
     const bar = progressBar(pct);
 
     let msg = `${icon} <b>${summary.platform} Run #${summary.runNumber}</b>\n`;
