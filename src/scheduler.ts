@@ -204,6 +204,22 @@ async function scheduledRun() {
             instagramAI = result.instagramAI;
         }
 
+        // ── Read Instagram badge counts ──────────────────────────────────
+        if (instagramAI) {
+            try {
+                const igPage = instagramAI.getPage();
+                if (igPage) {
+                    const { readInstagramBadges } = await import('./client/NotificationBadgeReader');
+                    const badges = await readInstagramBadges(igPage);
+                    if (badges.dms > 0 || badges.notifications > 0) {
+                        logger.info(`[scheduler] IG Badges: ${badges.dms} DMs, ${badges.notifications} notifications`);
+                    }
+                }
+            } catch (badgeErr) {
+                logger.debug(`[scheduler] IG badge read failed (non-fatal): ${formatError(badgeErr)}`);
+            }
+        }
+
         // ── Nurture engagement (VR-scheduled comments, separate from cold engagement) ──
         const IG_NURTURE_FREQUENCY = parseInt(process.env.IG_NURTURE_FREQUENCY || '2', 10);
         if (instagramAI && runNumber % IG_NURTURE_FREQUENCY === 0) {

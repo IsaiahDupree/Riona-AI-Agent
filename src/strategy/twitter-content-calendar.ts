@@ -12,8 +12,8 @@ import * as fs from 'fs';
 // ── Interfaces ──────────────────────────────────────────────────────
 
 export interface ContentSlot {
-    type: 'value' | 'engagement' | 'promotional';
-    style: 'informative' | 'opinion' | 'question' | 'tip' | 'story' | 'thread';
+    type: 'value' | 'engagement' | 'promotional' | 'personal';
+    style: 'informative' | 'opinion' | 'question' | 'tip' | 'story' | 'thread' | 'personal_story' | 'insight' | 'hot_take' | 'quote_tweet';
     topic?: string;
     offerId?: string;
     niche?: string;
@@ -23,7 +23,7 @@ export interface ContentCalendar {
     slots: ContentSlot[];
     tweetsPerDay: number;
     lastGeneratedAt: string;
-    contentMix: { value: number; engagement: number; promotional: number };
+    contentMix: { value: number; engagement: number; personal: number; promotional: number };
 }
 
 // ── File path ───────────────────────────────────────────────────────
@@ -51,26 +51,29 @@ export function saveCalendar(cal: ContentCalendar): void {
 
 // ── Calendar generation ─────────────────────────────────────────────
 
-const VALUE_STYLES: ContentSlot['style'][] = ['informative', 'tip', 'story'];
-const ENGAGEMENT_STYLES: ContentSlot['style'][] = ['question', 'opinion'];
-const PROMOTIONAL_STYLES: ContentSlot['style'][] = ['informative', 'story'];
+const VALUE_STYLES: ContentSlot['style'][] = ['informative', 'tip', 'story', 'insight'];
+const ENGAGEMENT_STYLES: ContentSlot['style'][] = ['question', 'opinion', 'hot_take', 'quote_tweet'];
+const PERSONAL_STYLES: ContentSlot['style'][] = ['personal_story', 'insight', 'story'];
+const PROMOTIONAL_STYLES: ContentSlot['style'][] = ['informative', 'story', 'insight'];
 
 export function generateWeeklyCalendar(brand: BrandIdentity): ContentCalendar {
-    const tweetsPerDay = parseInt(process.env.TWITTER_TWEETS_PER_DAY || '3', 10);
+    const tweetsPerDay = parseInt(process.env.TWITTER_TWEETS_PER_DAY || '12', 10);
     const totalSlots = tweetsPerDay * 7;
     const allNiches = [brand.niche, ...brand.subNiches].filter(Boolean);
 
-    const mix = { value: 60, engagement: 25, promotional: 15 };
+    // Thought leadership mix: value + engagement heavy, personal stories for authenticity
+    const mix = { value: 35, engagement: 30, personal: 20, promotional: 15 };
 
     const valueCount = Math.round(totalSlots * mix.value / 100);
     const engagementCount = Math.round(totalSlots * mix.engagement / 100);
-    const promotionalCount = totalSlots - valueCount - engagementCount;
+    const personalCount = Math.round(totalSlots * mix.personal / 100);
+    const promotionalCount = totalSlots - valueCount - engagementCount - personalCount;
 
     const slots: ContentSlot[] = [];
 
-    // Value slots
+    // Value slots (tips, insights, threads)
     for (let i = 0; i < valueCount; i++) {
-        const isThread = i % 5 === 0; // ~20% of value are threads
+        const isThread = i % 7 === 0; // ~14% of value are threads
         slots.push({
             type: 'value',
             style: isThread ? 'thread' : VALUE_STYLES[i % VALUE_STYLES.length],
@@ -78,7 +81,7 @@ export function generateWeeklyCalendar(brand: BrandIdentity): ContentCalendar {
         });
     }
 
-    // Engagement slots
+    // Engagement slots (questions, opinions, hot takes, quote tweets)
     for (let i = 0; i < engagementCount; i++) {
         slots.push({
             type: 'engagement',
@@ -87,9 +90,19 @@ export function generateWeeklyCalendar(brand: BrandIdentity): ContentCalendar {
         });
     }
 
-    // Promotional slots
+    // Personal slots (stories, insights, behind-the-scenes)
+    for (let i = 0; i < personalCount; i++) {
+        slots.push({
+            type: 'personal',
+            style: PERSONAL_STYLES[i % PERSONAL_STYLES.length],
+            niche: allNiches[i % allNiches.length],
+        });
+    }
+
+    // Promotional slots (offer mentions woven into value)
     for (let i = 0; i < promotionalCount; i++) {
-        const offer = brand.offers[i % Math.max(brand.offers.length, 1)];
+        const offers = brand.offers || [];
+        const offer = offers.length > 0 ? offers[i % offers.length] : undefined;
         slots.push({
             type: 'promotional',
             style: PROMOTIONAL_STYLES[i % PROMOTIONAL_STYLES.length],
@@ -112,7 +125,7 @@ export function generateWeeklyCalendar(brand: BrandIdentity): ContentCalendar {
     };
 
     saveCalendar(calendar);
-    logger.info(`[content-calendar] Generated weekly calendar: ${valueCount} value, ${engagementCount} engagement, ${promotionalCount} promotional`);
+    logger.info(`[content-calendar] Generated weekly calendar: ${valueCount} value, ${engagementCount} engagement, ${personalCount} personal, ${promotionalCount} promotional (${tweetsPerDay}/day)`);
     return calendar;
 }
 
@@ -144,22 +157,22 @@ function isCalendarExpired(cal: ContentCalendar): boolean {
 // ── Frequency control ───────────────────────────────────────────────
 
 /**
- * Whether to post content this run. Posts every 4-6 runs (randomized).
+ * Whether to post content this run. Posts every 2-3 runs (randomized).
+ * With 20-min intervals and 13 active hours: ~39 runs/day → ~13-19 posts/day.
  */
 export function shouldPostContent(runNumber: number, lastPostRun: number): boolean {
-    const minGap = 4;
-    const maxGap = 6;
+    const minGap = 2;
+    const maxGap = 3;
     const gap = runNumber - lastPostRun;
     if (gap < minGap) return false;
     if (gap >= maxGap) return true;
-    // Between min and max: 50% chance
-    return Math.random() > 0.5;
+    return Math.random() > 0.4;
 }
 
 /**
- * Whether to post a thread this run. Every 12-18 runs.
+ * Whether to post a thread this run. Every 8-12 runs (~3-4 threads/day).
  */
 export function shouldPostThread(runNumber: number): boolean {
-    const period = 12 + Math.floor(Math.random() * 7); // 12-18
+    const period = 8 + Math.floor(Math.random() * 5); // 8-12
     return runNumber % period === 0;
 }

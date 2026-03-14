@@ -74,6 +74,18 @@ function saveTargets(targets: string[]) {
                     navigating = true;
                     navigatingOwner = 'watcher';
 
+                    // Quick badge check before full inbox scrape
+                    const page = dm.getPage();
+                    if (page) {
+                        try {
+                            const { readTwitterBadges } = await import('./client/NotificationBadgeReader');
+                            const badges = await readTwitterBadges(page);
+                            if (badges.dms > 0) {
+                                logger.info(`[twitter-dm-scheduler] Badge: ${badges.dms} unread DMs detected`);
+                            }
+                        } catch (_) { /* non-fatal */ }
+                    }
+
                     logger.info('[twitter-dm-scheduler] Checking inbox for new messages...');
                     const conversations = await dm.scrapeInbox();
                     const unread = conversations.filter(c => c.unread);
@@ -229,7 +241,7 @@ function saveTargets(targets: string[]) {
             logger.error(`[twitter-dm-scheduler] Pipeline loop crashed fatally: ${formatError(e)}`);
         });
 
-        await Promise.all([watcherPromise, pipelinePromise]);
+        await Promise.allSettled([watcherPromise, pipelinePromise]);
 
     } catch (e) {
         logger.error(`[twitter-dm-scheduler] Fatal error: ${formatError(e)}`);

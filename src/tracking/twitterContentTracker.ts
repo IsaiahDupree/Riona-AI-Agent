@@ -29,7 +29,7 @@ export interface TrackedTweet {
     tweetUrl: string;
     text: string;
     type: 'tweet' | 'thread' | 'quote';
-    contentType: 'value' | 'engagement' | 'promotional';
+    contentType: 'value' | 'engagement' | 'promotional' | 'personal';
     style: string;
     topic: string;
     niche: string;

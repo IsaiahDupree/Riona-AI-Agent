@@ -850,6 +850,20 @@ export async function processTweetWithRetry(
                 }
             }
 
+            // Content filter — language, topic, risk, blocked accounts
+            const { filterTweet } = await import('../filters/twitter-content-filter');
+            const filterResult = filterTweet(metadata.text, metadata.username, metadata.displayName);
+            if (!filterResult.allowed) {
+                logger.info('Content filter blocked tweet', {
+                    component: 'Twitter-Core',
+                    event: 'tweet_skipped_filter',
+                    gate: filterResult.gate,
+                    reason: filterResult.reason,
+                    username: metadata.username,
+                });
+                return { success: false, skipped: true, details: `Filter: ${filterResult.reason}`, metadata };
+            }
+
             // Capture screenshot artifact when tracing
             if (trace && trace.runId) {
                 try {

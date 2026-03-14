@@ -238,6 +238,21 @@ async function scheduledRun() {
             try {
                 const page = twitterAI.getPage();
                 if (page) {
+                    // ── Read badge counts (DMs + notifications) ────────────
+                    try {
+                        const { readTwitterBadges, getActionsFromBadges } = await import('./client/NotificationBadgeReader');
+                        const badges = await readTwitterBadges(page);
+                        if (badges.dms > 0 || badges.notifications > 0) {
+                            logger.info(`[twitter-scheduler] Badges: ${badges.dms} DMs, ${badges.notifications} notifications`);
+                        }
+                        // If DMs detected, trigger inbox scrape via DM pipeline
+                        if (badges.dms > 0) {
+                            logger.info(`[twitter-scheduler] ${badges.dms} unread DMs detected — DM scheduler should handle these`);
+                        }
+                    } catch (badgeErr) {
+                        logger.debug(`[twitter-scheduler] Badge read failed (non-fatal): ${formatError(badgeErr)}`);
+                    }
+
                     const { shouldPostContent } = await import('./strategy/twitter-content-calendar');
                     const { postStrategicContent } = await import('./client/Twitter-AI');
 

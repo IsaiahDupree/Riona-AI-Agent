@@ -557,6 +557,15 @@ export async function runTwitterBatch(
                         continue;
                     }
 
+                    // ── Content filter — language, topic, risk, blocked accounts ──
+                    const { filterTweet } = await import('../filters/twitter-content-filter');
+                    const filterResult = filterTweet(metadata.text, metadata.username, metadata.displayName);
+                    if (!filterResult.allowed) {
+                        logger.info(`[twitter-batch] SKIP (filter: ${filterResult.gate}) @${metadata.username}: ${filterResult.reason}`);
+                        session.tweetsSkippedOther++;
+                        continue;
+                    }
+
                     logger.info(`[twitter-batch] @${metadata.username}: "${metadata.text.slice(0, 80)}..."`);
 
                     // Like the tweet (if not already liked)
@@ -874,6 +883,15 @@ export async function runTwitterNicheBatch(
 
                 if (!meta.text) {
                     logger.warn(`[twitter-niche] No tweet text found on ${tweetUrl}, skipping`);
+                    session.tweetsSkippedOther++;
+                    continue;
+                }
+
+                // ── Content filter — language, topic, risk, blocked accounts ──
+                const { filterTweet } = await import('../filters/twitter-content-filter');
+                const filterResult = filterTweet(meta.text, meta.username);
+                if (!filterResult.allowed) {
+                    logger.info(`[twitter-niche] SKIP (filter: ${filterResult.gate}) @${meta.username}: ${filterResult.reason}`);
                     session.tweetsSkippedOther++;
                     continue;
                 }
@@ -1430,7 +1448,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 export async function generateTweetContent(options: {
     topic?: string;
     niche?: string;
-    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story' | 'personal_story' | 'insight' | 'hot_take';
     includeHashtags?: boolean;
     maxLength?: number;
     brandContext?: string;
@@ -1450,10 +1468,13 @@ export async function generateTweetContent(options: {
 
     const styleGuide: Record<string, string> = {
         informative: 'Share a fact, insight, or trend that your audience would find valuable.',
-        opinion: 'Share a strong but respectful opinion or hot take.',
-        question: 'Ask a thought-provoking question that encourages discussion.',
-        tip: 'Share a practical, actionable tip or hack.',
-        story: 'Share a brief personal anecdote or observation.'
+        opinion: 'Share a strong but respectful opinion or hot take that sparks debate.',
+        question: 'Ask a thought-provoking question that encourages discussion and replies.',
+        tip: 'Share a practical, actionable tip or hack people can use right now.',
+        story: 'Share a brief personal anecdote or observation.',
+        personal_story: 'Share a real personal experience — a struggle, win, lesson learned, or behind-the-scenes moment. Be vulnerable and authentic. First person. Make people feel like they know you.',
+        insight: 'Share a non-obvious insight or contrarian observation from your experience. Something most people get wrong or overlook. Position yourself as someone who sees patterns others miss.',
+        hot_take: 'Share a bold, provocative opinion that challenges conventional wisdom. Be confident and direct. The kind of tweet that makes people either strongly agree or reply to argue.',
     };
 
     const prompt = `Generate an original tweet about ${topic || niche}.
@@ -1542,12 +1563,12 @@ Reply with each tweet on a new line, numbered.`;
 export async function postOriginalTweet(page: Page, options: {
     topic?: string;
     niche?: string;
-    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story' | 'personal_story' | 'insight' | 'hot_take';
     mediaPath?: string;
     brandContext?: string;
     learningContext?: string;
     offerContext?: string;
-    contentType?: 'value' | 'engagement' | 'promotional';
+    contentType?: 'value' | 'engagement' | 'promotional' | 'personal';
     offerId?: string;
 } = {}): Promise<PostTweetResult> {
     logger.info('[twitter-ai] Generating original tweet content...');
@@ -1614,7 +1635,7 @@ export async function postAIThread(page: Page, options: {
     tweetCount?: number;
     brandContext?: string;
     learningContext?: string;
-    contentType?: 'value' | 'engagement' | 'promotional';
+    contentType?: 'value' | 'engagement' | 'promotional' | 'personal';
 } = { topic: 'AI trends' }): Promise<PostTweetResult> {
     logger.info(`[twitter-ai] Generating thread about: ${options.topic}`);
 
@@ -1679,6 +1700,7 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
     const learningContext = getContentLearningContext(slot.type, slot.style);
     const offerContext = slot.offerId ? getOfferContext(brand, slot.offerId) : null;
 
+    // Thread posts
     if (slot.style === 'thread') {
         return postAIThread(page, {
             topic: slot.topic || slot.niche || brand.niche,
@@ -1690,7 +1712,15 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
         });
     }
 
-    const style = (slot.style as string) === 'thread' ? 'informative' : slot.style as 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+    // Quote tweet — find a tweet in the feed and add commentary
+    if (slot.style === 'quote_tweet') {
+        return postStrategicQuoteTweet(page, {
+            niche: slot.niche || brand.niche,
+            brandContext,
+        });
+    }
+
+    const style = slot.style as 'informative' | 'opinion' | 'question' | 'tip' | 'story' | 'personal_story' | 'insight' | 'hot_take';
 
     return postOriginalTweet(page, {
         topic: slot.topic || slot.niche || brand.niche,
@@ -1702,6 +1732,94 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
         contentType: slot.type,
         offerId: slot.offerId,
     });
+}
+
+/**
+ * Find an interesting tweet in the feed and quote-tweet it with AI commentary.
+ */
+async function postStrategicQuoteTweet(page: Page, options: {
+    niche: string;
+    brandContext?: string;
+}): Promise<PostTweetResult> {
+    try {
+        // Navigate to home feed
+        await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 15000 });
+        await delay(3000);
+
+        // Find tweets in the feed that are worth quote-tweeting
+        const tweets = await page.$$('article[data-testid="tweet"]');
+        if (tweets.length === 0) {
+            return { success: false, error: 'No tweets found in feed for quote tweeting' };
+        }
+
+        // Try up to 5 tweets to find one worth quoting
+        const candidates = tweets.slice(0, Math.min(tweets.length, 8));
+        // Shuffle to add variety
+        for (let i = candidates.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+        }
+
+        for (const tweet of candidates.slice(0, 5)) {
+            try {
+                const metadata = await extractTweetMetadata(tweet, page);
+                if (!metadata || !metadata.text || metadata.text.length < 20) continue;
+                // Skip our own tweets and retweets
+                if (metadata.isRetweet) continue;
+
+                // Content filter — skip political/toxic/non-English tweets
+                const { filterTweet: filterQT } = await import('../filters/twitter-content-filter');
+                const qtFilter = filterQT(metadata.text, metadata.username, metadata.displayName);
+                if (!qtFilter.allowed) {
+                    logger.debug(`[twitter-ai] QT skip (${qtFilter.gate}): ${qtFilter.reason}`);
+                    continue;
+                }
+
+                const result = await aiQuoteTweet(page, tweet, metadata.text, metadata.username || 'unknown', {
+                    niche: options.niche,
+                });
+
+                if (result.success) {
+                    // Track as strategic content
+                    try {
+                        const { trackTweet } = await import('../tracking/twitterContentTracker');
+                        const { syncTweetToSupabase } = await import('../db/supabaseTwitterContent');
+                        const tracked = trackTweet({
+                            tweetUrl: result.tweetUrl || '',
+                            text: `QT @${metadata.username}: ${metadata.text.slice(0, 100)}`,
+                            type: 'quote',
+                            contentType: 'engagement',
+                            style: 'quote_tweet',
+                            topic: options.niche,
+                            niche: options.niche,
+                            postedAt: new Date().toISOString(),
+                        });
+                        syncTweetToSupabase(tracked).catch(e =>
+                            logger.warn(`[twitter-ai] Supabase quote tweet sync failed: ${formatError(e)}`)
+                        );
+                    } catch (trackErr) {
+                        logger.warn(`[twitter-ai] Quote tweet tracking failed (non-fatal): ${formatError(trackErr)}`);
+                    }
+                    return result;
+                }
+            } catch (qtErr) {
+                logger.debug(`[twitter-ai] Quote tweet attempt failed: ${formatError(qtErr)}`);
+                continue;
+            }
+        }
+
+        // Fallback: post an opinion tweet instead
+        logger.info('[twitter-ai] No suitable tweet found for quoting, falling back to hot take');
+        return postOriginalTweet(page, {
+            niche: options.niche,
+            style: 'hot_take',
+            contentType: 'engagement',
+            brandContext: options.brandContext,
+        });
+    } catch (e) {
+        logger.warn(`[twitter-ai] Strategic quote tweet failed: ${formatError(e)}`);
+        return { success: false, error: formatError(e) };
+    }
 }
 
 // ── Auto-follow prospects ────────────────────────────────────────────
@@ -1717,7 +1835,7 @@ export async function autoFollowProspects(page: Page, options: {
     let usernames: string[] = [];
 
     if (source === 'outreach_targets') {
-        const targets = safeReadJSON<string[]>(TARGETS_FILE, []);
+        const targets = safeReadJSON<string[]>(TARGETS_FILE, [], 'twitter_outreach_targets');
         usernames = targets.slice(0, maxFollows);
     } else if (source === 'niche_search' && niche) {
         usernames = await collectNicheProspects(page, niche, maxFollows);
