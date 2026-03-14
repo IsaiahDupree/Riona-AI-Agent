@@ -27,7 +27,11 @@ TraceSchema.index({ startedAt: -1 });
 export const TraceModel = mongoose.models.Trace || mongoose.model<TraceRecord>('Trace', TraceSchema);
 
 export async function saveTrace(t: TraceRecord) {
-  await TraceModel.updateOne({ runId: t.runId }, t, { upsert: true });
+  try {
+    await TraceModel.updateOne({ runId: t.runId }, t, { upsert: true });
+  } catch (error) {
+    // Fail silently when MongoDB is unavailable - tracing is non-critical
+  }
 }
 
 export async function getTrace(runId: string) {

@@ -7,16 +7,21 @@ import { delay } from '../utils/delay';
 import * as path from 'path';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
+import OpenAI from 'openai';
 import {
     extractTweetMetadata, generateReply, validateReply,
     postReply, likeTweet, hasAlreadyReplied, hasAlreadyLiked,
-    extractTweetUrl, processTweets, TweetMetadata
+    extractTweetUrl, processTweets, TweetMetadata,
+    postTweet, quoteTweet, postThread, followUser, unfollowUser, bookmarkTweet,
+    PostTweetOptions, PostTweetResult, ThreadTweet
 } from './Twitter-Core';
 import {
     hasRepliedToTweet, trackReply, getTodayReplyCount,
     createSession, saveSession, updateDailyStats,
     SessionLog, TrackedReply
 } from '../tracking/twitterTracker';
+import { hasSentTwitterDMTo } from '../tracking/twitterDMTracker';
+import { safeReadJSON, safeWriteJSON } from '../utils/errors';
 import { startRun, pushStep, finishRun } from '../trace/runtime';
 import { saveTrace } from '../trace/store';
 
@@ -146,6 +151,7 @@ export class TwitterAI {
                 headless: false,
                 defaultViewport: null,
                 executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                userDataDir: process.env.TWITTER_CHROME_PROFILE || './chrome-profile-twitter',
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -156,12 +162,12 @@ export class TwitterAI {
                     '--window-position=0,0',
                     '--ignore-certificate-errors',
                     '--ignore-certificate-errors-spki-list',
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                     '--start-maximized'
                 ]
             });
 
-            this.page = await this.browser.newPage();
+            const pages = await this.browser.pages();
+            this.page = pages[0] || await this.browser.newPage();
             if (this.page) {
                 this.page.setDefaultNavigationTimeout(TWITTER_TIMEOUT_MS);
                 this.page.setDefaultTimeout(TWITTER_TIMEOUT_MS);
@@ -184,31 +190,41 @@ export class TwitterAI {
         if (!this.page) return;
 
         try {
+            // With userDataDir, the browser may already have a valid session.
+            // Navigate to home and check if we're logged in.
+            await this.page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: TWITTER_TIMEOUT_MS });
+            await delay(2000);
+
+            const currentUrl = this.page.url();
+            if (!currentUrl.includes('/login') && !currentUrl.includes('/i/flow/login')) {
+                logger.info('Twitter session valid (via browser profile)');
+                this.isLoggedIn = true;
+                await dismissPopups(this.page, '[init]');
+                return;
+            }
+
+            // If we have a cookies JSON file, try loading those
             if (fs.existsSync(this.cookiesPath)) {
                 const cookiesString = fs.readFileSync(this.cookiesPath, 'utf8');
                 const cookies = JSON.parse(cookiesString);
                 await this.page.setCookie(...cookies);
-                logger.info('Twitter cookies loaded successfully');
+                logger.info('Twitter cookies loaded from file');
 
-                // Verify cookies are still valid
                 await this.page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: TWITTER_TIMEOUT_MS });
-
-                // Check if redirected to login page
-                const currentUrl = this.page.url();
-                if (currentUrl.includes('/login') || currentUrl.includes('/i/flow/login')) {
-                    logger.info('Twitter cookies expired, logging in again');
-                    await this.login();
-                } else {
+                const urlAfterCookies = this.page.url();
+                if (!urlAfterCookies.includes('/login') && !urlAfterCookies.includes('/i/flow/login')) {
                     logger.info('Twitter cookies are valid');
                     this.isLoggedIn = true;
-                    // Dismiss any popups after cookie login
                     await delay(2000);
                     await dismissPopups(this.page, '[init]');
+                    return;
                 }
+                logger.info('Twitter cookies expired, logging in again');
             } else {
                 logger.info('No Twitter cookies found, performing fresh login');
-                await this.login();
             }
+
+            await this.login();
         } catch (error) {
             logger.error('Error loading Twitter cookies:', error);
             await this.login();
@@ -418,10 +434,11 @@ export async function runTwitterBatch(
     username: string,
     postsPerRun: number = TWITTER_POSTS_PER_RUN,
     trace?: any
-): Promise<{ commentsPosted: number; session: SessionLog }> {
+): Promise<{ commentsPosted: number; session: SessionLog; twitterAI?: TwitterAI }> {
     const twitterAI = new TwitterAI();
     const session = createSession();
     let commentsPosted = 0;
+    let keepOpen = false;
 
     try {
         if (trace) pushStep(trace, { name: 'twitter_init_browser', status: 'ok' });
@@ -627,20 +644,24 @@ export async function runTwitterBatch(
         }
 
         logger.info(`[twitter-batch] Batch complete: ${commentsPosted} replies posted, ${session.repliesVerified} verified, ${session.tweetsSkippedDuplicate} duplicates skipped`);
+        keepOpen = true;
     } catch (error: any) {
         if (trace) pushStep(trace, { name: 'twitter_batch_error', status: 'error', notes: error?.message });
         session.errors.push(error?.message || 'Unknown error');
         logger.error('[twitter-batch] Error in batch run:', error);
     } finally {
-        if (trace) pushStep(trace, { name: 'twitter_close_browser', status: 'ok' });
-        await twitterAI.close();
+        if (!keepOpen) {
+            if (trace) pushStep(trace, { name: 'twitter_close_browser', status: 'ok' });
+            await twitterAI.close();
+        }
 
         // Save session report and update daily stats
         saveSession(session);
         updateDailyStats(session);
     }
 
-    return { commentsPosted, session };
+    // Return twitterAI so caller can reuse the browser for content posting before closing
+    return { commentsPosted, session, twitterAI: keepOpen ? twitterAI : undefined };
 }
 
 // ── runTwitterNicheBatch ─────────────────────────────────────────────
@@ -656,10 +677,11 @@ export async function runTwitterNicheBatch(
     searchTerm: string,
     postsPerRun: number = TWITTER_POSTS_PER_RUN,
     trace?: any
-): Promise<{ commentsPosted: number; session: SessionLog }> {
+): Promise<{ commentsPosted: number; session: SessionLog; twitterAI?: TwitterAI }> {
     const twitterAI = new TwitterAI();
     const session = createSession();
     let commentsPosted = 0;
+    let keepOpen = false;
 
     try {
         await twitterAI.initialize();
@@ -971,16 +993,396 @@ export async function runTwitterNicheBatch(
             failed: session.repliesFailed
         });
 
+        keepOpen = true;
     } catch (error: any) {
         session.errors.push(error?.message || 'Unknown error');
         logger.error(`[twitter-niche] Fatal error in niche batch for "${searchTerm}":`, error);
     } finally {
-        await twitterAI.close();
+        if (!keepOpen) {
+            await twitterAI.close();
+        }
         saveSession(session);
         updateDailyStats(session);
     }
 
-    return { commentsPosted, session };
+    return { commentsPosted, session, twitterAI: keepOpen ? twitterAI : undefined };
+}
+
+// ── Multi-Niche Blitz ────────────────────────────────────────────────
+
+/**
+ * Rapidly reply across multiple niches in a single browser session.
+ * Reuses one browser instance, navigating search → collect → reply for each niche.
+ *
+ * @param niches - Array of search terms / niches to target
+ * @param repliesPerNiche - How many replies per niche (default 1)
+ * @param options.delayBetweenReplies - ms between replies (default 3000-5000)
+ * @param options.delayBetweenNiches - ms between niche switches (default 2000)
+ * @param options.maxScrollsPerNiche - max scroll attempts to collect tweets (default 3)
+ */
+export async function runMultiNicheBlitz(
+    niches: string[],
+    repliesPerNiche: number = 1,
+    options: {
+        delayBetweenReplies?: [number, number];
+        delayBetweenNiches?: number;
+        maxScrollsPerNiche?: number;
+    } = {}
+): Promise<{
+    totalReplies: number;
+    perNiche: Record<string, number>;
+    session: SessionLog;
+    durationSec: number;
+    twitterAI?: TwitterAI;
+}> {
+    const {
+        delayBetweenReplies = [3000, 5000],
+        delayBetweenNiches = 2000,
+        maxScrollsPerNiche = 3,
+    } = options;
+
+    const startTime = Date.now();
+    const twitterAI = new TwitterAI();
+    const session = createSession();
+    const perNiche: Record<string, number> = {};
+    let totalReplies = 0;
+    let keepOpen = false;
+
+    try {
+        await twitterAI.initialize();
+        if (!twitterAI.getPage()) throw new Error('Page not initialized');
+        let page = twitterAI.getPage()!;
+
+        const botUsername = (process.env.TWITTER_BOT_USERNAME || '').toLowerCase().replace(/@/g, '');
+
+        logger.info(`[multi-niche] Starting blitz: ${niches.length} niches x ${repliesPerNiche} replies = ${niches.length * repliesPerNiche} target`);
+
+        for (let ni = 0; ni < niches.length; ni++) {
+            const niche = niches[ni];
+            perNiche[niche] = 0;
+
+            logger.info(`[multi-niche] ── Niche ${ni + 1}/${niches.length}: "${niche}" ──`);
+
+            try {
+                // Navigate to search
+                const searchUrl = `https://x.com/search?q=${encodeURIComponent(niche)}&src=typed_query&f=top`;
+                await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: TWITTER_TIMEOUT_MS });
+                await delay(3000);
+                await dismissPopups(page, '[multi-niche]');
+
+                // Collect tweet URLs (minimal scrolling for speed)
+                let tweetUrls: string[] = [];
+                for (let scroll = 0; scroll < maxScrollsPerNiche; scroll++) {
+                    const urls: string[] = await page.evaluate(() => {
+                        const articles = document.querySelectorAll('article[data-testid="tweet"]');
+                        const hrefs: string[] = [];
+                        for (const article of articles) {
+                            const timeEl = article.querySelector('time');
+                            if (timeEl) {
+                                const link = timeEl.closest('a');
+                                if (link) {
+                                    const href = link.getAttribute('href');
+                                    if (href && href.match(/\/[^/]+\/status\/\d+/)) {
+                                        hrefs.push(`https://x.com${href}`);
+                                    }
+                                }
+                            }
+                        }
+                        return [...new Set(hrefs)];
+                    });
+
+                    const urlSet = new Set(tweetUrls);
+                    for (const u of urls) urlSet.add(u);
+                    tweetUrls = [...urlSet];
+
+                    if (tweetUrls.length >= repliesPerNiche * 2) break; // 2x buffer for skips
+
+                    await page.evaluate(() => window.scrollBy(0, 1200));
+                    await delay(1500);
+                }
+
+                logger.info(`[multi-niche] Collected ${tweetUrls.length} tweets for "${niche}"`);
+
+                if (tweetUrls.length === 0) {
+                    logger.warn(`[multi-niche] No tweets found for "${niche}", skipping`);
+                    continue;
+                }
+
+                // Process tweets until we hit repliesPerNiche
+                let nicheReplies = 0;
+
+                for (const tweetUrl of tweetUrls) {
+                    if (nicheReplies >= repliesPerNiche) break;
+
+                    try {
+                        // Dedup check
+                        if (hasRepliedToTweet(tweetUrl)) {
+                            session.tweetsSkippedDuplicate++;
+                            continue;
+                        }
+
+                        // Navigate to tweet
+                        await page.goto(tweetUrl, { waitUntil: 'domcontentloaded', timeout: TWITTER_TIMEOUT_MS });
+                        await delay(2000);
+                        await dismissPopups(page, '[multi-niche]');
+
+                        await page.waitForSelector('article[data-testid="tweet"]', { timeout: 8000 }).catch(() => {});
+
+                        // Extract metadata
+                        const meta = await page.evaluate(() => {
+                            const article = document.querySelector('article[data-testid="tweet"]');
+                            if (!article) return null;
+
+                            let username = 'unknown';
+                            const userNameEl = article.querySelector('[data-testid="User-Name"]');
+                            if (userNameEl) {
+                                const handleMatch = (userNameEl.textContent || '').match(/@([a-zA-Z0-9_]+)/);
+                                if (handleMatch) username = handleMatch[1];
+                            }
+                            if (username === 'unknown') {
+                                const userLink = article.querySelector('a[href*="/"]');
+                                if (userLink) {
+                                    const href = userLink.getAttribute('href') || '';
+                                    const match = href.match(/^\/([a-zA-Z0-9_]+)\/?$/);
+                                    if (match) username = match[1];
+                                }
+                            }
+
+                            const tweetTextEl = article.querySelector('[data-testid="tweetText"]');
+                            const text = tweetTextEl ? (tweetTextEl.textContent || '').trim() : '';
+                            const isRetweet = Boolean(article.querySelector('[data-testid="socialContext"]'));
+                            const likeBtn = article.querySelector('[data-testid="like"]');
+                            const unlikeBtn = article.querySelector('[data-testid="unlike"]');
+
+                            return { username, text, isRetweet, alreadyLiked: Boolean(unlikeBtn), hasLikeBtn: Boolean(likeBtn) };
+                        });
+
+                        if (!meta || !meta.text) {
+                            session.tweetsSkippedOther++;
+                            continue;
+                        }
+
+                        session.tweetsProcessed++;
+
+                        if (meta.isRetweet) { session.tweetsSkippedOther++; continue; }
+                        if (botUsername && meta.username.toLowerCase() === botUsername) { session.tweetsSkippedOther++; continue; }
+
+                        // Like
+                        if (meta.hasLikeBtn && !meta.alreadyLiked) {
+                            await page.evaluate(() => {
+                                const btn = document.querySelector('article[data-testid="tweet"] [data-testid="like"]') as HTMLElement;
+                                if (btn) btn.click();
+                            });
+                            await delay(800);
+                            session.likesPosted++;
+                        }
+
+                        // Generate + validate reply
+                        const reply = await generateReply(meta.text, meta.username);
+                        if (!reply) { session.repliesFailed++; continue; }
+                        const validation = validateReply(reply);
+                        if (!validation.valid) { session.repliesFailed++; continue; }
+
+                        // Post reply
+                        const tweetArticle = await page.$('article[data-testid="tweet"]');
+                        if (!tweetArticle) { session.repliesFailed++; continue; }
+
+                        const replyResult = await postReply(tweetArticle, page, reply);
+                        if (!replyResult.success) {
+                            session.repliesFailed++;
+                            session.errors.push(replyResult.error || `Reply failed: ${tweetUrl}`);
+                            continue;
+                        }
+
+                        // Track
+                        const tracked: TrackedReply = {
+                            tweetUrl,
+                            tweetAuthor: meta.username,
+                            replyText: reply,
+                            timestamp: new Date().toISOString(),
+                            verified: true,
+                            sessionId: session.sessionId,
+                            tweetSnippet: meta.text.slice(0, 100),
+                            liked: !meta.alreadyLiked,
+                            retweeted: false,
+                        };
+                        trackReply(tracked);
+                        session.repliesPosted++;
+                        session.repliesVerified++;
+                        session.replies.push(tracked);
+                        nicheReplies++;
+                        totalReplies++;
+
+                        logger.info(`[multi-niche] Reply ${nicheReplies}/${repliesPerNiche} on "${niche}" → @${meta.username}: "${reply.slice(0, 60)}..."`);
+
+                        // Inter-reply delay
+                        if (nicheReplies < repliesPerNiche) {
+                            await delay(getRandomDelay(delayBetweenReplies[0], delayBetweenReplies[1]));
+                        }
+
+                    } catch (tweetErr) {
+                        const errMsg = formatError(tweetErr);
+                        logger.warn(`[multi-niche] Error on ${tweetUrl}: ${errMsg}`);
+                        session.repliesFailed++;
+                        session.errors.push(errMsg);
+
+                        if (errMsg.includes('detached Frame') || errMsg.includes('Session closed') || errMsg.includes('Target closed')) {
+                            const freshPage = await twitterAI.getFreshPage();
+                            if (freshPage) { page = freshPage; } else break;
+                        }
+                    }
+                }
+
+                perNiche[niche] = nicheReplies;
+                logger.info(`[multi-niche] "${niche}" done: ${nicheReplies}/${repliesPerNiche} replies`);
+
+            } catch (nicheErr) {
+                logger.warn(`[multi-niche] Niche "${niche}" failed: ${formatError(nicheErr)}`);
+                session.errors.push(`Niche "${niche}": ${formatError(nicheErr)}`);
+
+                // Recover page for next niche
+                const freshPage = await twitterAI.getFreshPage();
+                if (freshPage) { page = freshPage; } else break;
+            }
+
+            // Delay between niches
+            if (ni < niches.length - 1) {
+                await delay(delayBetweenNiches);
+            }
+        }
+
+        keepOpen = true;
+    } catch (error: any) {
+        session.errors.push(error?.message || 'Unknown error');
+        logger.error('[multi-niche] Fatal error:', error);
+    } finally {
+        if (!keepOpen) await twitterAI.close();
+        saveSession(session);
+        updateDailyStats(session);
+    }
+
+    const durationSec = Math.round((Date.now() - startTime) / 1000);
+    const nicheResults = Object.entries(perNiche).map(([n, c]) => `${n}: ${c}`).join(', ');
+    logger.info(`[multi-niche] Blitz complete in ${durationSec}s: ${totalReplies} replies across ${niches.length} niches (${nicheResults})`);
+
+    return { totalReplies, perNiche, session, durationSec, twitterAI: keepOpen ? twitterAI : undefined };
+}
+
+// ── Prospect Collection ─────────────────────────────────────────────
+
+const OUTREACH_TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
+
+/**
+ * Discover prospects by searching Twitter for a term and extracting usernames.
+ */
+export async function collectNicheProspects(
+    page: Page,
+    searchTerm: string,
+    maxProspects = 20
+): Promise<string[]> {
+    logger.info(`[twitter-ai] Collecting prospects for "${searchTerm}"...`);
+
+    await page.goto(`https://x.com/search?q=${encodeURIComponent(searchTerm)}&f=top`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000
+    });
+    await delay(3000);
+
+    const collected = new Set<string>();
+    const scrollAttempts = Math.min(10, Math.ceil(maxProspects / 5));
+
+    for (let i = 0; i < scrollAttempts && collected.size < maxProspects; i++) {
+        const usernames = await page.evaluate(() => {
+            const results: string[] = [];
+            const tweets = document.querySelectorAll('article[data-testid="tweet"]');
+            for (const tweet of tweets) {
+                const userNameEl = tweet.querySelector('div[data-testid="User-Name"]');
+                if (!userNameEl) continue;
+                const spans = userNameEl.querySelectorAll('span');
+                for (const span of spans) {
+                    const text = span.textContent?.trim() || '';
+                    if (text.startsWith('@')) {
+                        results.push(text.slice(1));
+                        break;
+                    }
+                }
+            }
+            return results;
+        });
+
+        for (const u of usernames) {
+            if (collected.size >= maxProspects) break;
+            // Skip if already DMd
+            if (hasSentTwitterDMTo(u)) continue;
+            collected.add(u);
+        }
+
+        // Scroll down for more results
+        await page.evaluate(() => window.scrollBy(0, 800));
+        await delay(2000);
+    }
+
+    const prospects = Array.from(collected);
+
+    // Merge with existing targets file
+    const existing = safeReadJSON<string[]>(OUTREACH_TARGETS_FILE, [], 'twitter_outreach_targets');
+    const merged = Array.from(new Set([...existing, ...prospects]));
+    safeWriteJSON(OUTREACH_TARGETS_FILE, merged, 'twitter_outreach_targets');
+
+    logger.info(`[twitter-ai] Collected ${prospects.length} new prospects for "${searchTerm}" (${merged.length} total targets)`);
+    return prospects;
+}
+
+/**
+ * Collect followers from a specific Twitter user's followers page.
+ */
+export async function collectFollowers(
+    page: Page,
+    username: string,
+    maxFollowers = 50
+): Promise<string[]> {
+    logger.info(`[twitter-ai] Collecting followers of @${username}...`);
+
+    await page.goto(`https://x.com/${username}/followers`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000
+    });
+    await delay(3000);
+
+    const collected = new Set<string>();
+    const scrollAttempts = Math.min(15, Math.ceil(maxFollowers / 5));
+
+    for (let i = 0; i < scrollAttempts && collected.size < maxFollowers; i++) {
+        const usernames = await page.evaluate(() => {
+            const results: string[] = [];
+            const cells = document.querySelectorAll('div[data-testid="cellInnerDiv"], div[data-testid="UserCell"]');
+            for (const cell of cells) {
+                const links = cell.querySelectorAll('a[href^="/"]');
+                for (const link of links) {
+                    const href = link.getAttribute('href') || '';
+                    const parts = href.split('/').filter(Boolean);
+                    if (parts.length === 1 && !['home', 'explore', 'notifications', 'messages', 'settings'].includes(parts[0])) {
+                        results.push(parts[0]);
+                        break;
+                    }
+                }
+            }
+            return results;
+        });
+
+        for (const u of usernames) {
+            if (collected.size >= maxFollowers) break;
+            if (hasSentTwitterDMTo(u)) continue;
+            collected.add(u);
+        }
+
+        await page.evaluate(() => window.scrollBy(0, 600));
+        await delay(2000);
+    }
+
+    const followers = Array.from(collected);
+    logger.info(`[twitter-ai] Collected ${followers.length} followers of @${username}`);
+    return followers;
 }
 
 // ── runTwitter (top-level entry, mirrors runInstagram) ───────────────
@@ -1017,4 +1419,370 @@ export async function runTwitter(externalTrace?: any): Promise<void> {
     } finally {
         await saveTrace(trace);
     }
+}
+
+// ── OpenAI instance for content generation ───────────────────────────
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ── AI-Powered Original Tweet Generation ─────────────────────────────
+
+export async function generateTweetContent(options: {
+    topic?: string;
+    niche?: string;
+    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+    includeHashtags?: boolean;
+    maxLength?: number;
+    brandContext?: string;
+    learningContext?: string;
+    offerContext?: string;
+} = {}): Promise<string> {
+    const {
+        topic = '',
+        niche = 'tech & AI',
+        style = 'informative',
+        includeHashtags = false,
+        maxLength = 280,
+        brandContext,
+        learningContext,
+        offerContext,
+    } = options;
+
+    const styleGuide: Record<string, string> = {
+        informative: 'Share a fact, insight, or trend that your audience would find valuable.',
+        opinion: 'Share a strong but respectful opinion or hot take.',
+        question: 'Ask a thought-provoking question that encourages discussion.',
+        tip: 'Share a practical, actionable tip or hack.',
+        story: 'Share a brief personal anecdote or observation.'
+    };
+
+    const prompt = `Generate an original tweet about ${topic || niche}.
+
+Style: ${styleGuide[style] || styleGuide.informative}
+${offerContext ? `\nOffer context: ${offerContext}\n` : ''}
+${learningContext ? `\n${learningContext}\n` : ''}
+Rules:
+1. Maximum ${maxLength} characters
+2. Sound authentic — write like a real person, not a brand
+3. No generic motivational quotes
+4. ${includeHashtags ? 'Include 1-2 relevant hashtags' : 'Do NOT include hashtags'}
+5. Be specific and add real value
+6. Do NOT start with "Just" or "I just"
+7. No emojis unless they genuinely add meaning
+8. Write something that would make people want to engage (reply, retweet, like)
+
+Reply with ONLY the tweet text, nothing else.`;
+
+    const systemContent = brandContext
+        ? `${brandContext} You write tweets that are insightful, concise, and drive engagement.`
+        : `You are a knowledgeable voice in the ${niche} space on Twitter/X. You write tweets that are insightful, concise, and drive engagement. Your tone is confident but approachable.`;
+
+    const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            { role: 'system', content: systemContent },
+            { role: 'user', content: prompt }
+        ],
+        max_tokens: 150,
+        temperature: 0.9
+    });
+
+    const content = completion.choices[0]?.message?.content?.trim() || '';
+    // Strip surrounding quotes if present
+    return content.replace(/^["']|["']$/g, '');
+}
+
+// ── AI-Powered Thread Generation ─────────────────────────────────────
+
+export async function generateThreadContent(options: {
+    topic: string;
+    niche?: string;
+    tweetCount?: number;
+} = { topic: 'AI trends' }): Promise<string[]> {
+    const { topic, niche = 'tech & AI', tweetCount = 4 } = options;
+
+    const prompt = `Write a Twitter/X thread of exactly ${tweetCount} tweets about: ${topic}
+
+Rules:
+1. First tweet should be a hook — grab attention, make people want to read more
+2. Each tweet is max 280 characters
+3. Number each tweet (1/, 2/, etc.) at the start
+4. Last tweet should end with a call-to-action (ask a question, invite discussion)
+5. Sound like a real person, not a content mill
+6. Be specific with examples, data, or insights
+7. No hashtags except optionally in the last tweet
+8. Each tweet should stand alone but flow as a story
+
+Reply with each tweet on a new line, numbered.`;
+
+    const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            {
+                role: 'system',
+                content: `You are a thought leader in ${niche} who writes viral Twitter threads. Your threads educate, inspire, and drive discussion.`
+            },
+            { role: 'user', content: prompt }
+        ],
+        max_tokens: 600,
+        temperature: 0.85
+    });
+
+    const raw = completion.choices[0]?.message?.content?.trim() || '';
+    // Parse numbered tweets: "1/ ...", "2/ ...", etc.
+    const tweets = raw.split(/\n+/)
+        .map(line => line.replace(/^\d+[\/\.]\s*/, '').trim())
+        .filter(line => line.length > 0 && line.length <= 280);
+
+    return tweets.length > 0 ? tweets : [raw.slice(0, 280)];
+}
+
+// ── Orchestrator: Post an original AI-generated tweet ────────────────
+
+export async function postOriginalTweet(page: Page, options: {
+    topic?: string;
+    niche?: string;
+    style?: 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+    mediaPath?: string;
+    brandContext?: string;
+    learningContext?: string;
+    offerContext?: string;
+    contentType?: 'value' | 'engagement' | 'promotional';
+    offerId?: string;
+} = {}): Promise<PostTweetResult> {
+    logger.info('[twitter-ai] Generating original tweet content...');
+
+    const text = await generateTweetContent({
+        topic: options.topic,
+        niche: options.niche,
+        style: options.style,
+        brandContext: options.brandContext,
+        learningContext: options.learningContext,
+        offerContext: options.offerContext,
+    });
+
+    if (!text) {
+        logger.error('[twitter-ai] Failed to generate tweet content');
+        return { success: false, error: 'Failed to generate content' };
+    }
+
+    logger.info(`[twitter-ai] Generated tweet: "${text.slice(0, 80)}..."`);
+
+    const tweetOptions: PostTweetOptions = { text };
+    if (options.mediaPath) tweetOptions.mediaPath = options.mediaPath;
+
+    const result = await postTweet(page, tweetOptions);
+
+    if (result.success) {
+        logger.info(`[twitter-ai] Posted original tweet successfully: ${result.tweetUrl || 'no URL'}`);
+
+        // Track tweet + sync to Supabase
+        try {
+            const { trackTweet } = await import('../tracking/twitterContentTracker');
+            const { syncTweetToSupabase } = await import('../db/supabaseTwitterContent');
+
+            const tracked = trackTweet({
+                tweetUrl: result.tweetUrl || '',
+                text,
+                type: 'tweet',
+                contentType: options.contentType || 'value',
+                style: options.style || 'informative',
+                topic: options.topic || options.niche || '',
+                niche: options.niche || '',
+                offerId: options.offerId,
+                postedAt: new Date().toISOString(),
+            });
+
+            syncTweetToSupabase(tracked).catch(e =>
+                logger.warn(`[twitter-ai] Supabase tweet sync failed: ${formatError(e)}`)
+            );
+        } catch (trackErr) {
+            logger.warn(`[twitter-ai] Tweet tracking failed (non-fatal): ${formatError(trackErr)}`);
+        }
+    } else {
+        logger.error(`[twitter-ai] Failed to post tweet: ${result.error}`);
+    }
+
+    return result;
+}
+
+// ── Orchestrator: Post an AI-generated thread ────────────────────────
+
+export async function postAIThread(page: Page, options: {
+    topic: string;
+    niche?: string;
+    tweetCount?: number;
+    brandContext?: string;
+    learningContext?: string;
+    contentType?: 'value' | 'engagement' | 'promotional';
+} = { topic: 'AI trends' }): Promise<PostTweetResult> {
+    logger.info(`[twitter-ai] Generating thread about: ${options.topic}`);
+
+    const tweets = await generateThreadContent(options);
+
+    if (!tweets || tweets.length === 0) {
+        logger.error('[twitter-ai] Failed to generate thread content');
+        return { success: false, error: 'Failed to generate thread content' };
+    }
+
+    logger.info(`[twitter-ai] Generated ${tweets.length}-tweet thread`);
+
+    const threadTweets: ThreadTweet[] = tweets.map(text => ({ text }));
+    const result = await postThread(page, threadTweets);
+
+    if (result.success) {
+        logger.info(`[twitter-ai] Posted thread successfully (${tweets.length} tweets)`);
+
+        // Track thread + sync to Supabase
+        try {
+            const { trackTweet } = await import('../tracking/twitterContentTracker');
+            const { syncTweetToSupabase } = await import('../db/supabaseTwitterContent');
+
+            const tracked = trackTweet({
+                tweetUrl: result.tweetUrl || '',
+                text: tweets[0],
+                type: 'thread',
+                contentType: options.contentType || 'value',
+                style: 'thread',
+                topic: options.topic,
+                niche: options.niche || '',
+                postedAt: new Date().toISOString(),
+                threadTweets: tweets,
+            });
+
+            syncTweetToSupabase(tracked).catch(e =>
+                logger.warn(`[twitter-ai] Supabase thread sync failed: ${formatError(e)}`)
+            );
+        } catch (trackErr) {
+            logger.warn(`[twitter-ai] Thread tracking failed (non-fatal): ${formatError(trackErr)}`);
+        }
+    } else {
+        logger.error(`[twitter-ai] Failed to post thread: ${result.error}`);
+    }
+
+    return result;
+}
+
+// ── Strategic Content Orchestrator ────────────────────────────────────
+
+export async function postStrategicContent(page: Page, runNumber: number): Promise<PostTweetResult> {
+    const { loadBrandIdentity, getBrandPromptContext, getOfferContext } = await import('../strategy/twitter-brand');
+    const { getNextContentSlot } = await import('../strategy/twitter-content-calendar');
+    const { getContentLearningContext } = await import('./Twitter-Content-Analytics');
+
+    const brand = loadBrandIdentity();
+    const brandContext = getBrandPromptContext(brand);
+    const slot = getNextContentSlot(runNumber);
+
+    logger.info(`[twitter-ai] Strategic content: ${slot.type}/${slot.style} (niche: ${slot.niche || brand.niche})`);
+
+    const learningContext = getContentLearningContext(slot.type, slot.style);
+    const offerContext = slot.offerId ? getOfferContext(brand, slot.offerId) : null;
+
+    if (slot.style === 'thread') {
+        return postAIThread(page, {
+            topic: slot.topic || slot.niche || brand.niche,
+            niche: slot.niche || brand.niche,
+            tweetCount: 4,
+            brandContext,
+            learningContext,
+            contentType: slot.type,
+        });
+    }
+
+    const style = (slot.style as string) === 'thread' ? 'informative' : slot.style as 'informative' | 'opinion' | 'question' | 'tip' | 'story';
+
+    return postOriginalTweet(page, {
+        topic: slot.topic || slot.niche || brand.niche,
+        niche: slot.niche || brand.niche,
+        style,
+        brandContext,
+        learningContext,
+        offerContext: offerContext || undefined,
+        contentType: slot.type,
+        offerId: slot.offerId,
+    });
+}
+
+// ── Auto-follow prospects ────────────────────────────────────────────
+
+export async function autoFollowProspects(page: Page, options: {
+    maxFollows?: number;
+    source?: 'outreach_targets' | 'niche_search';
+    niche?: string;
+} = {}): Promise<{ followed: string[]; failed: string[] }> {
+    const { maxFollows = 5, source = 'outreach_targets', niche } = options;
+    const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
+
+    let usernames: string[] = [];
+
+    if (source === 'outreach_targets') {
+        const targets = safeReadJSON<string[]>(TARGETS_FILE, []);
+        usernames = targets.slice(0, maxFollows);
+    } else if (source === 'niche_search' && niche) {
+        usernames = await collectNicheProspects(page, niche, maxFollows);
+    }
+
+    const followed: string[] = [];
+    const failed: string[] = [];
+
+    for (const username of usernames) {
+        try {
+            const result = await followUser(page, username);
+            if (result) {
+                followed.push(username);
+                logger.info(`[twitter-ai] Followed @${username}`);
+            } else {
+                failed.push(username);
+            }
+            await delay(getRandomDelay(3000, 6000));
+        } catch (e) {
+            logger.warn(`[twitter-ai] Failed to follow @${username}: ${formatError(e)}`);
+            failed.push(username);
+        }
+    }
+
+    logger.info(`[twitter-ai] Follow results: ${followed.length} followed, ${failed.length} failed`);
+    return { followed, failed };
+}
+
+// ── AI Quote Tweet ───────────────────────────────────────────────────
+
+export async function aiQuoteTweet(page: Page, tweet: ElementHandle, tweetText: string, author: string, options: {
+    niche?: string;
+} = {}): Promise<PostTweetResult> {
+    const { niche = 'tech & AI' } = options;
+
+    const prompt = `Write commentary for a quote tweet of this tweet by @${author}: "${tweetText}"
+
+Rules:
+1. Max 200 characters
+2. Add your perspective — agree, disagree, expand, or contextualize
+3. Sound authentic and thoughtful
+4. No generic praise like "So true!" or "Great point!"
+5. No hashtags
+
+Reply with ONLY the commentary text.`;
+
+    const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            {
+                role: 'system',
+                content: `You are an engaged Twitter/X user in the ${niche} space. You add value when quote tweeting.`
+            },
+            { role: 'user', content: prompt }
+        ],
+        max_tokens: 80,
+        temperature: 0.85
+    });
+
+    const commentary = completion.choices[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || '';
+
+    if (!commentary) {
+        return { success: false, error: 'Failed to generate quote tweet commentary' };
+    }
+
+    logger.info(`[twitter-ai] Quote tweeting @${author} with: "${commentary.slice(0, 50)}..."`);
+    return await quoteTweet(tweet, page, commentary);
 }

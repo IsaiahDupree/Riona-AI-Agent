@@ -8,7 +8,7 @@ import { Page, Browser } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { logger } from '../utils/logger';
-import { formatError } from '../utils/errors';
+import { formatError, screenshotPath } from '../utils/errors';
 import * as path from 'path';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
@@ -285,30 +285,52 @@ export class TwitterAI {
             });
             await delay(randomJitter(3000));
 
-            // ── Step 1: Enter username ───────────────────────────────
+            // ── Step 1: Enter username/email ──────────────────────────
             logger.info('[twitter] Waiting for username input...');
-            const usernameSelector = 'input[autocomplete="username"]';
+            // Twitter's input may have autocomplete="username" or placeholder text
+            const usernameSelector = 'input[autocomplete="username"], input[name="text"], input[type="text"]';
             await this.page.waitForSelector(usernameSelector, { timeout: TWITTER_TIMEOUT });
             await delay(humanLikeDelay(500, 1200));
 
-            await humanTyping(this.page, usernameSelector, this.username);
+            // Use email for initial login (less likely to trigger blocks), fallback to username
+            const loginIdentity = process.env.TWITTER_BOT_EMAIL || this.username;
+            logger.info(`[twitter] Entering login identity: ${loginIdentity.slice(0, 4)}...`);
+            await humanTyping(this.page, usernameSelector, loginIdentity);
             await delay(humanLikeDelay(400, 800));
 
             // Click "Next" button
             logger.info('[twitter] Clicking Next...');
             await this.clickNextButton();
-            await delay(randomJitter(2500));
+            await delay(randomJitter(3000));
+
+            // Check for "Could not log you in" error banner
+            const loginBlocked = await this.page.evaluate(() => {
+                const text = (document.body.innerText || '').toLowerCase();
+                return text.includes('could not log you in') || text.includes('try again later');
+            });
+            if (loginBlocked) {
+                logger.error('[twitter] Login blocked by Twitter — "Could not log you in now. Please try again later."');
+                await this.page.screenshot({ path: screenshotPath('twitter-blocked.png'), fullPage: false }).catch(() => {});
+                return false;
+            }
 
             // ── Step 2: Handle unusual activity challenge ────────────
-            const challengeHandled = await this.handleUnusualActivityChallenge();
-            if (challengeHandled) {
-                logger.info('[twitter] Unusual activity challenge handled');
-                await delay(randomJitter(2000));
+            // Twitter may show multiple challenge steps (email, then phone, etc.)
+            for (let challengeAttempt = 0; challengeAttempt < 3; challengeAttempt++) {
+                const challengeHandled = await this.handleUnusualActivityChallenge();
+                if (challengeHandled) {
+                    logger.info(`[twitter] Challenge step ${challengeAttempt + 1} handled`);
+                    await delay(randomJitter(2000));
+                } else {
+                    break;
+                }
             }
 
             // ── Step 3: Enter password ───────────────────────────────
             logger.info('[twitter] Waiting for password input...');
             const passwordSelector = 'input[type="password"]';
+            // Take a screenshot to debug if password field is missing
+            await this.page.screenshot({ path: screenshotPath('twitter-pre-password.png'), fullPage: false }).catch(() => {});
             await this.page.waitForSelector(passwordSelector, { timeout: TWITTER_TIMEOUT });
             await delay(humanLikeDelay(500, 1200));
 
@@ -422,10 +444,26 @@ export class TwitterAI {
 
             logger.warn('[twitter] Unusual activity challenge detected — entering verification');
 
-            // Use email/phone from env, fallback to username
-            const verificationValue = process.env.TWITTER_BOT_EMAIL ||
-                process.env.TWITTER_BOT_PHONE ||
-                this.username;
+            // Take a screenshot for debugging
+            await this.page.screenshot({ path: screenshotPath('twitter-challenge.png'), fullPage: false }).catch(() => {});
+
+            // Detect what the challenge is asking for
+            const challengeText = await this.page.evaluate(() => (document.body.innerText || '').toLowerCase());
+            let verificationValue: string;
+
+            if (challengeText.includes('phone') && process.env.TWITTER_BOT_PHONE) {
+                verificationValue = process.env.TWITTER_BOT_PHONE;
+                logger.info('[twitter] Challenge asks for phone — using TWITTER_BOT_PHONE');
+            } else if (challengeText.includes('email') && process.env.TWITTER_BOT_EMAIL) {
+                verificationValue = process.env.TWITTER_BOT_EMAIL;
+                logger.info('[twitter] Challenge asks for email — using TWITTER_BOT_EMAIL');
+            } else {
+                // Fallback: try email, then phone, then username
+                verificationValue = process.env.TWITTER_BOT_EMAIL ||
+                    process.env.TWITTER_BOT_PHONE ||
+                    this.username;
+                logger.info(`[twitter] Challenge type unclear — using fallback: ${verificationValue.slice(0, 4)}...`);
+            }
 
             await delay(humanLikeDelay(500, 1000));
             await humanTyping(this.page, 'input[data-testid="ocfEnterTextTextInput"]', verificationValue);

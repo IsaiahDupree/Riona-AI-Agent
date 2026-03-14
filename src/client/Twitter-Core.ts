@@ -82,7 +82,7 @@ function extractMentions(text: string): string[] {
     return matches ? matches.map(m => m.toLowerCase()) : [];
 }
 
-function parseMetricFromAriaLabel(ariaLabel: string | null, keyword: string): number {
+export function parseMetricFromAriaLabel(ariaLabel: string | null, keyword: string): number {
     if (!ariaLabel) return 0;
     // e.g. "123 Likes" or "1,234 replies"
     const regex = new RegExp(`([\\d,]+)\\s+${keyword}`, 'i');
@@ -956,6 +956,796 @@ export async function processTweetWithRetry(
     }
 
     return { success: false, error: 'Exhausted all retries' };
+}
+
+// ── Deep Reply Verification ─────────────────────────────────────────
+
+/**
+ * Navigate to the tweet URL and verify our reply is visible in the thread.
+ */
+export async function verifyReplyVisible(
+    page: Page,
+    tweetUrl: string,
+    replyText: string
+): Promise<boolean> {
+    try {
+        const botUsername = (process.env.TWITTER_BOT_USERNAME || '').toLowerCase();
+        if (!botUsername || !tweetUrl) return false;
+
+        logger.info(`[Twitter-Core] Verifying reply on ${tweetUrl}`, {
+            component: 'Twitter-Core',
+            event: 'verify_reply_start'
+        });
+
+        await page.goto(tweetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(3000);
+
+        // Scroll down to expose reply section
+        await page.evaluate(() => window.scrollBy(0, 600));
+        await delay(2000);
+
+        const snippet = replyText.slice(0, 50).toLowerCase();
+
+        const found = await page.evaluate((username: string, textSnippet: string) => {
+            const articles = document.querySelectorAll('article[data-testid="tweet"]');
+            for (const article of articles) {
+                const text = (article as HTMLElement).innerText?.toLowerCase() || '';
+                if (text.includes(`@${username}`) && text.includes(textSnippet)) {
+                    return true;
+                }
+            }
+            return false;
+        }, botUsername, snippet);
+
+        logger.info(`[Twitter-Core] Reply verification: ${found ? 'FOUND' : 'NOT FOUND'}`, {
+            component: 'Twitter-Core',
+            event: found ? 'verify_reply_success' : 'verify_reply_not_found'
+        });
+
+        return found;
+    } catch (error) {
+        logger.warn(`[Twitter-Core] Reply verification failed: ${formatError(error)}`);
+        return false;
+    }
+}
+
+// ── Post Original Tweet ─────────────────────────────────────────────
+
+export interface PostTweetOptions {
+    text: string;
+    mediaPath?: string;          // Path to image/video/GIF to attach
+    quoteTweetUrl?: string;      // URL of tweet to quote
+    poll?: { options: string[]; durationHours: number };
+}
+
+export interface PostTweetResult {
+    success: boolean;
+    error?: string;
+    tweetUrl?: string;
+}
+
+/**
+ * Compose and post an original tweet.
+ */
+export async function postTweet(
+    page: Page,
+    options: PostTweetOptions
+): Promise<PostTweetResult> {
+    try {
+        logger.info('[Twitter-Core] Posting tweet...', {
+            component: 'Twitter-Core',
+            event: 'post_tweet_start',
+            hasMedia: !!options.mediaPath,
+            isQuote: !!options.quoteTweetUrl,
+            hasPoll: !!options.poll,
+            textLength: options.text.length
+        });
+
+        // Navigate to home if not already there
+        const url = page.url();
+        if (!url.includes('x.com/home') && !url.includes('x.com/compose')) {
+            await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await delay(2000);
+        }
+
+        // Click the compose area on the home timeline
+        const composeArea = await page.$('div[data-testid="tweetTextarea_0"]');
+        if (!composeArea) {
+            // Fallback: click the floating compose button
+            const composeBtn = await page.$('a[data-testid="SideNav_NewTweet_Button"]')
+                || await page.$('a[href="/compose/tweet"]');
+            if (composeBtn) {
+                await composeBtn.click();
+                await delay(2000);
+            } else {
+                return { success: false, error: 'Could not find compose area or button' };
+            }
+        } else {
+            await composeArea.click();
+            await delay(500);
+        }
+
+        // Wait for the text input to be ready
+        const textInput = await page.waitForSelector(
+            'div[data-testid="tweetTextarea_0"]',
+            { timeout: 8000 }
+        ).catch(() => null);
+
+        if (!textInput) {
+            return { success: false, error: 'Tweet compose textarea not found' };
+        }
+
+        // If this is a quote tweet, paste the URL first, then the text
+        if (options.quoteTweetUrl) {
+            await page.keyboard.type(options.text + '\n' + options.quoteTweetUrl, { delay: getRandomDelay(15, 40) });
+        } else {
+            await page.keyboard.type(options.text, { delay: getRandomDelay(15, 40) });
+        }
+        await delay(1000);
+
+        // Attach media if provided
+        if (options.mediaPath) {
+            const attached = await attachMedia(page, options.mediaPath);
+            if (!attached) {
+                logger.warn('[Twitter-Core] Media attachment failed, posting without media');
+            }
+        }
+
+        // Add poll if provided
+        if (options.poll) {
+            const pollAdded = await addPoll(page, options.poll.options, options.poll.durationHours);
+            if (!pollAdded) {
+                logger.warn('[Twitter-Core] Poll creation failed, posting without poll');
+            }
+        }
+
+        await delay(1000);
+
+        // Click the Post button
+        const postButton = await page.$('button[data-testid="tweetButton"], button[data-testid="tweetButtonInline"]');
+        if (!postButton) {
+            return { success: false, error: 'Post button not found' };
+        }
+
+        await postButton.click({ delay: getRandomDelay(30, 80) });
+        await delay(4000);
+
+        // Verify — check that compose area is cleared or a success toast appeared
+        const composeGone = await page.$('div[data-testid="tweetTextarea_0"]');
+        if (composeGone) {
+            const remainingText = await composeGone.evaluate(
+                (el: Element) => el.textContent?.trim() || ''
+            );
+            if (remainingText.length > 0 && remainingText !== 'What is happening?!' && remainingText !== 'Post') {
+                return { success: false, error: 'Tweet may not have posted — compose area still has text' };
+            }
+        }
+
+        logger.info('[Twitter-Core] Tweet posted successfully', {
+            component: 'Twitter-Core',
+            event: 'post_tweet_success'
+        });
+
+        return { success: true };
+    } catch (error) {
+        logger.error('[Twitter-Core] Tweet posting failed', {
+            component: 'Twitter-Core',
+            event: 'post_tweet_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
+}
+
+// ── Quote Tweet ─────────────────────────────────────────────────────
+
+/**
+ * Quote tweet: opens the quote dialog and posts with commentary.
+ */
+export async function quoteTweet(
+    tweet: ElementHandle,
+    page: Page,
+    commentary: string
+): Promise<PostTweetResult> {
+    try {
+        logger.info('[Twitter-Core] Starting quote tweet...', {
+            component: 'Twitter-Core',
+            event: 'quote_tweet_start'
+        });
+
+        // Scroll into view
+        await tweet.evaluate((el: Element) => {
+            (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        await delay(1000);
+
+        // Click the retweet button to open the dropdown
+        const retweetButton = await tweet.$('button[data-testid="retweet"]');
+        if (!retweetButton) {
+            return { success: false, error: 'Retweet button not found for quote tweet' };
+        }
+
+        await retweetButton.click({ delay: getRandomDelay(20, 50) });
+        await delay(1500);
+
+        // Click "Quote" in the dropdown
+        const quoteOption = await page.$('a[href="/compose/tweet"]')
+            || await page.$('div[data-testid="Dropdown"] a[href*="quote"]');
+
+        // Fallback: find menu item with "Quote" text
+        let quoteClicked = false;
+        if (quoteOption) {
+            await quoteOption.click();
+            quoteClicked = true;
+        } else {
+            const menuItems = await page.$$('div[role="menuitem"], a[role="menuitem"]');
+            for (const item of menuItems) {
+                const text = await item.evaluate((el: Element) => el.textContent?.trim().toLowerCase() || '');
+                if (text.includes('quote')) {
+                    await item.click();
+                    quoteClicked = true;
+                    break;
+                }
+            }
+        }
+
+        if (!quoteClicked) {
+            await page.keyboard.press('Escape');
+            return { success: false, error: 'Quote option not found in retweet dropdown' };
+        }
+
+        await delay(2000);
+
+        // Wait for the quote compose area
+        const quoteInput = await page.waitForSelector(
+            'div[data-testid="tweetTextarea_0"]',
+            { timeout: 8000 }
+        ).catch(() => null);
+
+        if (!quoteInput) {
+            return { success: false, error: 'Quote tweet compose area not found' };
+        }
+
+        // Type the commentary
+        await quoteInput.click();
+        await delay(300);
+        await page.keyboard.type(commentary, { delay: getRandomDelay(15, 40) });
+        await delay(1000);
+
+        // Post it
+        const postButton = await page.$('button[data-testid="tweetButton"]');
+        if (!postButton) {
+            return { success: false, error: 'Quote tweet post button not found' };
+        }
+
+        await postButton.click({ delay: getRandomDelay(30, 80) });
+        await delay(4000);
+
+        logger.info('[Twitter-Core] Quote tweet posted successfully', {
+            component: 'Twitter-Core',
+            event: 'quote_tweet_success'
+        });
+
+        return { success: true };
+    } catch (error) {
+        logger.error('[Twitter-Core] Quote tweet failed', {
+            component: 'Twitter-Core',
+            event: 'quote_tweet_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
+}
+
+// ── Tweet Thread ────────────────────────────────────────────────────
+
+export interface ThreadTweet {
+    text: string;
+    mediaPath?: string;
+}
+
+/**
+ * Post a tweet thread (multiple connected tweets).
+ */
+export async function postThread(
+    page: Page,
+    tweets: ThreadTweet[]
+): Promise<PostTweetResult> {
+    try {
+        if (tweets.length === 0) {
+            return { success: false, error: 'Thread has no tweets' };
+        }
+
+        logger.info(`[Twitter-Core] Posting thread with ${tweets.length} tweets...`, {
+            component: 'Twitter-Core',
+            event: 'post_thread_start',
+            tweetCount: tweets.length
+        });
+
+        // Navigate to home
+        const url = page.url();
+        if (!url.includes('x.com/home') && !url.includes('x.com/compose')) {
+            await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await delay(2000);
+        }
+
+        // Click compose area
+        const composeArea = await page.$('div[data-testid="tweetTextarea_0"]');
+        if (!composeArea) {
+            const composeBtn = await page.$('a[data-testid="SideNav_NewTweet_Button"]');
+            if (composeBtn) {
+                await composeBtn.click();
+                await delay(2000);
+            } else {
+                return { success: false, error: 'Could not find compose area' };
+            }
+        } else {
+            await composeArea.click();
+            await delay(500);
+        }
+
+        // Type the first tweet
+        const firstInput = await page.waitForSelector(
+            'div[data-testid="tweetTextarea_0"]',
+            { timeout: 8000 }
+        ).catch(() => null);
+
+        if (!firstInput) {
+            return { success: false, error: 'Compose textarea not found for thread' };
+        }
+
+        await page.keyboard.type(tweets[0].text, { delay: getRandomDelay(15, 40) });
+        await delay(500);
+
+        // Attach media to first tweet if provided
+        if (tweets[0].mediaPath) {
+            await attachMedia(page, tweets[0].mediaPath);
+        }
+
+        // Add subsequent tweets by clicking the "Add another tweet" button
+        for (let i = 1; i < tweets.length; i++) {
+            await delay(1000);
+
+            // Click the "+" / "Add another tweet" button
+            const addButton = await page.$('button[data-testid="addButton"]')
+                || await page.$('div[data-testid="addButton"]');
+
+            if (!addButton) {
+                // Fallback: look for a button with a plus icon near the compose area
+                const allButtons = await page.$$('button');
+                let addClicked = false;
+                for (const btn of allButtons) {
+                    const ariaLabel = await btn.evaluate(el => el.getAttribute('aria-label')?.toLowerCase() || '');
+                    if (ariaLabel.includes('add') || ariaLabel.includes('thread')) {
+                        await btn.click();
+                        addClicked = true;
+                        break;
+                    }
+                }
+                if (!addClicked) {
+                    logger.warn(`[Twitter-Core] Could not find "add tweet" button for tweet ${i + 1}, posting ${i} tweets only`);
+                    break;
+                }
+            } else {
+                await addButton.click();
+            }
+
+            await delay(1000);
+
+            // Find the new textarea (it will be tweetTextarea_N where N is the index)
+            const newTextarea = await page.$(`div[data-testid="tweetTextarea_${i}"]`);
+            if (newTextarea) {
+                await newTextarea.click();
+                await delay(300);
+            }
+
+            await page.keyboard.type(tweets[i].text, { delay: getRandomDelay(15, 40) });
+            await delay(500);
+
+            if (tweets[i].mediaPath) {
+                await attachMedia(page, tweets[i].mediaPath!);
+            }
+        }
+
+        await delay(1000);
+
+        // Click "Post all" button
+        const postButton = await page.$('button[data-testid="tweetButton"]')
+            || await page.$('button[data-testid="tweetButtonInline"]');
+        if (!postButton) {
+            return { success: false, error: 'Post button not found for thread' };
+        }
+
+        await postButton.click({ delay: getRandomDelay(30, 80) });
+        await delay(5000);
+
+        logger.info(`[Twitter-Core] Thread posted successfully (${tweets.length} tweets)`, {
+            component: 'Twitter-Core',
+            event: 'post_thread_success',
+            tweetCount: tweets.length
+        });
+
+        return { success: true };
+    } catch (error) {
+        logger.error('[Twitter-Core] Thread posting failed', {
+            component: 'Twitter-Core',
+            event: 'post_thread_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
+}
+
+// ── Media Attachment ────────────────────────────────────────────────
+
+/**
+ * Attach an image, video, or GIF to the current compose area.
+ */
+async function attachMedia(page: Page, mediaPath: string): Promise<boolean> {
+    try {
+        if (!fs.existsSync(mediaPath)) {
+            logger.warn(`[Twitter-Core] Media file not found: ${mediaPath}`);
+            return false;
+        }
+
+        // Twitter uses a hidden file input for media uploads
+        const fileInput = await page.$('input[data-testid="fileInput"]')
+            || await page.$('input[type="file"][accept*="image"], input[type="file"][accept*="video"]');
+
+        if (!fileInput) {
+            // Try clicking the media button to reveal the file input
+            const mediaButton = await page.$('button[aria-label="Add photos or video"]')
+                || await page.$('div[data-testid="fileInput"]')
+                || await page.$('input[aria-label="Add photos or video"]');
+
+            if (mediaButton) {
+                await mediaButton.click();
+                await delay(1000);
+            }
+
+            // Try again
+            const input = await page.$('input[type="file"]');
+            if (!input) {
+                logger.warn('[Twitter-Core] File input not found for media upload');
+                return false;
+            }
+
+            await (input as any).uploadFile(mediaPath);
+        } else {
+            await (fileInput as any).uploadFile(mediaPath);
+        }
+
+        // Wait for upload to complete (look for the media preview)
+        await delay(3000);
+
+        // Check for upload errors
+        const error = await page.$('div[data-testid="attachments"] div[role="alert"]');
+        if (error) {
+            const errorText = await error.evaluate(el => el.textContent || '');
+            logger.warn(`[Twitter-Core] Media upload error: ${errorText}`);
+            return false;
+        }
+
+        logger.info(`[Twitter-Core] Media attached: ${path.basename(mediaPath)}`, {
+            component: 'Twitter-Core',
+            event: 'media_attached'
+        });
+        return true;
+    } catch (error) {
+        logger.warn(`[Twitter-Core] Media attachment failed: ${formatError(error)}`);
+        return false;
+    }
+}
+
+// ── Poll Creation ───────────────────────────────────────────────────
+
+/**
+ * Add a poll to the current compose area.
+ */
+async function addPoll(page: Page, options: string[], durationHours: number): Promise<boolean> {
+    try {
+        if (options.length < 2 || options.length > 4) {
+            logger.warn('[Twitter-Core] Poll requires 2-4 options');
+            return false;
+        }
+
+        // Click the poll icon button
+        const pollButton = await page.$('button[aria-label="Add poll"]')
+            || await page.$('div[data-testid="pollButton"]');
+
+        if (!pollButton) {
+            // Fallback: look through toolbar buttons
+            const toolbarButtons = await page.$$('div[role="toolbar"] button, div[data-testid="toolBar"] button');
+            let pollClicked = false;
+            for (const btn of toolbarButtons) {
+                const label = await btn.evaluate(el =>
+                    el.getAttribute('aria-label')?.toLowerCase() || el.textContent?.toLowerCase() || ''
+                );
+                if (label.includes('poll')) {
+                    await btn.click();
+                    pollClicked = true;
+                    break;
+                }
+            }
+            if (!pollClicked) {
+                logger.warn('[Twitter-Core] Poll button not found');
+                return false;
+            }
+        } else {
+            await pollButton.click();
+        }
+
+        await delay(1500);
+
+        // Fill in poll options
+        for (let i = 0; i < options.length; i++) {
+            let optionInput: ElementHandle<Element> | null = null;
+
+            // First two options are always visible
+            if (i < 2) {
+                const inputs = await page.$$('div[data-testid="pollOptionTextInput"] input, input[placeholder*="Choice"]');
+                optionInput = inputs[i] || null;
+            } else {
+                // Click "Add" for options 3 and 4
+                const addChoice = await page.$('button[data-testid="addPollOptionButton"]');
+                if (addChoice) {
+                    await addChoice.click();
+                    await delay(500);
+                }
+                const inputs = await page.$$('div[data-testid="pollOptionTextInput"] input, input[placeholder*="Choice"]');
+                optionInput = inputs[i] || null;
+            }
+
+            if (optionInput) {
+                await optionInput.click();
+                await delay(200);
+                await page.keyboard.type(options[i], { delay: getRandomDelay(15, 30) });
+            } else {
+                logger.warn(`[Twitter-Core] Could not find input for poll option ${i + 1}`);
+            }
+        }
+
+        // Set duration (Twitter has dropdown selectors for days/hours/minutes)
+        // Default is 1 day — adjust if needed
+        if (durationHours !== 24) {
+            const durationSelects = await page.$$('select[aria-label*="Day"], select[aria-label*="Hour"], select[aria-label*="Minute"]');
+            if (durationSelects.length >= 2) {
+                const days = Math.floor(durationHours / 24);
+                const hours = durationHours % 24;
+                // Set days
+                await durationSelects[0].select(String(days));
+                await delay(300);
+                // Set hours
+                await durationSelects[1].select(String(hours));
+                await delay(300);
+            }
+        }
+
+        logger.info(`[Twitter-Core] Poll added with ${options.length} options`, {
+            component: 'Twitter-Core',
+            event: 'poll_added'
+        });
+        return true;
+    } catch (error) {
+        logger.warn(`[Twitter-Core] Poll creation failed: ${formatError(error)}`);
+        return false;
+    }
+}
+
+// ── Follow / Unfollow ───────────────────────────────────────────────
+
+/**
+ * Follow a user from their profile page or from a tweet element.
+ */
+export async function followUser(
+    page: Page,
+    username: string
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        logger.info(`[Twitter-Core] Following @${username}...`, {
+            component: 'Twitter-Core',
+            event: 'follow_start'
+        });
+
+        await page.goto(`https://x.com/${username}`, {
+            waitUntil: 'domcontentloaded', timeout: 30000
+        });
+        await delay(3000);
+
+        // Check if already following
+        const unfollowButton = await page.$('button[data-testid*="unfollow"]')
+            || await page.$('div[data-testid="placementTracking"] button[data-testid*="unfollow"]');
+        if (unfollowButton) {
+            logger.info(`[Twitter-Core] Already following @${username}`, {
+                component: 'Twitter-Core',
+                event: 'already_following'
+            });
+            return { success: true };
+        }
+
+        // Find and click the Follow button
+        // Twitter uses data-testid that contains the username for the follow button
+        const followButton = await page.$(`button[data-testid="${username}-follow"]`)
+            || await page.$('div[data-testid="placementTracking"] button:not([data-testid*="unfollow"])');
+
+        if (!followButton) {
+            // Fallback: search all buttons for "Follow" text
+            const allButtons = await page.$$('button[role="button"], div[role="button"]');
+            for (const btn of allButtons) {
+                const info = await btn.evaluate(el => {
+                    const text = el.textContent?.trim() || '';
+                    const testId = el.getAttribute('data-testid') || '';
+                    const rect = el.getBoundingClientRect();
+                    return { text, testId, visible: rect.width > 0 && rect.height > 0 };
+                });
+                if (info.text === 'Follow' && info.visible && !info.testId.includes('unfollow')) {
+                    await btn.click({ delay: getRandomDelay(20, 50) });
+                    await delay(2000);
+
+                    logger.info(`[Twitter-Core] Followed @${username}`, {
+                        component: 'Twitter-Core',
+                        event: 'follow_success'
+                    });
+                    return { success: true };
+                }
+            }
+            return { success: false, error: 'Follow button not found' };
+        }
+
+        await followButton.click({ delay: getRandomDelay(20, 50) });
+        await delay(2000);
+
+        // Verify
+        const verifyUnfollow = await page.$('button[data-testid*="unfollow"]');
+        if (verifyUnfollow) {
+            logger.info(`[Twitter-Core] Followed @${username} (verified)`, {
+                component: 'Twitter-Core',
+                event: 'follow_verified'
+            });
+            return { success: true };
+        }
+
+        logger.info(`[Twitter-Core] Follow clicked for @${username} — unverified`, {
+            component: 'Twitter-Core',
+            event: 'follow_unverified'
+        });
+        return { success: true };
+    } catch (error) {
+        logger.error(`[Twitter-Core] Follow failed for @${username}`, {
+            component: 'Twitter-Core',
+            event: 'follow_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
+}
+
+/**
+ * Unfollow a user.
+ */
+export async function unfollowUser(
+    page: Page,
+    username: string
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        logger.info(`[Twitter-Core] Unfollowing @${username}...`, {
+            component: 'Twitter-Core',
+            event: 'unfollow_start'
+        });
+
+        await page.goto(`https://x.com/${username}`, {
+            waitUntil: 'domcontentloaded', timeout: 30000
+        });
+        await delay(3000);
+
+        // Find the Following/Unfollow button
+        const followingButton = await page.$(`button[data-testid="${username}-unfollow"]`)
+            || await page.$('button[data-testid*="unfollow"]');
+
+        if (!followingButton) {
+            // May not be following
+            const followBtn = await page.$(`button[data-testid="${username}-follow"]`);
+            if (followBtn) {
+                logger.info(`[Twitter-Core] Not following @${username}`, {
+                    component: 'Twitter-Core',
+                    event: 'not_following'
+                });
+                return { success: true };
+            }
+            return { success: false, error: 'Unfollow button not found' };
+        }
+
+        await followingButton.click({ delay: getRandomDelay(20, 50) });
+        await delay(1500);
+
+        // Confirm unfollow in the dialog
+        const confirmButton = await page.$('button[data-testid="confirmationSheetConfirm"]');
+        if (confirmButton) {
+            await confirmButton.click({ delay: getRandomDelay(20, 50) });
+            await delay(2000);
+        }
+
+        logger.info(`[Twitter-Core] Unfollowed @${username}`, {
+            component: 'Twitter-Core',
+            event: 'unfollow_success'
+        });
+        return { success: true };
+    } catch (error) {
+        logger.error(`[Twitter-Core] Unfollow failed for @${username}`, {
+            component: 'Twitter-Core',
+            event: 'unfollow_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
+}
+
+// ── Bookmark ────────────────────────────────────────────────────────
+
+/**
+ * Bookmark a tweet.
+ */
+export async function bookmarkTweet(
+    tweet: ElementHandle,
+    page: Page
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        // Scroll into view
+        await tweet.evaluate((el: Element) => {
+            (el as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        await delay(800);
+
+        // Click the share/bookmark button
+        const shareButton = await tweet.$('button[data-testid="bookmark"]');
+        if (shareButton) {
+            await shareButton.click({ delay: getRandomDelay(20, 50) });
+            await delay(1500);
+
+            logger.info('[Twitter-Core] Tweet bookmarked', {
+                component: 'Twitter-Core',
+                event: 'bookmark_success'
+            });
+            return { success: true };
+        }
+
+        // Fallback: use the share menu → Bookmark option
+        const moreButton = await tweet.$('button[data-testid="caret"]')
+            || await tweet.$('button[aria-label="Share Tweet"]')
+            || await tweet.$('button[aria-label="Share post"]');
+
+        if (!moreButton) {
+            return { success: false, error: 'Bookmark/share button not found' };
+        }
+
+        await moreButton.click({ delay: getRandomDelay(20, 50) });
+        await delay(1000);
+
+        const menuItems = await page.$$('div[role="menuitem"]');
+        for (const item of menuItems) {
+            const text = await item.evaluate((el: Element) => el.textContent?.trim().toLowerCase() || '');
+            if (text.includes('bookmark')) {
+                await item.click({ delay: getRandomDelay(20, 50) });
+                await delay(1500);
+
+                logger.info('[Twitter-Core] Tweet bookmarked via menu', {
+                    component: 'Twitter-Core',
+                    event: 'bookmark_success'
+                });
+                return { success: true };
+            }
+        }
+
+        await page.keyboard.press('Escape');
+        return { success: false, error: 'Bookmark option not found in menu' };
+    } catch (error) {
+        logger.error('[Twitter-Core] Bookmark failed', {
+            component: 'Twitter-Core',
+            event: 'bookmark_failed',
+            error: formatError(error)
+        });
+        return { success: false, error: formatError(error) };
+    }
 }
 
 // ── Named Exports ────────────────────────────────────────────────────

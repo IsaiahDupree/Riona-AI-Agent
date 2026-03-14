@@ -509,6 +509,7 @@ async function runInstagram() {
                 browser = await puppeteer.launch({
                     headless: false,
                     defaultViewport: null,
+                    executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
                     args: launchArgs,
                     ignoreHTTPSErrors: true
                 });
@@ -516,7 +517,7 @@ async function runInstagram() {
                 const page = await browser.newPage();
                 
                 // Set a realistic user agent (avoid detection)
-                const userAgentString = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+                const userAgentString = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
                 await page.setUserAgent(userAgentString);
                 
                 // Set extra HTTP headers to appear more like a normal browser

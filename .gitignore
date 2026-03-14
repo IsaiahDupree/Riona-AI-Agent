@@ -51,6 +51,16 @@ Thumbs.db
 test-output.txt
 comprehensive-test-output.txt
 
+# Chrome profiles (Puppeteer user data)
+chrome-profile/
+chrome-profile-twitter/
+chrome-profile-threads/
+chrome-profile-niche-test/
+
+# Test scripts (ad-hoc)
+test-*.ts
+debug-*.js
+
 # Temporary files
 query
 *.backup.*

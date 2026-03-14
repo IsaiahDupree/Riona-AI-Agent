@@ -18,6 +18,7 @@
     "train:audio": "tsc && node build/Agent/training/TrainWithAudio.js",
     "scheduler": "tsc && node build/scheduler.js",
     "threads": "tsc && node build/runThreads.js",
+    "threads-scheduler": "tsc && node build/threads-scheduler.js",
     "test-instagram": "tsc && node -e \"require('./build/client/InstagramTest.js').runInstagramTest()\"",
     "test:dm": "tsc && node -e \"require('./build/client/InstagramDMTest.js').runDMTest()\"",
     "test:dm:safari": "tsc && BROWSER_TYPE=safari node -e \"require('./build/client/InstagramDMSafari.js').runSafariDMTest()\"",

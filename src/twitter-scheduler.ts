@@ -181,21 +181,86 @@ async function scheduledRun() {
         const runStart = Date.now();
 
         // Import Twitter-AI dynamically to match the pattern
-        const { runTwitterBatch, runTwitterNicheBatch } = await import('./client/Twitter-AI');
+        const { runTwitterBatch, runTwitterNicheBatch, autoFollowProspects } = await import('./client/Twitter-AI');
 
         let repliesPosted: number;
         let session: any;
+        let twitterAI: any;
 
         if (isNicheRun && currentNiche) {
             logger.info(`[twitter-scheduler] Running niche batch: ${currentNiche} (${NICHE_POSTS} tweets)`);
             const nicheResult = await runTwitterNicheBatch(currentNiche, NICHE_POSTS);
             repliesPosted = nicheResult.commentsPosted;
             session = nicheResult.session;
+            twitterAI = nicheResult.twitterAI;
             nicheIndex++;
         } else {
             const result = await runTwitterBatch(BOT_USERNAME);
             repliesPosted = result.commentsPosted;
             session = result.session;
+            twitterAI = result.twitterAI;
+        }
+
+        // ── Strategic content posting (calendar-driven) ─────────────────
+        const FOLLOW_FREQUENCY = 4;
+        const LAST_POST_RUN_FILE = path.join(process.cwd(), 'logs', 'config', 'last_post_run.json');
+
+        if (twitterAI) {
+            try {
+                const page = twitterAI.getPage();
+                if (page) {
+                    const { shouldPostContent } = await import('./strategy/twitter-content-calendar');
+                    const { postStrategicContent } = await import('./client/Twitter-AI');
+
+                    const lastPostData = safeReadJSON<{ run: number }>(LAST_POST_RUN_FILE, { run: 0 }, 'last_post_run');
+                    const lastPostRun = lastPostData.run;
+
+                    if (shouldPostContent(runNumber, lastPostRun)) {
+                        logger.info(`[twitter-scheduler] Run #${runNumber}: Posting strategic content`);
+                        const contentResult = await postStrategicContent(page, runNumber);
+                        if (contentResult.success) {
+                            logger.info(`[twitter-scheduler] Strategic content posted successfully`);
+                            safeWriteJSON(LAST_POST_RUN_FILE, { run: runNumber }, 'last_post_run');
+                        }
+                    }
+
+                    // Auto-follow prospects periodically
+                    if (runNumber % FOLLOW_FREQUENCY === 0) {
+                        logger.info(`[twitter-scheduler] Run #${runNumber}: Auto-following prospects`);
+                        const followResult = await autoFollowProspects(page, {
+                            maxFollows: 3,
+                            source: 'outreach_targets'
+                        });
+                        logger.info(`[twitter-scheduler] Followed ${followResult.followed.length} users`);
+                    }
+
+                    // Process engagement check-backs (max 5 per run)
+                    try {
+                        const { processCheckBacks } = await import('./client/Twitter-Engagement-Scraper');
+                        await processCheckBacks(page, 5);
+                    } catch (cbErr) {
+                        logger.warn(`[twitter-scheduler] Check-back processing failed (non-fatal): ${formatError(cbErr)}`);
+                    }
+
+                    // Periodic learning analysis (every 10th run)
+                    if (runNumber % 10 === 0) {
+                        try {
+                            const { analyzeContentPerformance } = await import('./client/Twitter-Content-Analytics');
+                            analyzeContentPerformance();
+                            logger.info(`[twitter-scheduler] Content performance analysis complete`);
+                        } catch (analyticsErr) {
+                            logger.warn(`[twitter-scheduler] Analytics failed (non-fatal): ${formatError(analyticsErr)}`);
+                        }
+                    }
+                }
+            } catch (contentErr) {
+                logger.warn(`[twitter-scheduler] Content posting failed (non-fatal): ${formatError(contentErr)}`);
+            }
+        }
+
+        // Close browser after content posting
+        if (twitterAI) {
+            try { await twitterAI.close(); } catch (e) { /* already closed */ }
         }
 
         counter.count = getTodayReplyCount();

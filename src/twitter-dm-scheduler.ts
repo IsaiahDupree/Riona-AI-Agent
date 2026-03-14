@@ -5,6 +5,10 @@
  */
 
 import { TwitterDM } from './client/Twitter-DM';
+import { TwitterDMPipeline, loadConfig as loadPipelineConfig } from './client/Twitter-DM-Pipeline';
+import { collectNicheProspects } from './client/Twitter-AI';
+import { getTodayTwitterDMCount } from './tracking/twitterDMTracker';
+import { notifyNewDM, notifyError, notifyStartup } from './utils/telegram';
 import { logger } from './utils/logger';
 import { safeReadJSON, safeWriteJSON, formatError } from './utils/errors';
 import * as path from 'path';
@@ -16,44 +20,10 @@ const PIPELINE_INTERVAL = parseInt(process.env.TWITTER_DM_PIPELINE_INTERVAL_MINU
 const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
 const MAX_DMS_PER_DAY = parseInt(process.env.TWITTER_DM_MAX_PER_DAY || '50', 10);
 const AUTO_APPROVE = process.env.TWITTER_DM_AUTO_APPROVE === 'true';
+const NICHE_HASHTAGS = (process.env.TWITTER_NICHE_HASHTAGS || '').split(',').map(h => h.trim()).filter(Boolean);
 
-interface PendingSend {
-    recipientUsername: string;
-    message: string;
-    status: 'pending' | 'approved' | 'rejected' | 'sent' | 'failed';
-    createdAt: string;
-    sentAt?: string;
-    error?: string;
-}
-
-const PENDING_SENDS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'pending_sends.json');
-const DM_COUNTER_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'daily_counter.json');
-
-function todayStr(): string {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-function getTodayDMCount(): number {
-    const data = safeReadJSON<{ date: string; count: number } | null>(DM_COUNTER_FILE, null, 'twitter_dm_counter');
-    if (data && data.date === todayStr()) return data.count;
-    return 0;
-}
-
-function incrementDMCount() {
-    const today = todayStr();
-    const data = safeReadJSON<{ date: string; count: number } | null>(DM_COUNTER_FILE, null, 'twitter_dm_counter');
-    const count = (data && data.date === today) ? data.count + 1 : 1;
-    safeWriteJSON(DM_COUNTER_FILE, { date: today, count }, 'twitter_dm_counter');
-}
-
-function loadPendingSends(): PendingSend[] {
-    return safeReadJSON<PendingSend[]>(PENDING_SENDS_FILE, [], 'twitter_pending_sends');
-}
-
-function savePendingSends(sends: PendingSend[]) {
-    safeWriteJSON(PENDING_SENDS_FILE, sends, 'twitter_pending_sends');
-}
+// Simple mutex to prevent watcher/pipeline from colliding on navigation
+let navigating = false;
 
 function loadTargets(): string[] {
     return safeReadJSON<string[]>(TARGETS_FILE, [], 'twitter_outreach_targets');
@@ -66,7 +36,7 @@ function saveTargets(targets: string[]) {
 (async () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════════╗');
-    console.log('║       Riona Twitter DM System v1.0                     ║');
+    console.log('║       Riona Twitter DM System v2.0                     ║');
     console.log('╠══════════════════════════════════════════════════════════╣');
     console.log(`║  DM check:       every ${String(CHECK_INTERVAL / 60000).padEnd(3)} minutes                    ║`);
     console.log(`║  Pipeline:       every ${String(PIPELINE_INTERVAL / 60000).padEnd(3)} minutes                    ║`);
@@ -81,11 +51,25 @@ function saveTargets(targets: string[]) {
     try {
         await dm.initialize();
         logger.info('[twitter-dm-scheduler] Browser initialized');
+        await notifyStartup('Twitter DM', MAX_DMS_PER_DAY, 0, PIPELINE_INTERVAL / 60000).catch(() => {});
+
+        const pipelineConfig = loadPipelineConfig();
+        pipelineConfig.autoApprove = AUTO_APPROVE;
+        pipelineConfig.maxDMsPerDay = MAX_DMS_PER_DAY;
+
+        const pipeline = new TwitterDMPipeline(dm, pipelineConfig);
 
         // ── DM Watcher Loop (check for new messages) ──
         async function watcherLoop() {
             while (true) {
                 try {
+                    if (navigating) {
+                        logger.info('[twitter-dm-scheduler] Watcher waiting — pipeline navigating');
+                        await delay(10000);
+                        continue;
+                    }
+                    navigating = true;
+
                     logger.info('[twitter-dm-scheduler] Checking inbox for new messages...');
                     const conversations = await dm.scrapeInbox();
                     const unread = conversations.filter(c => c.unread);
@@ -93,61 +77,48 @@ function saveTargets(targets: string[]) {
                         logger.info(`[twitter-dm-scheduler] ${unread.length} unread conversation(s) detected`);
                         for (const conv of unread) {
                             logger.info(`[twitter-dm-scheduler] Unread from: ${conv.username} — "${conv.lastMessage.slice(0, 50)}"`);
+                            await notifyNewDM(conv.username, conv.lastMessage).catch(() => {});
                         }
                     } else {
                         logger.info(`[twitter-dm-scheduler] No new messages (${conversations.length} conversations total)`);
                     }
                 } catch (e) {
                     logger.error(`[twitter-dm-scheduler] Watcher error: ${formatError(e)}`);
+                    await notifyError('Twitter DM Watcher', formatError(e)).catch(() => {});
+                } finally {
+                    navigating = false;
                 }
                 await delay(CHECK_INTERVAL);
             }
         }
 
-        // ── Pipeline Loop (process approved sends + outreach) ──
+        // ── Pipeline Loop (process approved sends + outreach + feedback) ──
         async function pipelineLoop() {
             // Wait a bit before starting pipeline to let watcher settle
             await delay(30000);
 
+            let nicheIndex = 0;
+
             while (true) {
                 try {
-                    const todayCount = getTodayDMCount();
+                    // Wait for watcher to finish if it's navigating
+                    while (navigating) {
+                        await delay(5000);
+                    }
+                    navigating = true;
 
-                    // 1. Process approved sends first
-                    const pendingSends = loadPendingSends();
-                    const approved = pendingSends.filter(s => s.status === 'approved');
-                    if (approved.length > 0) {
-                        logger.info(`[twitter-dm-scheduler] Processing ${approved.length} approved send(s)...`);
-                        let sentCount = 0;
-                        let failedCount = 0;
+                    const todayCount = getTodayTwitterDMCount();
 
-                        for (const send of approved) {
-                            if (getTodayDMCount() >= MAX_DMS_PER_DAY) {
-                                logger.info(`[twitter-dm-scheduler] Daily DM limit reached, stopping sends`);
-                                break;
-                            }
-                            try {
-                                const result = await dm.sendDM(send.recipientUsername, send.message);
-                                if (result.success) {
-                                    send.status = 'sent';
-                                    send.sentAt = new Date().toISOString();
-                                    incrementDMCount();
-                                    sentCount++;
-                                } else {
-                                    send.status = 'failed';
-                                    send.error = result.error || 'Unknown error';
-                                    failedCount++;
-                                }
-                            } catch (e) {
-                                send.status = 'failed';
-                                send.error = formatError(e);
-                                failedCount++;
-                                logger.error(`[twitter-dm-scheduler] Send to ${send.recipientUsername} failed: ${formatError(e)}`);
-                            }
-                            await delay(5000); // Rate limiting between sends
+                    // 1. Process approved sends via pipeline
+                    try {
+                        const approvedResults = await pipeline.processApprovedSends();
+                        if (approvedResults.length > 0) {
+                            const sent = approvedResults.filter(r => r.status === 'sent').length;
+                            const failed = approvedResults.filter(r => r.status === 'failed').length;
+                            logger.info(`[twitter-dm-scheduler] Approved sends: ${sent} sent, ${failed} failed`);
                         }
-                        savePendingSends(pendingSends);
-                        logger.info(`[twitter-dm-scheduler] Approved sends: ${sentCount} sent, ${failedCount} failed`);
+                    } catch (e) {
+                        logger.error(`[twitter-dm-scheduler] Approved sends error: ${formatError(e)}`);
                     }
 
                     // 2. Run outreach on queued targets (if under daily limit)
@@ -155,31 +126,39 @@ function saveTargets(targets: string[]) {
                         const hour = new Date().getHours();
                         const isGoodTime = hour >= 9 && hour < 21;
                         if (isGoodTime) {
-                            const remaining = MAX_DMS_PER_DAY - getTodayDMCount();
-                            const targets = loadTargets();
-                            if (targets.length > 0) {
-                                const batch = targets.slice(0, Math.min(5, remaining));
-                                logger.info(`[twitter-dm-scheduler] Processing ${batch.length} outreach target(s)...`);
-                                let sentCount = 0;
-                                let skippedCount = 0;
+                            let targets = loadTargets();
 
-                                for (const target of batch) {
-                                    if (getTodayDMCount() >= MAX_DMS_PER_DAY) break;
-                                    try {
-                                        // For outreach, we need a message — this would come from AI generation
-                                        // For now, log that the target needs a message
-                                        logger.info(`[twitter-dm-scheduler] Outreach target: @${target} — needs message generation`);
-                                        skippedCount++;
-                                    } catch (e) {
-                                        logger.error(`[twitter-dm-scheduler] Outreach to @${target} failed: ${formatError(e)}`);
-                                        skippedCount++;
+                            // Auto-populate targets if empty and we have niche hashtags
+                            if (targets.length === 0 && NICHE_HASHTAGS.length > 0) {
+                                const searchTerm = NICHE_HASHTAGS[nicheIndex % NICHE_HASHTAGS.length];
+                                nicheIndex++;
+                                logger.info(`[twitter-dm-scheduler] Auto-collecting prospects for "${searchTerm}"`);
+                                try {
+                                    const page = dm.getPage();
+                                    if (page) {
+                                        await collectNicheProspects(page, searchTerm, 20);
+                                        targets = loadTargets();
                                     }
-                                    await delay(3000);
+                                } catch (e) {
+                                    logger.error(`[twitter-dm-scheduler] Prospect collection failed: ${formatError(e)}`);
+                                }
+                            }
+
+                            if (targets.length > 0) {
+                                const remaining = MAX_DMS_PER_DAY - getTodayTwitterDMCount();
+                                const batch = targets.slice(0, Math.min(5, remaining));
+                                logger.info(`[twitter-dm-scheduler] Running batch outreach: ${batch.length} targets`);
+
+                                try {
+                                    const stats = await pipeline.runBatchOutreach(batch);
+                                    logger.info(`[twitter-dm-scheduler] Outreach: ${stats.sent} sent, ${stats.queued} queued, ${stats.skipped} skipped, ${stats.failed} failed`);
+                                } catch (e) {
+                                    logger.error(`[twitter-dm-scheduler] Batch outreach error: ${formatError(e)}`);
                                 }
 
+                                // Remove processed targets
                                 const remainingTargets = targets.filter(t => !batch.includes(t));
                                 saveTargets(remainingTargets);
-                                logger.info(`[twitter-dm-scheduler] Outreach: ${sentCount} sent, ${skippedCount} skipped`);
                             }
                         } else {
                             logger.info(`[twitter-dm-scheduler] Skipping outreach — outside optimal hours (9:00-21:00)`);
@@ -188,8 +167,21 @@ function saveTargets(targets: string[]) {
                         logger.info(`[twitter-dm-scheduler] Daily DM limit reached (${todayCount}/${MAX_DMS_PER_DAY})`);
                     }
 
+                    // 3. Check replies and update feedback loop
+                    try {
+                        const repliesFound = await pipeline.checkRepliesAndUpdateFeedback();
+                        if (repliesFound > 0) {
+                            logger.info(`[twitter-dm-scheduler] Found ${repliesFound} new replies`);
+                        }
+                    } catch (e) {
+                        logger.error(`[twitter-dm-scheduler] Feedback check error: ${formatError(e)}`);
+                    }
+
                 } catch (e) {
                     logger.error(`[twitter-dm-scheduler] Pipeline error: ${formatError(e)}`);
+                    await notifyError('Twitter DM Pipeline', formatError(e)).catch(() => {});
+                } finally {
+                    navigating = false;
                 }
 
                 await delay(PIPELINE_INTERVAL);
@@ -197,8 +189,6 @@ function saveTargets(targets: string[]) {
         }
 
         // Run both loops concurrently with error isolation.
-        // Each loop catches its own errors, but if one crashes fatally,
-        // we log it and keep the other running.
         const watcherPromise = watcherLoop().catch(e => {
             logger.error(`[twitter-dm-scheduler] Watcher loop crashed fatally: ${formatError(e)}`);
         });
@@ -210,6 +200,7 @@ function saveTargets(targets: string[]) {
 
     } catch (e) {
         logger.error(`[twitter-dm-scheduler] Fatal error: ${formatError(e)}`);
+        await notifyError('Twitter DM Scheduler', formatError(e)).catch(() => {});
         await dm.close();
         process.exit(1);
     }
