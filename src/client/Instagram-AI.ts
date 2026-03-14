@@ -724,7 +724,7 @@ async function dismissPopups(page: any, logPrefix: string = ''): Promise<boolean
 
 // Single-batch run: open browser, comment on posts, close browser, exit
 // Designed to be called by a scheduler that spins this up periodically
-export async function runSingleBatch(username: string, trace?: any): Promise<{ commentsPosted: number; session: SessionLog }> {
+export async function runSingleBatch(username: string, trace?: any, keepOpen?: boolean): Promise<{ commentsPosted: number; session: SessionLog; instagramAI?: InstagramAI }> {
     const instagramAI = new InstagramAI();
     const session = createSession();
     let commentsPosted = 0;
@@ -812,15 +812,17 @@ export async function runSingleBatch(username: string, trace?: any): Promise<{ c
         session.errors.push(error?.message || 'Unknown error');
         logger.error('Error in single batch run:', error);
     } finally {
-        if (trace) pushStep(trace, { name: 'close_browser', status: 'ok' });
-        await instagramAI.close();
-
         // Save session report and update daily stats
         saveSession(session);
         updateDailyStats(session);
+
+        if (!keepOpen) {
+            if (trace) pushStep(trace, { name: 'close_browser', status: 'ok' });
+            await instagramAI.close();
+        }
     }
 
-    return { commentsPosted, session };
+    return { commentsPosted, session, instagramAI: keepOpen ? instagramAI : undefined };
 }
 
 /**
@@ -833,8 +835,9 @@ export async function runSingleBatch(username: string, trace?: any): Promise<{ c
 export async function runNicheBatch(
     niche: string,
     targetPosts: number = 150,
-    trace?: any
-): Promise<{ commentsPosted: number; session: SessionLog }> {
+    trace?: any,
+    keepOpen?: boolean,
+): Promise<{ commentsPosted: number; session: SessionLog; instagramAI?: InstagramAI }> {
     const instagramAI = new InstagramAI();
     const session = createSession();
     let commentsPosted = 0;
@@ -1150,12 +1153,15 @@ export async function runNicheBatch(
         session.errors.push(error?.message || 'Unknown error');
         logger.error(`[niche] Fatal error in niche batch for #${hashtag}:`, error);
     } finally {
-        await instagramAI.close();
         saveSession(session);
         updateDailyStats(session);
+
+        if (!keepOpen) {
+            await instagramAI.close();
+        }
     }
 
-    return { commentsPosted, session };
+    return { commentsPosted, session, instagramAI: keepOpen ? instagramAI : undefined };
 }
 
 // Legacy loop mode (kept for backwards compatibility)

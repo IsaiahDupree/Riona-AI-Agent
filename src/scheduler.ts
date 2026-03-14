@@ -188,17 +188,45 @@ async function scheduledRun() {
         const runStart = Date.now();
         let commentsPosted: number;
         let session: any;
+        let instagramAI: any;
 
         if (isNicheRun && currentNiche) {
             logger.info(`[scheduler] Running niche batch: #${currentNiche} (${NICHE_POSTS} posts)`);
-            const nicheResult = await runNicheBatch(currentNiche, NICHE_POSTS);
+            const nicheResult = await runNicheBatch(currentNiche, NICHE_POSTS, undefined, true);
             commentsPosted = nicheResult.commentsPosted;
             session = nicheResult.session;
+            instagramAI = nicheResult.instagramAI;
             nicheIndex++; // rotate to next hashtag for next niche run
         } else {
-            const result = await runSingleBatch(BOT_USERNAME);
+            const result = await runSingleBatch(BOT_USERNAME, undefined, true);
             commentsPosted = result.commentsPosted;
             session = result.session;
+            instagramAI = result.instagramAI;
+        }
+
+        // ── Nurture engagement (VR-scheduled comments, separate from cold engagement) ──
+        const IG_NURTURE_FREQUENCY = parseInt(process.env.IG_NURTURE_FREQUENCY || '2', 10);
+        if (instagramAI && runNumber % IG_NURTURE_FREQUENCY === 0) {
+            try {
+                const page = instagramAI.getPage();
+                if (page) {
+                    const { runIGNurtureEngagement } = await import('./client/Instagram-Nurture');
+                    const nurtureResult = await runIGNurtureEngagement(page, 2, 3);
+                    if (nurtureResult.commentsPosted > 0) {
+                        logger.info(
+                            `[scheduler] IG Nurture: ${nurtureResult.commentsPosted} comments on ` +
+                            `${nurtureResult.contactsVisited} profiles`
+                        );
+                    }
+                }
+            } catch (nurtureErr) {
+                logger.warn(`[scheduler] IG nurture failed (non-fatal): ${formatError(nurtureErr)}`);
+            }
+        }
+
+        // Close browser after nurture phase
+        if (instagramAI) {
+            try { await instagramAI.close(); } catch (_) { /* already closed */ }
         }
 
         counter.count = getTodayCommentCount();

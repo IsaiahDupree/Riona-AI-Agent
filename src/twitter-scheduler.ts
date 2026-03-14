@@ -186,8 +186,22 @@ async function scheduledRun() {
 
         const remaining = DAILY_TARGET - effectiveCount;
         const runNumber = counter.runs + 1;
-        const isNicheRun = NICHE_SEARCH_TERMS.length > 0 && NICHE_FREQUENCY > 0 && runNumber % NICHE_FREQUENCY === 0;
-        const currentNiche = isNicheRun ? NICHE_SEARCH_TERMS[nicheIndex % NICHE_SEARCH_TERMS.length] : null;
+
+        // Merge likes-derived search terms with configured niche terms
+        let allSearchTerms = [...NICHE_SEARCH_TERMS];
+        try {
+            const { getLikesSearchTerms } = await import('./client/Twitter-Likes-Scraper');
+            const likesTerms = getLikesSearchTerms();
+            if (likesTerms.length > 0) {
+                allSearchTerms = [...NICHE_SEARCH_TERMS, ...likesTerms];
+                logger.info(`[twitter-scheduler] Using ${NICHE_SEARCH_TERMS.length} niche + ${likesTerms.length} likes-derived search terms`);
+            }
+        } catch (e) {
+            logger.debug(`[twitter-scheduler] Likes search terms not available: ${formatError(e)}`);
+        }
+
+        const isNicheRun = allSearchTerms.length > 0 && NICHE_FREQUENCY > 0 && runNumber % NICHE_FREQUENCY === 0;
+        const currentNiche = isNicheRun ? allSearchTerms[nicheIndex % allSearchTerms.length] : null;
 
         logger.info(`[twitter-scheduler] ── Starting run #${runNumber} ${isNicheRun ? `[NICHE: ${currentNiche}]` : '[FEED]'} ──────────────────────`);
         logger.info(`[twitter-scheduler] Today: ${effectiveCount}/${DAILY_TARGET} replies | ${remaining} remaining`);
@@ -217,7 +231,7 @@ async function scheduledRun() {
         }
 
         // ── Strategic content posting (calendar-driven) ─────────────────
-        const FOLLOW_FREQUENCY = 4;
+        const FOLLOW_FREQUENCY = parseInt(process.env.TWITTER_FOLLOW_FREQUENCY || '4', 10);
         const LAST_POST_RUN_FILE = path.join(process.cwd(), 'logs', 'config', 'last_post_run.json');
 
         if (twitterAI) {
@@ -227,15 +241,21 @@ async function scheduledRun() {
                     const { shouldPostContent } = await import('./strategy/twitter-content-calendar');
                     const { postStrategicContent } = await import('./client/Twitter-AI');
 
-                    const lastPostData = safeReadJSON<{ run: number }>(LAST_POST_RUN_FILE, { run: 0 }, 'last_post_run');
+                    const lastPostData = safeReadJSON<{ run: number; postsToday?: number; lastPostDate?: string }>(LAST_POST_RUN_FILE, { run: 0, postsToday: 0 }, 'last_post_run');
                     const lastPostRun = lastPostData.run;
+                    const maxPerDay = parseInt(process.env.TWITTER_TWEETS_PER_DAY || '12', 10);
+                    const postsToday = (lastPostData.lastPostDate === todayStr()) ? (lastPostData.postsToday || 0) : 0;
 
-                    if (shouldPostContent(runNumber, lastPostRun)) {
-                        logger.info(`[twitter-scheduler] Run #${runNumber}: Posting strategic content`);
+                    if (shouldPostContent(runNumber, lastPostRun) && postsToday < maxPerDay) {
+                        logger.info(`[twitter-scheduler] Run #${runNumber}: Posting strategic content (${postsToday}/${maxPerDay} today)`);
                         const contentResult = await postStrategicContent(page, runNumber);
                         if (contentResult.success) {
                             logger.info(`[twitter-scheduler] Strategic content posted successfully`);
-                            safeWriteJSON(LAST_POST_RUN_FILE, { run: runNumber }, 'last_post_run');
+                            safeWriteJSON(LAST_POST_RUN_FILE, {
+                                run: runNumber,
+                                postsToday: postsToday + 1,
+                                lastPostDate: todayStr(),
+                            }, 'last_post_run');
                         }
                     }
 
@@ -261,10 +281,99 @@ async function scheduledRun() {
                     if (runNumber % 10 === 0) {
                         try {
                             const { analyzeContentPerformance } = await import('./client/Twitter-Content-Analytics');
-                            analyzeContentPerformance();
+                            await analyzeContentPerformance();
                             logger.info(`[twitter-scheduler] Content performance analysis complete`);
                         } catch (analyticsErr) {
                             logger.warn(`[twitter-scheduler] Analytics failed (non-fatal): ${formatError(analyticsErr)}`);
+                        }
+                    }
+
+                    // Refresh likes analysis once per day (first run of the day)
+                    if (runNumber === 1 || runNumber % 30 === 0) {
+                        try {
+                            const { getLikesAnalysis, refreshLikesAnalysis } = await import('./client/Twitter-Likes-Scraper');
+                            const existing = getLikesAnalysis();
+                            const isStale = !existing || (Date.now() - new Date(existing.analyzedAt).getTime() > 24 * 60 * 60 * 1000);
+                            if (isStale) {
+                                logger.info('[twitter-scheduler] Refreshing likes-based search terms...');
+                                const analysis = await refreshLikesAnalysis(page, 100);
+                                logger.info(`[twitter-scheduler] Likes refresh: ${analysis.topics.length} topics, ${analysis.searchTerms.length} search terms`);
+                            }
+                        } catch (likesErr) {
+                            logger.warn(`[twitter-scheduler] Likes refresh failed (non-fatal): ${formatError(likesErr)}`);
+                        }
+                    }
+
+                    // ── Nurture engagement (VR-scheduled comments) ─────────────
+                    // Does NOT count toward cold DM limits — separate nurture system
+                    const NURTURE_FREQUENCY = parseInt(process.env.TWITTER_NURTURE_FREQUENCY || '2', 10);
+                    if (runNumber % NURTURE_FREQUENCY === 0) {
+                        try {
+                            const { runNurtureEngagement } = await import('./client/Twitter-Nurture');
+                            const nurtureResult = await runNurtureEngagement(page, 3, 5);
+                            if (nurtureResult.commentsPosted > 0) {
+                                logger.info(
+                                    `[twitter-scheduler] Nurture: ${nurtureResult.commentsPosted} comments on ` +
+                                    `${nurtureResult.contactsVisited} profiles`
+                                );
+
+                                // Sync to Supabase
+                                try {
+                                    const { syncNurtureCommentToSupabase } = await import('./db/supabaseNurture');
+                                    const { loadVRState } = await import('./nurture/vr-scheduler');
+                                    for (const r of nurtureResult.results.filter(r => r.success)) {
+                                        const vrState = loadVRState(r.username, 'twitter');
+                                        await syncNurtureCommentToSupabase(r, vrState);
+                                    }
+                                } catch (syncErr) {
+                                    logger.debug(`[twitter-scheduler] Nurture Supabase sync failed (non-fatal): ${formatError(syncErr)}`);
+                                }
+                            }
+                        } catch (nurtureErr) {
+                            logger.warn(`[twitter-scheduler] Nurture engagement failed (non-fatal): ${formatError(nurtureErr)}`);
+                        }
+                    }
+
+                    // ── Check notifications (detect replies to our content) ────
+                    const NOTIF_FREQUENCY = parseInt(process.env.TWITTER_NOTIF_FREQUENCY || '3', 10);
+                    if (runNumber % NOTIF_FREQUENCY === 0) {
+                        try {
+                            const { checkNotifications, processIgnoredComments } = await import('./client/Twitter-Notifications');
+                            const notifResult = await checkNotifications(page, 20);
+
+                            if (notifResult.newNotifications.length > 0) {
+                                logger.info(
+                                    `[twitter-scheduler] Notifications: ${notifResult.newNotifications.length} new ` +
+                                    `(${notifResult.replies} replies, ${notifResult.likes} likes)`
+                                );
+
+                                // Sync to Supabase
+                                try {
+                                    const { syncNotificationToSupabase } = await import('./db/supabaseNurture');
+                                    for (const notif of notifResult.newNotifications) {
+                                        await syncNotificationToSupabase(notif);
+                                    }
+                                } catch (syncErr) {
+                                    logger.debug(`[twitter-scheduler] Notification Supabase sync failed (non-fatal): ${formatError(syncErr)}`);
+                                }
+                            }
+
+                            // Check for ignored comments every 6th run
+                            if (runNumber % 6 === 0) {
+                                processIgnoredComments(24);
+                            }
+                        } catch (notifErr) {
+                            logger.warn(`[twitter-scheduler] Notification check failed (non-fatal): ${formatError(notifErr)}`);
+                        }
+                    }
+
+                    // ── Periodic VR snapshot sync (every 20th run) ─────────────
+                    if (runNumber % 20 === 0) {
+                        try {
+                            const { syncAllVRSnapshots } = await import('./db/supabaseNurture');
+                            await syncAllVRSnapshots();
+                        } catch (snapErr) {
+                            logger.debug(`[twitter-scheduler] VR snapshot sync failed (non-fatal): ${formatError(snapErr)}`);
                         }
                     }
                 }
