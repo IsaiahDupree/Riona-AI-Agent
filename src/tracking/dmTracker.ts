@@ -65,6 +65,14 @@ export function getDMsForUser(username: string): TrackedDM[] {
     return dms.filter(d => d.recipientUsername.toLowerCase() === username.toLowerCase());
 }
 
+export function getLastDMTimestamp(username: string): string | null {
+    const dms = loadDMs();
+    const userDMs = dms
+        .filter(d => d.recipientUsername.toLowerCase() === username.toLowerCase() && d.direction === 'outbound')
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return userDMs.length > 0 ? userDMs[0].timestamp : null;
+}
+
 export function cleanupOldDMs(daysToKeep = 90) {
     const cutoff = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000).toISOString();
     const dms = loadDMs();

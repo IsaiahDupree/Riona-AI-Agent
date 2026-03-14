@@ -172,6 +172,27 @@ export async function generateDMMessage(context: {
         learningContext = getLearningContextForAI(relationship.category, relationship.stage);
     } catch (e) { logger.warn('[dm-ai] Failed to load learning context: ' + formatError(e)); }
 
+    // ── Nurture context enrichment ──────────────────────────────
+    let tierContext = '';
+    let interestContext = '';
+    let crossPlatformContext = '';
+    try {
+        const { getTierForMessage } = await import('../nurture/tiers');
+        const { getBestInterestForMessage } = await import('../nurture/interests');
+        const { getCrossContext } = await import('../nurture/cross-platform');
+        const { loadNurtureProfile } = await import('../nurture/store');
+
+        const nurture = loadNurtureProfile(theirProfile.username, 'instagram');
+        const tierHints = getTierForMessage(nurture.tier);
+        tierContext = `\nFriendship tier: ${nurture.tier.replace('_', ' ')}. ${tierHints.style} ${tierHints.depthHint}`;
+
+        const interest = getBestInterestForMessage(theirProfile.username, 'instagram');
+        if (interest) interestContext = `\n${interest.context}`;
+
+        crossPlatformContext = getCrossContext(theirProfile.username, 'instagram');
+        if (crossPlatformContext) crossPlatformContext = `\n${crossPlatformContext}`;
+    } catch (e) { /* nurture not initialized yet — no-op */ }
+
     const systemPrompt = `You are an AI assistant helping craft Instagram DMs for a growth-oriented social media strategy. You write messages that are authentic, personable, and never spammy.
 
 About us:
@@ -193,6 +214,7 @@ Relationship:
 - Stage: ${relationship.stage}
 ${relationship.notes.length > 0 ? `- Notes: ${relationship.notes.join('; ')}` : ''}
 ${relationship.tags.length > 0 ? `- Tags: ${relationship.tags.join(', ')}` : ''}
+${tierContext}${interestContext}${crossPlatformContext}
 
 Rules:
 1. Be genuine and conversational — no corporate speak

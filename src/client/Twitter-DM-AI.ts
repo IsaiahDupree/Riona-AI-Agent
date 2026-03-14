@@ -161,6 +161,27 @@ export async function generateDMMessage(context: {
     const autoObjective = getStageObjective(relationship);
     const messageObjective = objective || autoObjective;
 
+    // ── Nurture context enrichment ──────────────────────────────
+    let tierContext = '';
+    let interestContext = '';
+    let crossPlatformContext = '';
+    try {
+        const { getTierForMessage } = await import('../nurture/tiers');
+        const { getBestInterestForMessage } = await import('../nurture/interests');
+        const { getCrossContext } = await import('../nurture/cross-platform');
+        const { loadNurtureProfile } = await import('../nurture/store');
+
+        const nurture = loadNurtureProfile(theirProfile.username, 'twitter');
+        const tierHints = getTierForMessage(nurture.tier);
+        tierContext = `\nFriendship tier: ${nurture.tier.replace('_', ' ')}. ${tierHints.style} ${tierHints.depthHint}`;
+
+        const interest = getBestInterestForMessage(theirProfile.username, 'twitter');
+        if (interest) interestContext = `\n${interest.context}`;
+
+        crossPlatformContext = getCrossContext(theirProfile.username, 'twitter');
+        if (crossPlatformContext) crossPlatformContext = `\n${crossPlatformContext}`;
+    } catch (e) { /* nurture not initialized yet — no-op */ }
+
     const systemPrompt = `You are an AI assistant helping craft Twitter/X DMs for a growth-oriented social media strategy. You write messages that are authentic, personable, and never spammy.
 
 About us:
@@ -182,6 +203,7 @@ Relationship:
 - Stage: ${relationship.stage}
 ${relationship.notes.length > 0 ? `- Notes: ${relationship.notes.join('; ')}` : ''}
 ${relationship.tags.length > 0 ? `- Tags: ${relationship.tags.join(', ')}` : ''}
+${tierContext}${interestContext}${crossPlatformContext}
 
 Rules:
 1. Be genuine and conversational — no corporate speak

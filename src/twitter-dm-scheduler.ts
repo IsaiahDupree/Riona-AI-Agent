@@ -177,6 +177,32 @@ function saveTargets(targets: string[]) {
                         logger.error(`[twitter-dm-scheduler] Feedback check error: ${formatError(e)}`);
                     }
 
+                    // 4. Process proactive check-ins for warm contacts
+                    try {
+                        const { processDueCheckIns } = await import('./nurture/check-ins');
+                        const checkInsSent = await processDueCheckIns('twitter', async (username, message) => {
+                            try {
+                                const stats = await pipeline.runBatchOutreach([username]);
+                                return stats.sent > 0;
+                            } catch { return false; }
+                        }, 3);
+                        if (checkInsSent > 0) {
+                            logger.info(`[twitter-dm-scheduler] Sent ${checkInsSent} proactive check-ins`);
+                        }
+                    } catch (e) {
+                        logger.warn(`[twitter-dm-scheduler] Check-ins error (non-fatal): ${formatError(e)}`);
+                    }
+
+                    // 5. Periodic tier evaluation (every pipeline run)
+                    try {
+                        const { runTierEvaluation } = await import('./nurture/tiers');
+                        const { promoted, demoted } = runTierEvaluation('twitter');
+                        if (promoted.length > 0) logger.info(`[twitter-dm-scheduler] Tier promotions: ${promoted.join(', ')}`);
+                        if (demoted.length > 0) logger.info(`[twitter-dm-scheduler] Tier demotions: ${demoted.join(', ')}`);
+                    } catch (e) {
+                        logger.warn(`[twitter-dm-scheduler] Tier evaluation error (non-fatal): ${formatError(e)}`);
+                    }
+
                 } catch (e) {
                     logger.error(`[twitter-dm-scheduler] Pipeline error: ${formatError(e)}`);
                     await notifyError('Twitter DM Pipeline', formatError(e)).catch(() => {});

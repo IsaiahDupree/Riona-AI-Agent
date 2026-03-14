@@ -71,6 +71,8 @@ export interface RelationshipInfo {
     lastInteraction?: string;
     notes: string[];
     tags: string[];
+    friendshipTier?: 'acquaintance' | 'casual_friend' | 'close_friend' | 'inner_circle';
+    personId?: string;          // cross-platform identity link
 }
 
 export interface DMContext {
