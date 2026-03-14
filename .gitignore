@@ -59,6 +59,7 @@ chrome-profile-niche-test/
 
 # Test scripts (ad-hoc)
 test-*.ts
+test-*.js
 debug-*.js
 
 # Temporary files

@@ -8,6 +8,7 @@ import { TwitterDM } from './client/Twitter-DM';
 import { TwitterDMPipeline, loadConfig as loadPipelineConfig } from './client/Twitter-DM-Pipeline';
 import { collectNicheProspects } from './client/Twitter-AI';
 import { getTodayTwitterDMCount } from './tracking/twitterDMTracker';
+import { getTodayDMLimit, getDMLimitInfo } from './config/dm-limits';
 import { notifyNewDM, notifyError, notifyStartup } from './utils/telegram';
 import { logger } from './utils/logger';
 import { safeReadJSON, safeWriteJSON, formatError } from './utils/errors';
@@ -18,12 +19,12 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 const CHECK_INTERVAL = parseInt(process.env.TWITTER_DM_CHECK_INTERVAL_MINUTES || '5', 10) * 60 * 1000;
 const PIPELINE_INTERVAL = parseInt(process.env.TWITTER_DM_PIPELINE_INTERVAL_MINUTES || '30', 10) * 60 * 1000;
 const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
-const MAX_DMS_PER_DAY = parseInt(process.env.TWITTER_DM_MAX_PER_DAY || '50', 10);
 const AUTO_APPROVE = process.env.TWITTER_DM_AUTO_APPROVE === 'true';
 const NICHE_HASHTAGS = (process.env.TWITTER_NICHE_HASHTAGS || '').split(',').map(h => h.trim()).filter(Boolean);
 
 // Simple mutex to prevent watcher/pipeline from colliding on navigation
 let navigating = false;
+let navigatingOwner = '';
 
 function loadTargets(): string[] {
     return safeReadJSON<string[]>(TARGETS_FILE, [], 'twitter_outreach_targets');
@@ -35,13 +36,15 @@ function saveTargets(targets: string[]) {
 
 (async () => {
     console.log('');
+    const MAX_DMS_PER_DAY = getTodayDMLimit();
+    const limitInfo = getDMLimitInfo();
     console.log('╔══════════════════════════════════════════════════════════╗');
-    console.log('║       Riona Twitter DM System v2.0                     ║');
+    console.log('║       Riona Twitter DM System v2.1                     ║');
     console.log('╠══════════════════════════════════════════════════════════╣');
     console.log(`║  DM check:       every ${String(CHECK_INTERVAL / 60000).padEnd(3)} minutes                    ║`);
     console.log(`║  Pipeline:       every ${String(PIPELINE_INTERVAL / 60000).padEnd(3)} minutes                    ║`);
     console.log(`║  Auto-approve:   ${AUTO_APPROVE ? 'ON ' : 'OFF'}                                     ║`);
-    console.log(`║  Max DMs/day:    ${String(MAX_DMS_PER_DAY).padEnd(4)}                                    ║`);
+    console.log(`║  Max DMs/day:    ${String(MAX_DMS_PER_DAY).padEnd(4)} (week ${limitInfo.weekNumber}, +10/wk)             ║`);
     console.log(`║  Bot account:    @${(process.env.TWITTER_BOT_USERNAME || 'unknown').padEnd(37)}║`);
     console.log('╚══════════════════════════════════════════════════════════╝');
     console.log('');
@@ -55,7 +58,7 @@ function saveTargets(targets: string[]) {
 
         const pipelineConfig = loadPipelineConfig();
         pipelineConfig.autoApprove = AUTO_APPROVE;
-        pipelineConfig.maxDMsPerDay = MAX_DMS_PER_DAY;
+        pipelineConfig.maxDMsPerDay = getTodayDMLimit();
 
         const pipeline = new TwitterDMPipeline(dm, pipelineConfig);
 
@@ -64,11 +67,12 @@ function saveTargets(targets: string[]) {
             while (true) {
                 try {
                     if (navigating) {
-                        logger.info('[twitter-dm-scheduler] Watcher waiting — pipeline navigating');
+                        logger.info(`[twitter-dm-scheduler] Watcher waiting — ${navigatingOwner} navigating`);
                         await delay(10000);
                         continue;
                     }
                     navigating = true;
+                    navigatingOwner = 'watcher';
 
                     logger.info('[twitter-dm-scheduler] Checking inbox for new messages...');
                     const conversations = await dm.scrapeInbox();
@@ -106,7 +110,10 @@ function saveTargets(targets: string[]) {
                         await delay(5000);
                     }
                     navigating = true;
+                    navigatingOwner = 'pipeline';
 
+                    // Re-fetch dynamic limit each cycle (auto-increments weekly)
+                    const MAX_DMS_PER_DAY = getTodayDMLimit();
                     const todayCount = getTodayTwitterDMCount();
 
                     // 1. Process approved sends via pipeline

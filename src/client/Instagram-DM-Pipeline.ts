@@ -106,7 +106,9 @@ export function matchOffer(
 
         // Check stage threshold
         const stageOrder = ['cold_outreach', 'initial_contact', 'building', 'warm', 'active'];
-        if (stageOrder.indexOf(relationship.stage) < stageOrder.indexOf(offer.minStage)) continue;
+        const currentStageIdx = stageOrder.indexOf(relationship.stage);
+        const minStageIdx = stageOrder.indexOf(offer.minStage);
+        if (currentStageIdx === -1 || minStageIdx === -1 || currentStageIdx < minStageIdx) continue;
 
         // Check category match
         if (offer.targetCategories.length > 0 && !offer.targetCategories.includes(relationship.category)) continue;
@@ -211,7 +213,11 @@ export class DMPipeline {
     // ── Process a single target: scrape → categorize → generate → queue/send ──
 
     async processTarget(username: string): Promise<PendingSend | null> {
-        const page = this.dm.getPage()!;
+        const page = this.dm.getPage();
+        if (!page) {
+            logger.error('[pipeline] Browser page not available — cannot process target');
+            return null;
+        }
 
         // Check cooldown
         const recentDM = hasSentDMTo(username, this.config.cooldownHoursPerUser);
@@ -415,7 +421,11 @@ export class DMPipeline {
     // ── Check for replies and update feedback loop ──────────────────
 
     async checkRepliesAndUpdateFeedback(): Promise<number> {
-        const page = this.dm.getPage()!;
+        const page = this.dm.getPage();
+        if (!page) {
+            logger.error('[pipeline] Browser page not available — cannot check replies');
+            return 0;
+        }
         let repliesFound = 0;
 
         // Get all outbound DMs that don't have feedback yet

@@ -165,6 +165,21 @@ async function scheduledRun() {
         }
 
         if (!isWithinActiveHours()) {
+            // Capture daily snapshot at end of day (first check after active hours)
+            try {
+                const { captureDailySnapshot, generateGrowthReport, formatGrowthReport } = await import('./tracking/weeklyStats');
+                const snapshotFile = path.join(process.cwd(), 'logs', 'tracking', 'weekly', '.last_snapshot_date.txt');
+                const lastSnapshotDate = fs.existsSync(snapshotFile) ? fs.readFileSync(snapshotFile, 'utf-8').trim() : '';
+                if (lastSnapshotDate !== todayStr()) {
+                    await captureDailySnapshot();
+                    fs.mkdirSync(path.dirname(snapshotFile), { recursive: true });
+                    fs.writeFileSync(snapshotFile, todayStr());
+                    const report = generateGrowthReport();
+                    logger.info(`[twitter-scheduler] Daily snapshot captured\n${formatGrowthReport(report)}`);
+                }
+            } catch (snapErr) {
+                logger.warn(`[twitter-scheduler] Snapshot capture failed (non-fatal): ${formatError(snapErr)}`);
+            }
             logger.info(`[twitter-scheduler] Outside active hours (${ACTIVE_START}:00 - ${ACTIVE_END}:00). Skipping.`);
             return;
         }

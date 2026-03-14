@@ -71,54 +71,68 @@ export class TwitterDM {
         const timestamp = new Date().toISOString();
 
         try {
-            // Navigate to inbox first
+            // Strategy 1: Try to open existing thread via inbox search (most reliable)
             await this.navigateToInbox();
             await this.page.screenshot({ path: screenshotPath('twitter-dm-1-inbox.png'), fullPage: false });
 
-            // Click "New message" icon
-            const newMsgClicked = await this.clickNewMessage();
-            if (!newMsgClicked) {
-                return { success: false, error: 'Could not click New Message button', recipientUsername: recipientName, messageText: message, timestamp, verified: false };
+            const existingFound = await this.openExistingThread(recipientName);
+            if (existingFound) {
+                logger.info(`[twitter-dm] Found existing thread with @${recipientName}`);
+                await delay(2000);
+                await this.page.screenshot({ path: screenshotPath('twitter-dm-2-thread-open.png'), fullPage: false });
+                const sent = await this.typeAndSendMessage(message);
+                await delay(3000);
+                const verified = await this.verifyMessageSent(message);
+                logger.info(`[twitter-dm] Send result: success=${sent}, verified=${verified}`);
+                return { success: sent, recipientUsername: recipientName, messageText: message, timestamp, verified };
             }
-            await delay(2000);
-            await this.page.screenshot({ path: screenshotPath('twitter-dm-2-new-msg-dialog.png'), fullPage: false });
 
-            // Search for the recipient
+            // Strategy 2: Navigate to user's profile and click the Message/DM button
+            logger.info(`[twitter-dm] No existing thread, trying profile message button...`);
+            const profileOpened = await this.openDMFromProfile(recipientName);
+            if (profileOpened) {
+                logger.info(`[twitter-dm] Opened DM thread from @${recipientName}'s profile`);
+                await delay(2000);
+                await this.page.screenshot({ path: screenshotPath('twitter-dm-3-profile-dm.png'), fullPage: false });
+                const sent = await this.typeAndSendMessage(message);
+                await delay(3000);
+                const verified = await this.verifyMessageSent(message);
+                logger.info(`[twitter-dm] Send result: success=${sent}, verified=${verified}`);
+                return { success: sent, recipientUsername: recipientName, messageText: message, timestamp, verified };
+            }
+
+            // Strategy 3: Compose dialog as last resort
+            logger.info(`[twitter-dm] Profile DM button not found, trying compose dialog...`);
+            try {
+                await this.page.goto(`https://x.com/messages/compose`, {
+                    waitUntil: 'domcontentloaded', timeout: 15000
+                });
+                await delay(2000);
+            } catch (e) {
+                logger.debug(`[twitter-dm] Direct compose navigation failed: ${formatError(e)}`);
+            }
+            await this.page.screenshot({ path: screenshotPath('twitter-dm-4-compose-dialog.png'), fullPage: false });
+
             const recipientFound = await this.searchAndSelectRecipient(recipientName);
             if (!recipientFound) {
                 await this.page.keyboard.press('Escape');
-                return { success: false, error: `Recipient "${recipientName}" not found`, recipientUsername: recipientName, messageText: message, timestamp, verified: false };
+                return { success: false, error: `Recipient "${recipientName}" not found via any strategy`, recipientUsername: recipientName, messageText: message, timestamp, verified: false };
             }
             await delay(1000);
-            await this.page.screenshot({ path: screenshotPath('twitter-dm-3-recipient-selected.png'), fullPage: false });
 
-            // Click "Next" to open the thread
             const chatOpened = await this.clickNext();
             if (!chatOpened) {
                 await this.page.keyboard.press('Escape');
-                return { success: false, error: 'Could not open chat', recipientUsername: recipientName, messageText: message, timestamp, verified: false };
+                return { success: false, error: 'Could not open chat after compose', recipientUsername: recipientName, messageText: message, timestamp, verified: false };
             }
             await delay(2000);
-            await this.page.screenshot({ path: screenshotPath('twitter-dm-4-thread-open.png'), fullPage: false });
 
-            // Find the message input and type
             const sent = await this.typeAndSendMessage(message);
             await delay(3000);
-            await this.page.screenshot({ path: screenshotPath('twitter-dm-5-after-send.png'), fullPage: false });
-
-            // Verify the message appeared
             const verified = await this.verifyMessageSent(message);
 
-            const result: DMSendResult = {
-                success: sent,
-                recipientUsername: recipientName,
-                messageText: message,
-                timestamp,
-                verified
-            };
-
             logger.info(`[twitter-dm] Send result: success=${sent}, verified=${verified}`);
-            return result;
+            return { success: sent, recipientUsername: recipientName, messageText: message, timestamp, verified };
 
         } catch (error) {
             const err = error instanceof Error ? error.message : String(error);
@@ -288,21 +302,37 @@ export class TwitterDM {
             }
         }
 
-        // Fallback: look for a compose/pencil icon button
-        const allBtns = await this.page.$$('a, button, div[role="button"]');
-        for (const btn of allBtns) {
-            const hasSvg = await btn.evaluate(el => {
-                const svg = el.querySelector('svg');
-                if (!svg) return false;
-                const rect = el.getBoundingClientRect();
-                // The new message button is typically in the header area
-                return rect.y < 200 && rect.width < 80;
+        // Fallback 1: Navigate directly to compose URL
+        try {
+            await this.page.goto('https://x.com/messages/compose', {
+                waitUntil: 'domcontentloaded', timeout: 15000
             });
-            if (hasSvg) {
-                await btn.click();
-                logger.info('[twitter-dm] Clicked new message button via fallback');
+            await delay(2000);
+            // Check if compose dialog appeared
+            const hasSearchPeople = await this.page.$('input[data-testid="searchPeople"], input[placeholder*="Search"]');
+            if (hasSearchPeople) {
+                logger.info('[twitter-dm] Opened compose via direct URL /messages/compose');
                 return true;
             }
+        } catch (e) {
+            logger.debug(`[twitter-dm] Direct compose URL failed: ${formatError(e)}`);
+        }
+
+        // Fallback 2: Click "New chat" button (visible in inbox center)
+        const newChatBtn = await this.page.evaluate(() => {
+            const btns = document.querySelectorAll('button, div[role="button"], a');
+            for (const btn of btns) {
+                const text = (btn as HTMLElement).innerText?.trim().toLowerCase() || '';
+                if (text === 'new chat' || text === 'new message') {
+                    (btn as HTMLElement).click();
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (newChatBtn) {
+            logger.info('[twitter-dm] Clicked "New chat" button via text match');
+            return true;
         }
 
         logger.warn('[twitter-dm] New message button not found');
@@ -341,27 +371,59 @@ export class TwitterDM {
         await this.page.keyboard.type(recipientName, { delay: 50 });
         await delay(2000); // Wait for search results
 
+        // Wait a bit longer for search results to populate
+        await delay(3000);
+
         // Click the first matching result
         const resultClicked = await this.page.evaluate((name: string) => {
             const nameLower = name.toLowerCase();
             // Look for clickable items in the dialog/modal
             const dialog = document.querySelector('[role="dialog"]') || document.querySelector('[aria-modal="true"]');
             const container = dialog || document;
-            const items = container.querySelectorAll('div[role="button"], button, div[role="option"], li[role="listitem"]');
-            for (const item of items) {
+
+            // Try Twitter-specific selectors first
+            const specificSelectors = [
+                '[data-testid="TypeaheadUser"]',
+                '[data-testid="UserCell"]',
+                '[data-testid="listTimelineItem"]',
+            ];
+            for (const sel of specificSelectors) {
+                const items = container.querySelectorAll(sel);
+                for (const item of items) {
+                    const text = (item as HTMLElement).innerText?.toLowerCase() || '';
+                    if (text.includes(nameLower)) {
+                        (item as HTMLElement).click();
+                        return true;
+                    }
+                }
+            }
+
+            // Broader search: any item containing the username in the dialog
+            const allItems = container.querySelectorAll('div[role="button"], button, div[role="option"], li[role="listitem"], div[role="row"]');
+            for (const item of allItems) {
                 const text = (item as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
+                if (text.includes(nameLower) && text.length < 200) {
                     (item as HTMLElement).click();
                     return true;
                 }
             }
-            // Also try any list items in search results
-            const listItems = container.querySelectorAll('[data-testid="TypeaheadUser"], [data-testid="UserCell"]');
-            for (const li of listItems) {
-                const text = (li as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
-                    (li as HTMLElement).click();
-                    return true;
+
+            // Last resort: find any element with the @handle
+            const handleSpans = container.querySelectorAll('span');
+            for (const span of handleSpans) {
+                const text = span.textContent?.toLowerCase().trim() || '';
+                if (text === `@${nameLower}` || text === nameLower) {
+                    const clickable = span.closest('div[role="button"], button, a, [data-testid="TypeaheadUser"], [data-testid="UserCell"]');
+                    if (clickable) {
+                        (clickable as HTMLElement).click();
+                        return true;
+                    }
+                    // Click the span's parent row
+                    const row = span.closest('div[class]');
+                    if (row) {
+                        (row as HTMLElement).click();
+                        return true;
+                    }
                 }
             }
             return false;
@@ -402,13 +464,209 @@ export class TwitterDM {
         return false;
     }
 
+    private async openDMFromProfile(username: string): Promise<boolean> {
+        if (!this.page) return false;
+
+        try {
+            // Navigate to user's profile
+            await this.page.goto(`https://x.com/${username}`, {
+                waitUntil: 'domcontentloaded', timeout: 30000
+            });
+            await delay(3000);
+
+            // Look for the DM/Message button on their profile
+            // Twitter uses a mail/envelope icon button on profiles
+            const dmClicked = await this.page.evaluate(() => {
+                // Method 1: data-testid for the DM button
+                const dmBtn = document.querySelector('[data-testid="sendDMFromProfile"]');
+                if (dmBtn) {
+                    (dmBtn as HTMLElement).click();
+                    return 'sendDMFromProfile';
+                }
+
+                // Method 2: aria-label "Message" button
+                const msgBtns = document.querySelectorAll('button[aria-label="Message"], div[role="button"][aria-label="Message"]');
+                for (const btn of msgBtns) {
+                    const rect = (btn as HTMLElement).getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        (btn as HTMLElement).click();
+                        return 'aria-label-message';
+                    }
+                }
+
+                // Method 3: Look for envelope/mail SVG icon in action buttons area
+                const svgs = document.querySelectorAll('svg');
+                for (const svg of svgs) {
+                    const label = svg.getAttribute('aria-label')?.toLowerCase() || '';
+                    if (label === 'message' || label === 'direct message') {
+                        const btn = svg.closest('button, div[role="button"], a');
+                        if (btn) {
+                            (btn as HTMLElement).click();
+                            return 'svg-message-icon';
+                        }
+                    }
+                }
+
+                return null;
+            });
+
+            if (dmClicked) {
+                logger.info(`[twitter-dm] Clicked DM button on @${username}'s profile via ${dmClicked}`);
+                await delay(3000);
+
+                // Check if we landed in a DM thread
+                // Twitter uses both /messages/ and /i/chat/ URL patterns
+                const currentUrl = this.page.url();
+                if (currentUrl.includes('/messages/') || currentUrl.includes('/i/chat/')) {
+                    logger.info(`[twitter-dm] Successfully opened DM thread from profile: ${currentUrl}`);
+                    return true;
+                }
+
+                // Sometimes clicking the button opens a DM compose overlay on the same page
+                const hasInput = await this.page.$('div[data-testid="dmComposerTextInput"], div[role="textbox"][contenteditable="true"]');
+                if (hasInput) {
+                    logger.info(`[twitter-dm] DM compose overlay opened from profile`);
+                    return true;
+                }
+
+                // Wait a bit more and re-check
+                await delay(2000);
+                const currentUrl2 = this.page.url();
+                if (currentUrl2.includes('/messages/') || currentUrl2.includes('/i/chat/')) {
+                    logger.info(`[twitter-dm] Successfully opened DM thread from profile (after wait): ${currentUrl2}`);
+                    return true;
+                }
+
+                logger.warn(`[twitter-dm] DM button clicked but no thread opened (URL: ${currentUrl2})`);
+                await this.page.screenshot({ path: screenshotPath('twitter-dm-profile-dm-fail.png'), fullPage: false });
+                return false;
+            }
+
+            logger.info(`[twitter-dm] No DM button found on @${username}'s profile (DMs may be closed)`);
+            await this.page.screenshot({ path: screenshotPath('twitter-dm-profile-no-button.png'), fullPage: false });
+            return false;
+
+        } catch (e) {
+            logger.warn(`[twitter-dm] openDMFromProfile failed: ${formatError(e)}`);
+            return false;
+        }
+    }
+
     private async openExistingThread(username: string): Promise<boolean> {
         if (!this.page) return false;
 
-        // Look for the conversation in the sidebar
+        // First try: use the inbox search bar (placeholder is just "Search")
+        // On /i/chat/ page, the search bar is a styled element, may need to click first
+        const searchSelectors = [
+            'input[placeholder="Search"]',
+            'input[placeholder="Search Direct Messages"]',
+            'input[aria-label="Search"]',
+            'input[aria-label*="Search"]',
+            'input[data-testid="SearchBox_Search_Input"]',
+            'input[data-testid="DmActivitySearch"]',
+        ];
+
+        let searchBar: ElementHandle<Element> | null = null;
+        for (const sel of searchSelectors) {
+            searchBar = await this.page.$(sel);
+            if (searchBar) {
+                logger.info(`[twitter-dm] Found inbox search bar: ${sel}`);
+                break;
+            }
+        }
+
+        // If no direct input found, try clicking the search area to activate it
+        if (!searchBar) {
+            const activated = await this.page.evaluate(() => {
+                // Find any element with "Search" text in the DM sidebar area
+                const allEls = document.querySelectorAll('div, span, label');
+                for (const el of allEls) {
+                    const text = (el as HTMLElement).innerText?.trim();
+                    if (text === 'Search' && (el as HTMLElement).getBoundingClientRect().width > 50) {
+                        (el as HTMLElement).click();
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (activated) {
+                await delay(500);
+                // Now look for the input that appeared
+                for (const sel of searchSelectors) {
+                    searchBar = await this.page.$(sel);
+                    if (searchBar) {
+                        logger.info(`[twitter-dm] Found search bar after click activation: ${sel}`);
+                        break;
+                    }
+                }
+                // Try generic input
+                if (!searchBar) {
+                    searchBar = await this.page.$('input[type="text"]');
+                    if (searchBar) logger.info('[twitter-dm] Found search bar via generic input after activation');
+                }
+            }
+        }
+
+        if (searchBar) {
+            await searchBar.click();
+            await delay(500);
+            await this.page.keyboard.type(username, { delay: 30 });
+            await delay(3000); // Wait for search results to populate
+
+            await this.page.screenshot({ path: screenshotPath('twitter-dm-inbox-search.png'), fullPage: false });
+
+            // Click first matching result in search
+            const searchResult = await this.page.evaluate((name: string) => {
+                const nameLower = name.toLowerCase();
+                // Check all clickable items that might be search results
+                const selectors = [
+                    'div[data-testid="TypeaheadUser"]',
+                    'div[data-testid="conversation"]',
+                    'div[role="listitem"]',
+                    'div[role="row"]',
+                    'div[role="option"]',
+                    'a[href*="/messages/"]',
+                ];
+                for (const sel of selectors) {
+                    const items = document.querySelectorAll(sel);
+                    for (const item of items) {
+                        const text = (item as HTMLElement).innerText?.toLowerCase() || '';
+                        if (text.includes(nameLower)) {
+                            (item as HTMLElement).click();
+                            return sel;
+                        }
+                    }
+                }
+                // Broader: any element containing the username
+                const allDivs = document.querySelectorAll('div[tabindex], li, a');
+                for (const el of allDivs) {
+                    const text = (el as HTMLElement).innerText?.toLowerCase() || '';
+                    if (text.includes(nameLower) && text.length < 200) {
+                        (el as HTMLElement).click();
+                        return 'generic-click';
+                    }
+                }
+                return null;
+            }, username);
+
+            if (searchResult) {
+                logger.info(`[twitter-dm] Opened thread via inbox search for "${username}" (${searchResult})`);
+                return true;
+            }
+
+            // Clear search and fall through to visual scan
+            await this.page.keyboard.down('Control');
+            await this.page.keyboard.press('a');
+            await this.page.keyboard.up('Control');
+            await this.page.keyboard.press('Backspace');
+            await delay(500);
+        } else {
+            logger.warn('[twitter-dm] No inbox search bar found');
+        }
+
+        // Second try: visually scan sidebar conversations
         const found = await this.page.evaluate((name: string) => {
             const nameLower = name.toLowerCase();
-            // Twitter DM sidebar conversations
             const conversations = document.querySelectorAll('div[data-testid="conversation"], a[href*="/messages/"]');
             for (const conv of conversations) {
                 const text = (conv as HTMLElement).innerText?.toLowerCase() || '';
@@ -417,7 +675,6 @@ export class TwitterDM {
                     return true;
                 }
             }
-            // Fallback: search by text in list items
             const items = document.querySelectorAll('div[role="listitem"], div[role="row"]');
             for (const item of items) {
                 const text = (item as HTMLElement).innerText?.toLowerCase() || '';
@@ -439,32 +696,61 @@ export class TwitterDM {
         if (!this.page) return false;
 
         // Find the message input — Twitter uses data-testid selectors
+        // The /i/chat/ page may take longer to render the input
         const inputSelectors = [
+            // /i/chat/ page uses a plain textarea
+            'textarea[placeholder="Unencrypted message"]',
+            'textarea[placeholder*="message" i]',
+            // /messages/ page uses contenteditable divs
             'div[data-testid="dmComposerTextInput"]',
             'div[data-testid="dmComposerTextInput"] div[contenteditable="true"]',
             'div[role="textbox"][contenteditable="true"]',
             'textarea[data-testid="dmComposerTextInput"]',
             'div[aria-label*="message" i][contenteditable="true"]',
+            'div[contenteditable="true"][data-offset-key]',
+            'div[data-testid="tweetTextarea_0"]',
         ];
 
         let msgInput: ElementHandle<Element> | null = null;
-        for (const sel of inputSelectors) {
-            msgInput = await this.page.$(sel);
-            if (msgInput) {
-                const visible = await msgInput.evaluate(el => {
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                });
-                if (visible) {
-                    logger.info(`[twitter-dm] Found message input: ${sel}`);
-                    break;
+
+        // Try up to 3 rounds with delays (input may still be loading)
+        for (let attempt = 0; attempt < 3 && !msgInput; attempt++) {
+            if (attempt > 0) {
+                logger.info(`[twitter-dm] Waiting for message input (attempt ${attempt + 1}/3)...`);
+                await delay(2000);
+            }
+            for (const sel of inputSelectors) {
+                msgInput = await this.page.$(sel);
+                if (msgInput) {
+                    const visible = await msgInput.evaluate(el => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    });
+                    if (visible) {
+                        logger.info(`[twitter-dm] Found message input: ${sel}`);
+                        break;
+                    }
+                    msgInput = null;
                 }
-                msgInput = null;
+            }
+        }
+
+        // Last resort: try waitForSelector
+        if (!msgInput) {
+            try {
+                msgInput = await this.page.waitForSelector(
+                    'textarea[placeholder="Unencrypted message"], div[data-testid="dmComposerTextInput"], div[role="textbox"][contenteditable="true"]',
+                    { timeout: 5000, visible: true }
+                );
+                if (msgInput) logger.info('[twitter-dm] Found message input via waitForSelector');
+            } catch (e) {
+                logger.debug(`[twitter-dm] waitForSelector timed out: ${formatError(e)}`);
             }
         }
 
         if (!msgInput) {
-            logger.warn('[twitter-dm] Message input not found');
+            await this.page.screenshot({ path: screenshotPath('twitter-dm-no-input.png'), fullPage: false });
+            logger.warn('[twitter-dm] Message input not found after all attempts');
             return false;
         }
 
@@ -559,9 +845,9 @@ export class TwitterDM {
                 if (body.includes(text)) return { verified: true, reason: 'message_visible' };
 
                 // Check if input is empty (message was consumed)
-                const inputs = document.querySelectorAll('div[data-testid="dmComposerTextInput"], div[role="textbox"][contenteditable="true"]');
+                const inputs = document.querySelectorAll('textarea[placeholder="Unencrypted message"], div[data-testid="dmComposerTextInput"], div[role="textbox"][contenteditable="true"]');
                 const allEmpty = Array.from(inputs).every(i => {
-                    const content = i.textContent || '';
+                    const content = (i as HTMLTextAreaElement).value || i.textContent || '';
                     return content.trim() === '' || content.trim() === 'Start a new message';
                 });
                 if (allEmpty) return { verified: true, reason: 'input_cleared' };

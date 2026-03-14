@@ -105,7 +105,9 @@ export function matchOffer(
         if (relationship.warmth < offer.minWarmth) continue;
 
         const stageOrder = ['cold_outreach', 'initial_contact', 'building', 'warm', 'active'];
-        if (stageOrder.indexOf(relationship.stage) < stageOrder.indexOf(offer.minStage)) continue;
+        const currentStageIdx = stageOrder.indexOf(relationship.stage);
+        const minStageIdx = stageOrder.indexOf(offer.minStage);
+        if (currentStageIdx === -1 || minStageIdx === -1 || currentStageIdx < minStageIdx) continue;
 
         if (offer.targetCategories.length > 0 && !offer.targetCategories.includes(relationship.category)) continue;
 
@@ -207,7 +209,11 @@ export class TwitterDMPipeline {
     // ── Process a single target: scrape → categorize → generate → queue/send ──
 
     async processTarget(username: string): Promise<PendingSend | null> {
-        const page = this.dm.getPage()!;
+        const page = this.dm.getPage();
+        if (!page) {
+            logger.error('[twitter-pipeline] Browser page not available — cannot process target');
+            return null;
+        }
 
         // Check cooldown
         const recentDM = hasSentTwitterDMTo(username, this.config.cooldownHoursPerUser);
@@ -234,7 +240,7 @@ export class TwitterDMPipeline {
         await delay(2000);
 
         // Sync profile to Supabase (fire-and-forget)
-        syncTwitterProfileToSupabase(username, theirProfile).catch(() => {});
+        syncTwitterProfileToSupabase(username, theirProfile).catch(e => logger.debug(`[twitter-pipeline] Supabase profile sync failed: ${formatError(e)}`));
 
         // Load/create relationship
         let relationship = loadRelationship(username);
@@ -329,7 +335,7 @@ export class TwitterDMPipeline {
                 trackTwitterDM(tracked);
 
                 // Sync to Supabase (fire-and-forget)
-                syncTwitterDMToSupabase(tracked).catch(() => {});
+                syncTwitterDMToSupabase(tracked).catch(e => logger.debug(`[twitter-pipeline] Supabase DM sync failed: ${formatError(e)}`));
 
                 // Track offer if one was matched
                 if (pending.context.offer) {

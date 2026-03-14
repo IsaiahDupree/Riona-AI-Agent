@@ -31,6 +31,20 @@ export async function scrapeTwitterProfile(page: Page, username: string): Promis
     await delay(3000);
 
     const profile = await page.evaluate((user: string) => {
+        const parseCount = (s: string): number => {
+            if (!s) return 0;
+            s = s.replace(/,/g, '');
+            const multiplier = s.match(/[KMB]$/i);
+            let num = parseFloat(s);
+            if (multiplier) {
+                const m = multiplier[0].toUpperCase();
+                if (m === 'K') num *= 1000;
+                else if (m === 'M') num *= 1000000;
+                else if (m === 'B') num *= 1000000000;
+            }
+            return Math.round(num);
+        };
+
         const result: any = {
             username: user,
             fullName: '',
@@ -134,20 +148,6 @@ export async function scrapeTwitterProfile(page: Page, username: string): Promis
             if (text && !text.startsWith('http') && !text.includes('Joined')) {
                 result.category = text;
             }
-        }
-
-        function parseCount(str: string): number {
-            if (!str) return 0;
-            str = str.replace(/,/g, '');
-            const multiplier = str.match(/[KMB]$/i);
-            let num = parseFloat(str);
-            if (multiplier) {
-                const m = multiplier[0].toUpperCase();
-                if (m === 'K') num *= 1000;
-                else if (m === 'M') num *= 1000000;
-                else if (m === 'B') num *= 1000000000;
-            }
-            return Math.round(num);
         }
 
         return result;
