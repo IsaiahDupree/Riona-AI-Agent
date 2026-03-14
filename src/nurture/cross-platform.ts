@@ -170,10 +170,10 @@ export function getCrossState(personId: string): CrossPlatformState | null {
  * Check if we can message this person on the given platform.
  * Prevents double-messaging the same person on both platforms in 24h.
  */
-export function canMessageOnPlatform(
+export async function canMessageOnPlatform(
     handle: string,
     platform: 'twitter' | 'instagram'
-): { allowed: boolean; reason: string } {
+): Promise<{ allowed: boolean; reason: string }> {
     const identity = findPersonByHandle(handle, platform);
     if (!identity) return { allowed: true, reason: 'no cross-platform link' };
 
@@ -186,7 +186,7 @@ export function canMessageOnPlatform(
 
     try {
         if (otherPlatform === 'twitter') {
-            const { hasSentTwitterDMTo } = require('../tracking/twitterDMTracker');
+            const { hasSentTwitterDMTo } = await import('../tracking/twitterDMTracker');
             if (hasSentTwitterDMTo(otherHandle, 24)) {
                 return { allowed: false, reason: `Already DMed @${otherHandle} on Twitter in last 24h` };
             }

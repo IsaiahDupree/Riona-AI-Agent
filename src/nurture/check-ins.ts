@@ -206,7 +206,7 @@ export async function processDueCheckIns(
 
     for (const contact of due.slice(0, maxCheckIns)) {
         // Cross-platform guard
-        const guard = canMessageOnPlatform(contact.username, platform);
+        const guard = await canMessageOnPlatform(contact.username, platform);
         if (!guard.allowed) {
             logger.info(`[check-ins] Skipping @${contact.username}: ${guard.reason}`);
             continue;

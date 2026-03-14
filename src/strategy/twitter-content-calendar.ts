@@ -118,13 +118,17 @@ export function generateWeeklyCalendar(brand: BrandIdentity): ContentCalendar {
 
 // ── Slot selection ──────────────────────────────────────────────────
 
-export function getNextContentSlot(runNumber: number): ContentSlot {
+export async function getNextContentSlot(runNumber: number): Promise<ContentSlot> {
     let calendar = loadCalendar();
 
     // Regenerate weekly (or on first run)
     if (!calendar || isCalendarExpired(calendar)) {
-        const { loadBrandIdentity } = require('./twitter-brand');
+        const { loadBrandIdentity } = await import('./twitter-brand');
         calendar = generateWeeklyCalendar(loadBrandIdentity());
+    }
+
+    if (!calendar.slots || calendar.slots.length === 0) {
+        return { type: 'value', style: 'informative' };
     }
 
     const slotIndex = runNumber % calendar.slots.length;

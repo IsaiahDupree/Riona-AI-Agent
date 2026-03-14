@@ -150,12 +150,12 @@ export function scoreInterestOverlap(username: string, platform: 'twitter' | 'in
     // Best interest for DM: highest overlap + best historical performance
     const perf = profile.interestMessagePerformance;
     let bestInterest = shared[0] || theirInterests[0] || '';
-    let bestScore = -1;
+    let bestScore = -Infinity;
 
     for (const topic of shared) {
         const p = perf[topic];
         if (p && p.sent > 0) {
-            const rate = p.replied / p.sent;
+            const rate = (p.replied || 0) / p.sent;
             if (rate > bestScore) {
                 bestScore = rate;
                 bestInterest = topic;

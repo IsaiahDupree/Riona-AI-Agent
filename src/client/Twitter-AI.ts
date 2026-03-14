@@ -1672,7 +1672,7 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
 
     const brand = loadBrandIdentity();
     const brandContext = getBrandPromptContext(brand);
-    const slot = getNextContentSlot(runNumber);
+    const slot = await getNextContentSlot(runNumber);
 
     logger.info(`[twitter-ai] Strategic content: ${slot.type}/${slot.style} (niche: ${slot.niche || brand.niche})`);
 

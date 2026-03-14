@@ -82,6 +82,7 @@ export function analyzeContentPerformance(): ContentLearning[] {
             .filter((m): m is TweetEngagement => m !== null && m !== undefined);
 
         const n = metricsArr.length;
+        if (n === 0) continue;
         const avgLikes = Math.round(metricsArr.reduce((s, m) => s + m.likes, 0) / n);
         const avgRetweets = Math.round(metricsArr.reduce((s, m) => s + m.retweets, 0) / n);
         const avgViews = Math.round(metricsArr.reduce((s, m) => s + m.views, 0) / n);
@@ -221,6 +222,7 @@ export function getBestPostingHours(): { hour: number; avgEngagement: number }[]
     }
 
     return [...hourBuckets.entries()]
+        .filter(([, scores]) => scores.length > 0)
         .map(([hour, scores]) => ({
             hour,
             avgEngagement: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length),
