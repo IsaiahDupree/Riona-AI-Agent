@@ -17,7 +17,7 @@ import * as fs from 'fs';
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type NotificationType = 'reply' | 'mention' | 'like' | 'retweet' | 'quote';
+export type NotificationType = 'reply' | 'mention' | 'like' | 'retweet' | 'quote' | 'follow' | 'recommended' | 'unknown';
 
 export interface DetectedNotification {
     type: NotificationType;
@@ -72,6 +72,7 @@ function saveNotifications(notifs: DetectedNotification[]) {
 export async function checkNotifications(
     page: Page,
     maxToProcess: number = 20,
+    scrollPasses: number = 3,
 ): Promise<NotificationCheckResult> {
     const result: NotificationCheckResult = {
         totalChecked: 0,
@@ -123,62 +124,96 @@ export async function checkNotifications(
             `${n.type}_${n.fromUsername}_${n.text.slice(0, 50)}`
         ));
 
-        // Scrape notification cells
-        const rawNotifs = await page.evaluate(() => {
-            const items: Array<{
-                text: string;
-                links: string[];
-                usernames: string[];
-                type: string;
-            }> = [];
+        // Scrape notification cells with scrolling for more results
+        const allRawNotifs: Array<{
+            text: string;
+            links: string[];
+            usernames: string[];
+            type: string;
+        }> = [];
+        const seenTexts = new Set<string>();
 
-            // Notifications are in article elements or div[data-testid="cellInnerDiv"]
-            const cells = document.querySelectorAll(
-                'article[data-testid="tweet"], [data-testid="cellInnerDiv"]'
-            );
+        for (let pass = 0; pass < scrollPasses; pass++) {
+            const rawNotifs = await page.evaluate(() => {
+                const items: Array<{
+                    text: string;
+                    links: string[];
+                    usernames: string[];
+                    type: string;
+                }> = [];
 
-            for (const cell of cells) {
-                const text = (cell.textContent || '').trim();
-                if (!text) continue;
+                // Notifications are in article elements or div[data-testid="cellInnerDiv"]
+                const cells = document.querySelectorAll(
+                    'article[data-testid="tweet"], [data-testid="cellInnerDiv"]'
+                );
 
-                // Extract links
-                const links: string[] = [];
-                const anchors = cell.querySelectorAll('a[href]');
-                for (const a of anchors) {
-                    const href = (a as HTMLAnchorElement).getAttribute('href') || '';
-                    if (href.match(/\/[^/]+\/status\/\d+/)) {
-                        links.push(`https://x.com${href}`);
+                for (const cell of cells) {
+                    const text = (cell.textContent || '').trim();
+                    if (!text) continue;
+
+                    // Extract links
+                    const links: string[] = [];
+                    const anchors = cell.querySelectorAll('a[href]');
+                    for (const a of anchors) {
+                        const href = (a as HTMLAnchorElement).getAttribute('href') || '';
+                        if (href.match(/\/[^/]+\/status\/\d+/)) {
+                            links.push(`https://x.com${href}`);
+                        }
                     }
-                }
 
-                // Extract usernames from links
-                const usernames: string[] = [];
-                for (const a of anchors) {
-                    const href = (a as HTMLAnchorElement).getAttribute('href') || '';
-                    const match = href.match(/^\/([a-zA-Z0-9_]+)$/);
-                    if (match && !['home', 'notifications', 'messages', 'explore', 'settings', 'i'].includes(match[1])) {
-                        usernames.push(match[1]);
+                    // Extract usernames from links
+                    const usernames: string[] = [];
+                    for (const a of anchors) {
+                        const href = (a as HTMLAnchorElement).getAttribute('href') || '';
+                        const match = href.match(/^\/([a-zA-Z0-9_]+)$/);
+                        if (match && !['home', 'notifications', 'messages', 'explore', 'settings', 'i'].includes(match[1])) {
+                            usernames.push(match[1]);
+                        }
                     }
-                }
 
-                // Classify notification type
-                const lowerText = text.toLowerCase();
-                let type = 'unknown';
-                if (lowerText.includes('replied')) type = 'reply';
-                else if (lowerText.includes('mentioned you')) type = 'mention';
-                else if (lowerText.includes('liked your')) type = 'like';
-                else if (lowerText.includes('retweeted your') || lowerText.includes('reposted your')) type = 'retweet';
-                else if (lowerText.includes('quoted your') || lowerText.includes('quote tweeted')) type = 'quote';
+                    // Classify notification type
+                    const lowerText = text.toLowerCase();
+                    let type = 'unknown';
+                    if (lowerText.includes('replied') || lowerText.includes('replying to')) type = 'reply';
+                    else if (lowerText.includes('mentioned you') || lowerText.includes('mentioned')) type = 'mention';
+                    else if (lowerText.includes('liked your') || lowerText.includes('liked a') || /liked \d+ of your/i.test(text)) type = 'like';
+                    else if (lowerText.includes('retweeted your') || lowerText.includes('reposted your') || lowerText.includes('reposted')) type = 'retweet';
+                    else if (lowerText.includes('quoted your') || lowerText.includes('quote tweeted') || lowerText.includes('quoted')) type = 'quote';
+                    else if (lowerText.includes('followed you') || lowerText.includes('followed')) type = 'follow';
+                    else if (lowerText.includes('recent post from') || lowerText.includes('there was a login')) type = 'recommended';
 
-                if (type !== 'unknown') {
+                    // Always include — unknowns are logged for discovery
                     items.push({ text: text.slice(0, 500), links, usernames, type });
+                }
+
+                return items;
+            });
+
+            // Deduplicate across scroll passes
+            let newThisPass = 0;
+            for (const notif of rawNotifs) {
+                const dedupeKey = `${notif.type}_${notif.text.slice(0, 80)}`;
+                if (!seenTexts.has(dedupeKey)) {
+                    seenTexts.add(dedupeKey);
+                    allRawNotifs.push(notif);
+                    newThisPass++;
                 }
             }
 
-            return items;
-        });
+            logger.info(`[twitter-notifs] Scroll pass ${pass + 1}/${scrollPasses}: ${rawNotifs.length} cells, ${newThisPass} new`);
 
-        logger.info(`[twitter-notifs] Found ${rawNotifs.length} notification items`);
+            // Stop scrolling if we have enough or no new items
+            if (allRawNotifs.length >= maxToProcess || newThisPass === 0) break;
+
+            // Scroll down for more notifications
+            if (pass < scrollPasses - 1) {
+                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
+                await delay(2500);
+            }
+        }
+
+        const rawNotifs = allRawNotifs;
+        logger.info(`[twitter-notifs] Found ${rawNotifs.length} total notification items (${scrollPasses} scroll passes)`);
 
         // Process and deduplicate
         for (const raw of rawNotifs.slice(0, maxToProcess)) {
@@ -207,6 +242,7 @@ export async function checkNotifications(
                 case 'like': result.likes++; break;
                 case 'retweet': result.retweets++; break;
                 case 'quote': result.quotes++; break;
+                // follow and unknown are tracked but don't need special counters
             }
 
             // Update relationship health if the person is in our nurture system
@@ -393,7 +429,7 @@ export function getNotificationStats(): {
     const lastCheck = safeReadJSON<{ lastCheck: string } | null>(LAST_CHECK_FILE, null, 'notif_last_check');
 
     const byType: Record<NotificationType, number> = {
-        reply: 0, mention: 0, like: 0, retweet: 0, quote: 0,
+        reply: 0, mention: 0, like: 0, retweet: 0, quote: 0, follow: 0, recommended: 0, unknown: 0,
     };
     let unactioned = 0;
 

@@ -84,8 +84,8 @@ module.exports = {
             restart_delay: 60000,
             env: {
                 NODE_ENV: "production",
-                DM_CHECK_INTERVAL_MINUTES: process.env.DM_CHECK_INTERVAL_MINUTES || "5",
-                DM_PIPELINE_INTERVAL_MINUTES: process.env.DM_PIPELINE_INTERVAL_MINUTES || "30",
+                DM_CHECK_INTERVAL_MINUTES: process.env.DM_CHECK_INTERVAL_MINUTES || "30",
+                DM_PIPELINE_INTERVAL_MINUTES: process.env.DM_PIPELINE_INTERVAL_MINUTES || "60",
                 // Instagram
                 INSTAGRAM_BOT_USERNAME: process.env.INSTAGRAM_BOT_USERNAME,
                 INSTAGRAM_BOT_PASSWORD: process.env.INSTAGRAM_BOT_PASSWORD,
@@ -146,8 +146,8 @@ module.exports = {
             restart_delay: 60000,
             env: {
                 NODE_ENV: "production",
-                TWITTER_DM_CHECK_INTERVAL_MINUTES: process.env.TWITTER_DM_CHECK_INTERVAL_MINUTES || "5",
-                TWITTER_DM_PIPELINE_INTERVAL_MINUTES: process.env.TWITTER_DM_PIPELINE_INTERVAL_MINUTES || "30",
+                TWITTER_DM_CHECK_INTERVAL_MINUTES: process.env.TWITTER_DM_CHECK_INTERVAL_MINUTES || "30",
+                TWITTER_DM_PIPELINE_INTERVAL_MINUTES: process.env.TWITTER_DM_PIPELINE_INTERVAL_MINUTES || "60",
                 TWITTER_MAX_DMS_PER_DAY: process.env.TWITTER_MAX_DMS_PER_DAY || "30",
                 // Twitter credentials
                 TWITTER_BOT_USERNAME: process.env.TWITTER_BOT_USERNAME,
