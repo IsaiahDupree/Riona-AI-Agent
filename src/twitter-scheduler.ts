@@ -167,7 +167,7 @@ async function runDMTasks(page: import('puppeteer').Page, runNumber: number) {
         dmConfig.maxDMsPerDay = getTodayDMLimit();
         const dmPipeline = new TwitterDMPipeline(dm, dmConfig);
 
-        // Initialize watcher state on first run (establishes baseline)
+        // Initialize watcher state on first run + one-time catch-up
         if (!dmWatcherInitialized) {
             try {
                 await initializeTwitterWatcherState(dm);
@@ -175,6 +175,16 @@ async function runDMTasks(page: import('puppeteer').Page, runNumber: number) {
                 logger.info('[twitter-scheduler] DM watcher state initialized');
             } catch (e) {
                 logger.warn(`[twitter-scheduler] DM watcher init failed (non-fatal): ${formatError(e)}`);
+            }
+
+            // One-time catch-up: reply to missed incoming DMs
+            try {
+                const catchUpResult = await dmPipeline.catchUpMissedReplies();
+                if (catchUpResult.replied > 0) {
+                    logger.info(`[twitter-scheduler] DM catch-up: scheduled ${catchUpResult.replied} reply(ies)`);
+                }
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM catch-up failed (non-fatal): ${formatError(e)}`);
             }
         }
 
@@ -239,6 +249,48 @@ async function runDMTasks(page: import('puppeteer').Page, runNumber: number) {
                 if (demoted.length > 0) logger.info(`[twitter-scheduler] DM tier demotions: ${demoted.join(', ')}`);
             } catch (e) {
                 logger.warn(`[twitter-scheduler] DM tier eval error (non-fatal): ${formatError(e)}`);
+            }
+
+            // Outreach to queued targets (if under daily limit)
+            const todayDMCount = getTodayTwitterDMCount();
+            const maxDMsPerDay = dmConfig.maxDMsPerDay;
+            if (todayDMCount < maxDMsPerDay) {
+                const hour = new Date().getHours();
+                if (hour >= 9 && hour < 21) {
+                    const { collectNicheProspects } = await import('./client/Twitter-AI');
+                    const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
+                    let targets = safeReadJSON<string[]>(TARGETS_FILE, [], 'twitter_outreach_targets');
+
+                    if (targets.length > 0) {
+                        const remaining = maxDMsPerDay - todayDMCount;
+                        const batch = targets.slice(0, Math.min(3, remaining));
+                        logger.info(`[twitter-scheduler] DM outreach: ${batch.length} targets`);
+                        try {
+                            const stats = await dmPipeline.runBatchOutreach(batch);
+                            logger.info(`[twitter-scheduler] DM outreach: ${stats.sent} sent, ${stats.skipped} skipped, ${stats.failed} failed`);
+                        } catch (outreachErr) {
+                            logger.warn(`[twitter-scheduler] DM outreach error (non-fatal): ${formatError(outreachErr)}`);
+                        }
+                        const remainingTargets = targets.filter(t => !batch.includes(t));
+                        safeWriteJSON(TARGETS_FILE, remainingTargets, 'twitter_outreach_targets');
+                    }
+                }
+            }
+
+            // Proactive check-ins for warm contacts
+            try {
+                const { processDueCheckIns } = await import('./nurture/check-ins');
+                const checkInsSent = await processDueCheckIns('twitter', async (username, message) => {
+                    try {
+                        const stats = await dmPipeline.runBatchOutreach([username]);
+                        return stats.sent > 0;
+                    } catch { return false; }
+                }, 3);
+                if (checkInsSent > 0) {
+                    logger.info(`[twitter-scheduler] DM: ${checkInsSent} proactive check-in(s) sent`);
+                }
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM check-ins error (non-fatal): ${formatError(e)}`);
             }
 
             // DM cleanup (every 3rd run, lightweight)
