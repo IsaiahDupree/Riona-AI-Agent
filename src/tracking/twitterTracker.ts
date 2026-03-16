@@ -104,11 +104,19 @@ export function recentReplyToUser(username: string, withinHours = 2): TrackedRep
 /**
  * Record a reply that was posted.
  */
+let twTrackCallCount = 0;
+
 export function trackReply(reply: TrackedReply) {
     const replies = loadReplies();
     replies.push(reply);
     saveReplies(replies);
     logger.info(`[twitter-tracker] Recorded reply on ${reply.tweetUrl} by @${reply.tweetAuthor}`);
+
+    // Auto-cleanup every 100 tracked replies to prevent unbounded file growth
+    twTrackCallCount++;
+    if (twTrackCallCount % 100 === 0) {
+        cleanupOldReplies(30);
+    }
 }
 
 /**

@@ -1,7 +1,7 @@
 // Twitter/X Core — tweet interaction functions (reply, like, retweet, metadata extraction)
 import { ElementHandle, Page } from 'puppeteer';
 import { logger } from '../utils/logger';
-import { formatError, withRetry, classifyError } from '../utils/errors';
+import { formatError, withRetry, classifyError, sanitizeForPrompt } from '../utils/errors';
 import { delay } from '../utils/delay';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
@@ -250,7 +250,10 @@ export async function generateReply(
         author
     });
 
-    const prompt = `Generate a reply to this tweet by @${author}: "${tweetText}"
+    const cleanText = sanitizeForPrompt(tweetText, 500);
+    const cleanAuthor = sanitizeForPrompt(author, 50);
+
+    const prompt = `Generate a reply to this tweet by @${cleanAuthor}: "${cleanText}"
 
 Rules:
 1. Length: ${guidelines.minLength}-${guidelines.maxLength} characters
@@ -1135,12 +1138,70 @@ export async function postTweet(
             }
         }
 
+        // Try to capture the tweet URL from the page (redirects to tweet after posting)
+        let tweetUrl: string | undefined;
+        try {
+            await delay(2000);
+            const currentUrl = page.url();
+            if (currentUrl.includes('/status/')) {
+                tweetUrl = currentUrl;
+            } else {
+                // Look for the most recent tweet by checking notification toast or nav
+                const url = await page.evaluate((text: string) => {
+                    const snippet = text.slice(0, 40).toLowerCase();
+                    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+                    for (const article of articles) {
+                        const articleText = (article as HTMLElement).innerText?.toLowerCase() || '';
+                        if (articleText.includes(snippet)) {
+                            const link = article.querySelector('a[href*="/status/"]');
+                            if (link) {
+                                const href = link.getAttribute('href') || '';
+                                return href.startsWith('http') ? href : `https://x.com${href}`;
+                            }
+                        }
+                    }
+                    return null;
+                }, options.text);
+                if (url) tweetUrl = url;
+            }
+        } catch (urlErr) {
+            logger.debug(`[Twitter-Core] Could not capture tweet URL (non-fatal): ${formatError(urlErr)}`);
+        }
+
+        // Verify posted text wasn't clipped (check first/last chars visible on page)
+        if (tweetUrl && options.text.length > 20) {
+            try {
+                const textCheck = await page.evaluate((expectedText: string) => {
+                    const snippet = expectedText.slice(0, 50).toLowerCase();
+                    const endSnippet = expectedText.slice(-30).toLowerCase();
+                    const articles = document.querySelectorAll('article[data-testid="tweet"]');
+                    for (const article of articles) {
+                        const text = (article as HTMLElement).innerText?.toLowerCase() || '';
+                        if (text.includes(snippet)) {
+                            return {
+                                foundStart: true,
+                                foundEnd: text.includes(endSnippet),
+                            };
+                        }
+                    }
+                    return { foundStart: false, foundEnd: false };
+                }, options.text);
+
+                if (textCheck.foundStart && !textCheck.foundEnd) {
+                    logger.warn(`[Twitter-Core] Tweet text may be clipped — start found but end missing`);
+                }
+            } catch (verifyErr) {
+                logger.debug(`[Twitter-Core] Text verification check failed (non-fatal): ${formatError(verifyErr)}`);
+            }
+        }
+
         logger.info('[Twitter-Core] Tweet posted successfully', {
             component: 'Twitter-Core',
-            event: 'post_tweet_success'
+            event: 'post_tweet_success',
+            tweetUrl: tweetUrl || 'unknown'
         });
 
-        return { success: true };
+        return { success: true, tweetUrl };
     } catch (error) {
         logger.error('[Twitter-Core] Tweet posting failed', {
             component: 'Twitter-Core',

@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import { logger } from '../utils/logger';
-import { formatError } from '../utils/errors';
+import { formatError, sanitizeForPrompt } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, DMContext } from '../types/dm';
 import { getLearningContextForAI, recordTimingStat } from './Instagram-DM-Analytics';
 import { syncFeedbackToSupabase, syncRelationshipToSupabase } from '../db/supabaseDM';
@@ -153,13 +153,14 @@ export async function generateDMMessage(context: {
     conversationHistory: DMMessage[];
     relationship: RelationshipInfo;
     objective?: string;
+    isJackpot?: boolean;
 }): Promise<string> {
-    const { ourProfile, theirProfile, conversationHistory, relationship, objective } = context;
+    const { ourProfile, theirProfile, conversationHistory, relationship, objective, isJackpot } = context;
 
     // Build conversation history string
     const recentMessages = conversationHistory.slice(-10);
     const historyStr = recentMessages.length > 0
-        ? recentMessages.map(m => `${m.isOurs ? 'You' : 'Them'}: ${m.text}`).join('\n')
+        ? recentMessages.map(m => `${m.isOurs ? 'You' : 'Them'}: ${sanitizeForPrompt(m.text, 300)}`).join('\n')
         : '(No prior conversation — this is the first message)';
 
     // Determine the message objective based on relationship stage
@@ -202,9 +203,9 @@ About us:
 - Followers: ${ourProfile.followerCount || 'N/A'}
 
 About them:
-- Username: @${theirProfile.username}
-- Name: ${theirProfile.fullName || theirProfile.username}
-- Bio: ${theirProfile.bio || 'N/A'}
+- Username: @${sanitizeForPrompt(theirProfile.username, 50)}
+- Name: ${sanitizeForPrompt(theirProfile.fullName || theirProfile.username, 100)}
+- Bio: ${sanitizeForPrompt(theirProfile.bio || 'N/A', 300)}
 - Followers: ${theirProfile.followerCount || 'N/A'}
 - Verified: ${theirProfile.isVerified ? 'Yes' : 'No'}
 
@@ -212,7 +213,7 @@ Relationship:
 - Category: ${relationship.category}
 - Warmth: ${relationship.warmth}/100
 - Stage: ${relationship.stage}
-${relationship.notes.length > 0 ? `- Notes: ${relationship.notes.join('; ')}` : ''}
+${relationship.notes.length > 0 ? `- Notes: ${relationship.notes.map(n => sanitizeForPrompt(n, 150)).join('; ')}` : ''}
 ${relationship.tags.length > 0 ? `- Tags: ${relationship.tags.join(', ')}` : ''}
 ${tierContext}${interestContext}${crossPlatformContext}
 
@@ -226,6 +227,7 @@ Rules:
 7. Never say "I noticed your profile" or other generic openers
 8. Use emojis sparingly (0-2 max)
 9. Sound like a real person, not a bot
+${isJackpot ? `\n🎰 JACKPOT REPLY: Go above and beyond — write a longer, more thoughtful, more personal message. Reference specific details about them. Share a genuine personal story or insight. Make this reply feel special and memorable. Use 3-5 sentences instead of 1-3.` : ''}
 ${learningContext ? `\nPerformance Insights:\n${learningContext}` : ''}`;
 
     const userPrompt = `Conversation history:
@@ -242,8 +244,8 @@ Generate the next message to send. Just the message text, nothing else.`;
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt }
             ],
-            max_tokens: 150,
-            temperature: 0.8
+            max_tokens: isJackpot ? 300 : 150,
+            temperature: isJackpot ? 0.9 : 0.8
         });
 
         const message = completion.choices[0]?.message?.content?.trim();
@@ -251,11 +253,39 @@ Generate the next message to send. Just the message text, nothing else.`;
 
         // Clean up — remove surrounding quotes if present
         const cleaned = message.replace(/^["']|["']$/g, '').trim();
-        logger.info(`[dm-ai] Generated message for @${theirProfile.username}: "${cleaned.slice(0, 50)}..."`);
+        logger.info(`[dm-ai] Generated ${isJackpot ? 'JACKPOT ' : ''}message for @${theirProfile.username}: "${cleaned.slice(0, 50)}..."`);
         return cleaned;
     } catch (e) {
         logger.error('[dm-ai] Failed to generate message:', e);
         throw e;
+    }
+}
+
+// ── Reply-specific objective (for auto-reply pipeline) ──────────────
+
+export function getReplyObjective(relationship: RelationshipInfo, theirLastMessage: string): string {
+    const lower = theirLastMessage.toLowerCase();
+
+    // Check for negative sentiment signals
+    const negativeWords = ['no thanks', 'not interested', 'stop', 'don\'t', 'spam',
+        'unsubscribe', 'leave me alone', 'block', 'report', 'annoying', 'scam'];
+    const isNegative = negativeWords.some(w => lower.includes(w));
+
+    if (isNegative) {
+        return 'They seem unhappy or uninterested. Respond gracefully — acknowledge, apologize if needed, offer to back off.';
+    }
+
+    switch (relationship.stage) {
+        case 'cold_outreach':
+        case 'initial_contact':
+            return 'They replied! Respond naturally to what they said. Ask a follow-up question. Build rapport — do NOT pitch anything.';
+        case 'building':
+            return 'Continue the conversation naturally. Respond specifically to their message. Share value or insight.';
+        case 'warm':
+        case 'active':
+            return 'You have a good relationship. Respond conversationally. Be helpful and genuine.';
+        default:
+            return 'Respond naturally to their message. Be conversational and genuine.';
     }
 }
 
@@ -349,6 +379,8 @@ export interface MessageFeedback {
 
 const FEEDBACK_FILE = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'feedback.json');
 
+const MAX_FEEDBACK_ENTRIES = 1000;
+
 export function recordFeedback(feedback: MessageFeedback) {
     try {
         let feedbacks: MessageFeedback[] = [];
@@ -356,6 +388,10 @@ export function recordFeedback(feedback: MessageFeedback) {
             feedbacks = JSON.parse(fs.readFileSync(FEEDBACK_FILE, 'utf8'));
         }
         feedbacks.push(feedback);
+        // Cap at MAX_FEEDBACK_ENTRIES to prevent unbounded growth
+        if (feedbacks.length > MAX_FEEDBACK_ENTRIES) {
+            feedbacks = feedbacks.slice(-MAX_FEEDBACK_ENTRIES);
+        }
         fs.writeFileSync(FEEDBACK_FILE, JSON.stringify(feedbacks, null, 2));
 
         // Update warmth based on feedback

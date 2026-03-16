@@ -102,11 +102,19 @@ export function recentCommentOnUser(username: string, withinHours = 2): TrackedC
 /**
  * Record a comment that was posted.
  */
+let trackCallCount = 0;
+
 export function trackComment(comment: TrackedComment) {
     const comments = loadComments();
     comments.push(comment);
     saveComments(comments);
     logger.info(`[tracker] Recorded comment on ${comment.postUrl} by @${comment.postUsername}`);
+
+    // Auto-cleanup every 100 tracked comments to prevent unbounded file growth
+    trackCallCount++;
+    if (trackCallCount % 100 === 0) {
+        cleanupOldComments(30);
+    }
 }
 
 /**

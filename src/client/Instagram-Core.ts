@@ -17,7 +17,7 @@ import { AccountModel } from '../hitl/models';
 import { StorageInterface } from '../db/interfaces';
 import { SupabaseStorage } from '../db/supabase';
 import { hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/commentTracker';
-import { formatError } from '../utils/errors';
+import { formatError, sanitizeForPrompt } from '../utils/errors';
 
 // Load environment variables
 dotenv.config();
@@ -730,7 +730,9 @@ async function generateComment(caption: string): Promise<string | null> {
             captionLength: caption.length
         });
 
-        const prompt = `Generate a simple Instagram comment for this post: "${caption}"\n\nFollow these basic rules:
+        const cleanCaption = sanitizeForPrompt(caption, 500);
+
+        const prompt = `Generate a simple Instagram comment for this post: "${cleanCaption}"\n\nFollow these basic rules:
         1. Length: 3-300 characters
         2. Style: Casual and friendly
         3. Content: Should relate to the post content

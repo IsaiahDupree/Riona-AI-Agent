@@ -1,5 +1,5 @@
 import { logger } from './utils/logger';
-import { notifyRunComplete, notifyDailyTargetReached, notifyError, notifyStartup } from './utils/telegram';
+import { notifyRunComplete, notifyDailyTargetReached, notifyError, notifyStartup, notifyContentPosted, notifyNurtureActivity, notifyContentAnalysis } from './utils/telegram';
 import { getTodayReplyCount, getTodayVerifiedCount, getDailyStats, cleanupOldReplies } from './tracking/twitterTracker';
 import { safeReadJSON, safeWriteJSON, formatError } from './utils/errors';
 import dotenv from 'dotenv';
@@ -149,6 +149,109 @@ function tryScheduledRun() {
     });
 }
 
+// ── DM processing (runs independently of reply daily target) ──────
+let dmWatcherInitialized = false;
+
+async function runDMTasks(page: import('puppeteer').Page, runNumber: number) {
+    try {
+        const { TwitterDM } = await import('./client/Twitter-DM');
+        const { checkForNewTwitterDMs, initializeTwitterWatcherState } = await import('./client/Twitter-DM-Watcher');
+        const { TwitterDMPipeline, loadConfig: loadDMConfig } = await import('./client/Twitter-DM-Pipeline');
+        const { getTodayTwitterDMCount, cleanupOldTwitterDMs } = await import('./tracking/twitterDMTracker');
+        const { getTodayDMLimit } = await import('./config/dm-limits');
+        const { notifyNewDM } = await import('./utils/telegram');
+
+        const dm = TwitterDM.fromPage(page);
+        const dmConfig = loadDMConfig();
+        dmConfig.autoApprove = process.env.TWITTER_DM_AUTO_APPROVE === 'true';
+        dmConfig.maxDMsPerDay = getTodayDMLimit();
+        const dmPipeline = new TwitterDMPipeline(dm, dmConfig);
+
+        // Initialize watcher state on first run (establishes baseline)
+        if (!dmWatcherInitialized) {
+            try {
+                await initializeTwitterWatcherState(dm);
+                dmWatcherInitialized = true;
+                logger.info('[twitter-scheduler] DM watcher state initialized');
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM watcher init failed (non-fatal): ${formatError(e)}`);
+            }
+        }
+
+        // Process any delayed replies that are ready (VI schedule)
+        try {
+            const delayedResult = await dmPipeline.processDelayedReplies();
+            if (delayedResult.sent > 0) {
+                logger.info(`[twitter-scheduler] DM: Sent ${delayedResult.sent} delayed reply(ies)`);
+            }
+        } catch (e) {
+            logger.warn(`[twitter-scheduler] DM delayed reply error (non-fatal): ${formatError(e)}`);
+        }
+
+        // Check for new incoming DMs
+        const detected = await checkForNewTwitterDMs(dm);
+        if (detected.newMessages.length > 0) {
+            logger.info(`[twitter-scheduler] DM: ${detected.newMessages.length} new message(s) (DOM: ${detected.unreadFromDOM}, state: ${detected.detectedByState})`);
+            for (const msg of detected.newMessages) {
+                logger.info(`[twitter-scheduler] DM from: ${msg.from} — "${msg.preview.slice(0, 50)}"`);
+                await notifyNewDM(msg.from, msg.preview, 'Twitter').catch(() => {});
+            }
+
+            // Auto-reply to new DMs (schedules via VI delays)
+            try {
+                const replyResult = await dmPipeline.processDMAutoReplies();
+                if (replyResult.replied > 0) {
+                    logger.info(`[twitter-scheduler] DM: Scheduled ${replyResult.replied} reply(ies) via VI delay`);
+                }
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM auto-reply error (non-fatal): ${formatError(e)}`);
+            }
+        }
+
+        // Pipeline tasks (every 3rd run — outreach, feedback, tiers)
+        if (runNumber % 3 === 0) {
+            // Process approved sends
+            try {
+                const approvedResults = await dmPipeline.processApprovedSends();
+                if (approvedResults.length > 0) {
+                    const sent = approvedResults.filter((r: any) => r.status === 'sent').length;
+                    logger.info(`[twitter-scheduler] DM: ${sent} approved send(s) processed`);
+                }
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM approved sends error (non-fatal): ${formatError(e)}`);
+            }
+
+            // Check replies and update feedback
+            try {
+                const repliesFound = await dmPipeline.checkRepliesAndUpdateFeedback();
+                if (repliesFound > 0) {
+                    logger.info(`[twitter-scheduler] DM: ${repliesFound} new reply feedback(s)`);
+                }
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM feedback error (non-fatal): ${formatError(e)}`);
+            }
+
+            // Tier evaluation
+            try {
+                const { runTierEvaluation } = await import('./nurture/tiers');
+                const { promoted, demoted } = runTierEvaluation('twitter');
+                if (promoted.length > 0) logger.info(`[twitter-scheduler] DM tier promotions: ${promoted.join(', ')}`);
+                if (demoted.length > 0) logger.info(`[twitter-scheduler] DM tier demotions: ${demoted.join(', ')}`);
+            } catch (e) {
+                logger.warn(`[twitter-scheduler] DM tier eval error (non-fatal): ${formatError(e)}`);
+            }
+
+            // DM cleanup (every 3rd run, lightweight)
+            try { cleanupOldTwitterDMs(90); } catch (_) {}
+        }
+
+        // Navigate back to home so subsequent scheduler tasks work
+        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    } catch (dmErr) {
+        logger.warn(`[twitter-scheduler] DM processing failed (non-fatal): ${formatError(dmErr)}`);
+    }
+}
+
 async function scheduledRun() {
     if (!acquireLock()) {
         return;
@@ -160,6 +263,23 @@ async function scheduledRun() {
         const effectiveCount = Math.max(counter.count, trackerCount);
 
         if (effectiveCount >= DAILY_TARGET) {
+            // Daily target reached, but still run DM tasks if within active hours
+            if (isWithinActiveHours()) {
+                let tempAI: any = null;
+                try {
+                    const { TwitterAI: TwitterAIClass } = await import('./client/Twitter');
+                    tempAI = new TwitterAIClass();
+                    await tempAI.initialize();
+                    const page = tempAI.getPage();
+                    if (page) {
+                        await runDMTasks(page, counter.runs + 1);
+                    }
+                } catch (e) {
+                    logger.debug(`[twitter-scheduler] DM-only run failed (non-fatal): ${formatError(e)}`);
+                } finally {
+                    if (tempAI) try { await tempAI.close(); } catch (_) {}
+                }
+            }
             logger.info(`[twitter-scheduler] Daily target reached (${effectiveCount}/${DAILY_TARGET}). Skipping until tomorrow.`);
             return;
         }
@@ -171,11 +291,33 @@ async function scheduledRun() {
                 const snapshotFile = path.join(process.cwd(), 'logs', 'tracking', 'weekly', '.last_snapshot_date.txt');
                 const lastSnapshotDate = fs.existsSync(snapshotFile) ? fs.readFileSync(snapshotFile, 'utf-8').trim() : '';
                 if (lastSnapshotDate !== todayStr()) {
-                    await captureDailySnapshot();
+                    const snapshot = await captureDailySnapshot();
                     fs.mkdirSync(path.dirname(snapshotFile), { recursive: true });
                     fs.writeFileSync(snapshotFile, todayStr());
                     const report = generateGrowthReport();
                     logger.info(`[twitter-scheduler] Daily snapshot captured\n${formatGrowthReport(report)}`);
+
+                    // Sync snapshot + weekly trend to Supabase
+                    try {
+                        const { syncDailySnapshotToSupabase, syncWeeklyTrendToSupabase, runPeriodicSync } = await import('./db/supabaseSync');
+                        await syncDailySnapshotToSupabase(snapshot);
+                        if (report.currentWeek) await syncWeeklyTrendToSupabase(report.currentWeek);
+                        // End-of-day full periodic sync (comments, pending sends, identities)
+                        await runPeriodicSync();
+                    } catch (syncErr) {
+                        logger.debug(`[twitter-scheduler] End-of-day Supabase sync failed (non-fatal): ${formatError(syncErr)}`);
+                    }
+
+                    // Auto-detect cross-platform identity links
+                    try {
+                        const { autoDetectLinks } = await import('./nurture/cross-platform');
+                        const newLinks = autoDetectLinks();
+                        if (newLinks.length > 0) {
+                            logger.info(`[twitter-scheduler] Auto-detected ${newLinks.length} cross-platform link(s)`);
+                        }
+                    } catch (linkErr) {
+                        logger.debug(`[twitter-scheduler] Cross-platform detection failed (non-fatal): ${formatError(linkErr)}`);
+                    }
                 }
             } catch (snapErr) {
                 logger.warn(`[twitter-scheduler] Snapshot capture failed (non-fatal): ${formatError(snapErr)}`);
@@ -240,21 +382,21 @@ async function scheduledRun() {
                 if (page) {
                     // ── Read badge counts (DMs + notifications) ────────────
                     try {
-                        const { readTwitterBadges, getActionsFromBadges } = await import('./client/NotificationBadgeReader');
+                        const { readTwitterBadges } = await import('./client/NotificationBadgeReader');
                         const badges = await readTwitterBadges(page);
                         if (badges.dms > 0 || badges.notifications > 0) {
                             logger.info(`[twitter-scheduler] Badges: ${badges.dms} DMs, ${badges.notifications} notifications`);
-                        }
-                        // If DMs detected, trigger inbox scrape via DM pipeline
-                        if (badges.dms > 0) {
-                            logger.info(`[twitter-scheduler] ${badges.dms} unread DMs detected — DM scheduler should handle these`);
                         }
                     } catch (badgeErr) {
                         logger.debug(`[twitter-scheduler] Badge read failed (non-fatal): ${formatError(badgeErr)}`);
                     }
 
+                    // ── DM Watcher + Auto-Reply (merged from twitter-dm-scheduler) ──
+                    await runDMTasks(page, runNumber);
+
                     const { shouldPostContent } = await import('./strategy/twitter-content-calendar');
                     const { postStrategicContent } = await import('./client/Twitter-AI');
+                    const { getBestPostingHours } = await import('./client/Twitter-Content-Analytics');
 
                     const lastPostData = safeReadJSON<{ run: number; postsToday?: number; lastPostDate?: string }>(LAST_POST_RUN_FILE, { run: 0, postsToday: 0 }, 'last_post_run');
                     const lastPostRun = lastPostData.run;
@@ -262,15 +404,45 @@ async function scheduledRun() {
                     const postsToday = (lastPostData.lastPostDate === todayStr()) ? (lastPostData.postsToday || 0) : 0;
 
                     if (shouldPostContent(runNumber, lastPostRun) && postsToday < maxPerDay) {
-                        logger.info(`[twitter-scheduler] Run #${runNumber}: Posting strategic content (${postsToday}/${maxPerDay} today)`);
-                        const contentResult = await postStrategicContent(page, runNumber);
-                        if (contentResult.success) {
-                            logger.info(`[twitter-scheduler] Strategic content posted successfully`);
-                            safeWriteJSON(LAST_POST_RUN_FILE, {
-                                run: runNumber,
-                                postsToday: postsToday + 1,
-                                lastPostDate: todayStr(),
-                            }, 'last_post_run');
+                        // Check if this is a good posting hour based on engagement history
+                        let goodTime = true;
+                        try {
+                            const bestHours = getBestPostingHours();
+                            if (bestHours.length >= 5) {
+                                const currentHour = new Date().getHours();
+                                const currentHourData = bestHours.find(h => h.hour === currentHour);
+                                const medianEngagement = bestHours[Math.floor(bestHours.length / 2)].avgEngagement;
+                                if (currentHourData && currentHourData.avgEngagement < medianEngagement * 0.5) {
+                                    const topHour = bestHours[0];
+                                    logger.info(`[twitter-scheduler] Deferring post — hour ${currentHour} underperforms (${currentHourData.avgEngagement} avg eng vs ${topHour.avgEngagement} at hour ${topHour.hour})`);
+                                    goodTime = false;
+                                } else if (currentHourData) {
+                                    logger.info(`[twitter-scheduler] Posting hour ${currentHour}: ${currentHourData.avgEngagement} avg engagement (rank ${bestHours.indexOf(currentHourData) + 1}/${bestHours.length})`);
+                                }
+                            }
+                        } catch (e) {
+                            logger.debug(`[twitter-scheduler] Best posting hours check failed (posting anyway): ${formatError(e)}`);
+                        }
+
+                        if (goodTime) {
+                            logger.info(`[twitter-scheduler] Run #${runNumber}: Posting strategic content (${postsToday}/${maxPerDay} today)`);
+                            const contentResult = await postStrategicContent(page, runNumber);
+                            if (contentResult.success) {
+                                logger.info(`[twitter-scheduler] Strategic content posted successfully`);
+                                safeWriteJSON(LAST_POST_RUN_FILE, {
+                                    run: runNumber,
+                                    postsToday: postsToday + 1,
+                                    lastPostDate: todayStr(),
+                                }, 'last_post_run');
+                                // Notify Telegram
+                                await notifyContentPosted(
+                                    'Twitter',
+                                    'strategic',
+                                    'auto',
+                                    contentResult.tweetUrl || 'Tweet posted',
+                                    contentResult.tweetUrl
+                                ).catch(() => {});
+                            }
                         }
                     }
 
@@ -295,9 +467,26 @@ async function scheduledRun() {
                     // Periodic learning analysis (every 10th run)
                     if (runNumber % 10 === 0) {
                         try {
-                            const { analyzeContentPerformance } = await import('./client/Twitter-Content-Analytics');
-                            await analyzeContentPerformance();
+                            const { analyzeContentPerformance, getContentLearningContext } = await import('./client/Twitter-Content-Analytics');
+                            const { getTopPerformers } = await import('./tracking/twitterContentTracker');
+                            const contentLearnings = await analyzeContentPerformance();
                             logger.info(`[twitter-scheduler] Content performance analysis complete`);
+                            // Notify with top performer
+                            if (contentLearnings.length > 0) {
+                                let topText: string | undefined;
+                                let topEng: string | undefined;
+                                try {
+                                    const top = getTopPerformers(1);
+                                    if (top.length > 0) {
+                                        const cb = top[0].checkBacks.find(c => c.period === '24_hours' && c.metrics);
+                                        if (cb?.metrics) {
+                                            topText = top[0].text;
+                                            topEng = `${cb.metrics.likes}L, ${cb.metrics.retweets}RT, ${cb.metrics.replies}R`;
+                                        }
+                                    }
+                                } catch (_) {}
+                                await notifyContentAnalysis('Twitter', contentLearnings.length, topText, topEng).catch(() => {});
+                            }
                         } catch (analyticsErr) {
                             logger.warn(`[twitter-scheduler] Analytics failed (non-fatal): ${formatError(analyticsErr)}`);
                         }
@@ -331,6 +520,11 @@ async function scheduledRun() {
                                     `[twitter-scheduler] Nurture: ${nurtureResult.commentsPosted} comments on ` +
                                     `${nurtureResult.contactsVisited} profiles`
                                 );
+                                await notifyNurtureActivity(
+                                    'Twitter',
+                                    nurtureResult.commentsPosted,
+                                    nurtureResult.contactsVisited
+                                ).catch(() => {});
 
                                 // Sync to Supabase
                                 try {
@@ -373,6 +567,21 @@ async function scheduledRun() {
                                 }
                             }
 
+                            // Process reply-to-reply (respond to people who replied to us)
+                            // Always check — there may be stored unactioned replies from previous scrapes
+                            try {
+                                const { processReplyNotifications } = await import('./client/Twitter-Reply-Handler');
+                                const replyResult = await processReplyNotifications(page, 5);
+                                if (replyResult.replied > 0) {
+                                    logger.info(
+                                        `[twitter-scheduler] Reply handler: ${replyResult.replied} replies sent, ` +
+                                        `${replyResult.skipped} skipped, ${replyResult.failed} failed`
+                                    );
+                                }
+                            } catch (replyErr) {
+                                logger.warn(`[twitter-scheduler] Reply handler failed (non-fatal): ${formatError(replyErr)}`);
+                            }
+
                             // Check for ignored comments every 6th run
                             if (runNumber % 6 === 0) {
                                 processIgnoredComments(24);
@@ -382,13 +591,20 @@ async function scheduledRun() {
                         }
                     }
 
-                    // ── Periodic VR snapshot sync (every 20th run) ─────────────
+                    // ── Periodic VR snapshot sync + bulk DM sync (every 20th run) ──
                     if (runNumber % 20 === 0) {
                         try {
                             const { syncAllVRSnapshots } = await import('./db/supabaseNurture');
                             await syncAllVRSnapshots();
                         } catch (snapErr) {
                             logger.debug(`[twitter-scheduler] VR snapshot sync failed (non-fatal): ${formatError(snapErr)}`);
+                        }
+                        try {
+                            const { bulkSyncTwitterToSupabase } = await import('./db/supabaseTwitterDM');
+                            const syncResult = await bulkSyncTwitterToSupabase();
+                            logger.info(`[twitter-scheduler] Twitter DM bulk sync: ${syncResult.conversations} contacts, ${syncResult.messages} msgs`);
+                        } catch (syncErr) {
+                            logger.debug(`[twitter-scheduler] Twitter DM bulk sync failed (non-fatal): ${formatError(syncErr)}`);
                         }
                     }
                 }

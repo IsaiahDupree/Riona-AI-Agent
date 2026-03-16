@@ -15,7 +15,8 @@
  * Falls back gracefully if Supabase is not configured.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseClient } from './supabaseClient';
 import { logger } from '../utils/logger';
 import { withRetry, formatError } from '../utils/errors';
 import { TrackedDM, ProfileInfo, RelationshipInfo } from '../types/dm';
@@ -23,21 +24,8 @@ import { MessageFeedback } from '../client/Twitter-DM-AI';
 import * as fs from 'fs';
 import * as path from 'path';
 
-let client: SupabaseClient | null = null;
-
 function getClient(): SupabaseClient | null {
-    if (client) return client;
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_KEY;
-    if (!url || !key) return null;
-
-    try {
-        client = createClient(url, key);
-        return client;
-    } catch (e) {
-        logger.warn(`[supabase-twitter-dm] Client creation failed: ${formatError(e)}`);
-        return null;
-    }
+    return getSupabaseClient();
 }
 
 // ── Ensure a CRM contact exists for a Twitter username ──────────────
@@ -165,8 +153,8 @@ export async function syncTwitterDMToSupabase(dm: TrackedDM): Promise<void> {
             });
         }
 
-        // Write to platform_dms for raw tracking
-        await sb.from('platform_dms').insert({
+        // Write to platform_dms for raw tracking (upsert to prevent duplicates on re-sync)
+        await sb.from('platform_dms').upsert({
             platform: 'twitter',
             username: dm.recipientUsername.toLowerCase(),
             direction: dm.direction === 'outbound' ? 'outbound' : 'inbound',
@@ -182,7 +170,7 @@ export async function syncTwitterDMToSupabase(dm: TrackedDM): Promise<void> {
                 session_id: dm.sessionId,
                 source: 'riona_twitter_dm_system'
             }
-        });
+        }, { onConflict: 'platform,username,platform_timestamp' });
 
         // Update contact stats
         const updateFields: Record<string, any> = {
@@ -364,28 +352,34 @@ export async function bulkSyncTwitterToSupabase(): Promise<{
         }
     }
 
-    // Sync messages → crm_messages + platform_dms
+    // Sync messages → crm_messages + platform_dms (only last 48h for incremental sync)
     const msgFile = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'messages.json');
     if (fs.existsSync(msgFile)) {
         try {
-            const messages: TrackedDM[] = JSON.parse(fs.readFileSync(msgFile, 'utf8'));
-            for (const msg of messages) {
+            const allMessages: TrackedDM[] = JSON.parse(fs.readFileSync(msgFile, 'utf8'));
+            const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+            const recentMessages = allMessages.filter(m => m.timestamp > cutoff);
+            for (const msg of recentMessages) {
                 await syncTwitterDMToSupabase(msg);
                 stats.messages++;
+                if (stats.messages % 10 === 0) await new Promise(r => setTimeout(r, 200));
             }
         } catch (e) {
             stats.errors.push(`msgs: ${e}`);
         }
     }
 
-    // Sync feedback → dm_message_performance
+    // Sync feedback → dm_message_performance (only last 48h)
     const fbFile = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'feedback.json');
     if (fs.existsSync(fbFile)) {
         try {
-            const feedbacks: MessageFeedback[] = JSON.parse(fs.readFileSync(fbFile, 'utf8'));
-            for (const fb of feedbacks) {
+            const allFeedbacks: MessageFeedback[] = JSON.parse(fs.readFileSync(fbFile, 'utf8'));
+            const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+            const recentFeedbacks = allFeedbacks.filter(f => f.messageSentAt > cutoff);
+            for (const fb of recentFeedbacks) {
                 await syncTwitterFeedbackToSupabase(fb);
                 stats.feedback++;
+                if (stats.feedback % 10 === 0) await new Promise(r => setTimeout(r, 200));
             }
         } catch (e) {
             stats.errors.push(`feedback: ${e}`);

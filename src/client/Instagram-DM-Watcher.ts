@@ -1,4 +1,3 @@
-import { Page } from 'puppeteer';
 import { InstagramDM } from './Instagram-DM';
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
@@ -85,122 +84,8 @@ function saveWatcherState(state: WatcherState) {
 // ── Full inbox scraper ──────────────────────────────────────────────
 
 export async function scrapeFullInbox(dm: InstagramDM): Promise<ConversationPreview[]> {
-    const page = dm.getPage()!;
-    logger.info('[dm-watcher] Scraping full inbox...');
-
-    await page.goto('https://www.instagram.com/direct/inbox/', {
-        waitUntil: 'domcontentloaded', timeout: 60000
-    });
-    await delay(4000);
-
-    // Scroll the conversation list to load more
-    const conversations: ConversationPreview[] = [];
-    const seenUsernames = new Set<string>();
-
-    for (let scroll = 0; scroll < 10; scroll++) {
-        const batch = await page.evaluate(() => {
-            const results: any[] = [];
-            // Instagram DM inbox: conversations are clickable div containers
-            // with profile pic (img), name (span), last message (span), and timestamp
-            // They contain img elements for avatars and multiple span[dir="auto"] for text
-            // We find conversation items by looking for img elements (profile pics)
-            // that are siblings to text spans
-            const mainEl = document.querySelector('main');
-            if (!mainEl) return results;
-
-            const mainText = mainEl.innerText || '';
-            const lines = mainText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-
-            // The conversation list follows a pattern:
-            // Name\nMessage preview\nTimestamp OR Name\nMessage preview · Timestamp
-            // Skip UI elements: Primary, General, Requests, Your note, Search, etc.
-            const skipWords = ['primary', 'general', 'requests', 'your note', 'search',
-                'start your', 'the_isaiah_dupree', 'send message', 'your messages',
-                'send a message', 'active', 'unread', 'pinned', 'muted'];
-
-            let i = 0;
-            while (i < lines.length) {
-                const line = lines[i];
-                const lineLower = line.toLowerCase();
-
-                // Skip known UI elements
-                if (skipWords.some(s => lineLower.startsWith(s)) || line.length < 2) {
-                    i++;
-                    continue;
-                }
-
-                // A conversation entry: name, then message preview, then possibly timestamp
-                // Names don't typically contain "·" or time indicators
-                const isTimestamp = /^\d+[mhwd]$/.test(line) || /·/.test(line);
-                if (isTimestamp) { i++; continue; }
-
-                // Check if next lines are message preview + timestamp
-                const name = line;
-                let lastMsg = '';
-                let timeStr = '';
-
-                if (i + 1 < lines.length) {
-                    const next = lines[i + 1];
-                    // Could be a message preview or timestamp
-                    if (/^\d+[mhwd]$/.test(next) || next === '·') {
-                        timeStr = next;
-                    } else {
-                        lastMsg = next;
-                        if (i + 2 < lines.length) {
-                            const timeCandidate = lines[i + 2];
-                            if (/^\d+[mhwd]$/.test(timeCandidate) || /·/.test(timeCandidate)) {
-                                timeStr = timeCandidate;
-                            }
-                        }
-                    }
-                }
-
-                // Only add if the name looks like a username/display name (not too long, not UI text)
-                const looksLikeMessage = name.toLowerCase().includes('sent a') || name.toLowerCase().includes('you:') || name.toLowerCase().includes('attachment');
-                if (name.length < 60 && !looksLikeMessage && !skipWords.some(s => name.toLowerCase().includes(s))) {
-                    results.push({
-                        username: name,
-                        lastMessage: lastMsg.slice(0, 100),
-                        lastMessageTime: timeStr,
-                        unread: false
-                    });
-                }
-
-                // Skip past this conversation entry
-                i += (lastMsg ? 2 : 1) + (timeStr ? 1 : 0);
-            }
-            return results;
-        });
-
-        for (const c of batch) {
-            const key = c.username.toLowerCase();
-            if (!seenUsernames.has(key)) {
-                seenUsernames.add(key);
-                conversations.push(c);
-            }
-        }
-
-        // Scroll the sidebar down to load more conversations
-        await page.evaluate(() => {
-            const main = document.querySelector('main');
-            if (main) {
-                // Find the scrollable container within main
-                const divs = main.querySelectorAll('div');
-                for (const div of divs) {
-                    if (div.scrollHeight > div.clientHeight && div.clientHeight > 200) {
-                        div.scrollTop += 500;
-                        break;
-                    }
-                }
-            }
-        });
-        await delay(1500);
-
-        // Stop if we got a batch (the text-based approach gets all at once)
-        if (batch.length > 0) break;
-    }
-
-    logger.info(`[dm-watcher] Scraped ${conversations.length} conversations from inbox`);
+    logger.info('[dm-watcher] Scraping full inbox (with scroll)...');
+    const conversations = await dm.scrapeInbox(true);
     saveInboxSnapshot(conversations);
     return conversations;
 }
@@ -211,8 +96,8 @@ export async function scrapeConversationThread(
     dm: InstagramDM,
     username: string,
     maxScrolls = 10
-): Promise<StoredConversation> {
-    const page = dm.getPage()!;
+): Promise<StoredConversation & { handle?: string }> {
+    const page = await dm.ensurePage();
     logger.info(`[dm-watcher] Scraping thread with "${username}"...`);
 
     // Navigate to inbox and open the thread
@@ -221,14 +106,36 @@ export async function scrapeConversationThread(
     });
     await delay(3000);
 
-    // Find and click the conversation
+    // Find and click the conversation using span text matching
     const opened = await page.evaluate((name: string) => {
         const nameLower = name.toLowerCase();
-        const items = document.querySelectorAll('a[href*="/direct/t/"]');
-        for (const item of items) {
-            const text = (item as HTMLElement).innerText?.toLowerCase() || '';
+        const threadList = document.querySelector('[aria-label="Thread list"]');
+        if (threadList) {
+            // Match by span text (display name) within the thread list
+            const spans = threadList.querySelectorAll('span[dir="auto"]');
+            for (const span of spans) {
+                const text = (span.textContent || '').trim().toLowerCase();
+                if (text === nameLower || text.includes(nameLower)) {
+                    // Walk up to find clickable container
+                    let el: HTMLElement | null = span as HTMLElement;
+                    for (let i = 0; i < 10 && el; i++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.height > 40 && rect.width > 200) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: links
+        const links = document.querySelectorAll('a[href*="/direct/"]');
+        for (const link of links) {
+            const text = (link as HTMLElement).innerText?.toLowerCase() || '';
             if (text.includes(nameLower)) {
-                (item as HTMLElement).click();
+                (link as HTMLElement).click();
                 return true;
             }
         }
@@ -242,16 +149,70 @@ export async function scrapeConversationThread(
 
     await delay(3000);
 
-    // Scroll up to load older messages
+    // Extract the actual handle from the thread header
+    // Instagram shows <a href="/handle/"> with "View profile" text, or handle in header links
+    const handle = await page.evaluate((displayName: string) => {
+        const ourHandle = (document.querySelector('h2')?.textContent || '').trim().toLowerCase();
+
+        // Method 1: "View profile" link
+        const links = document.querySelectorAll('a');
+        for (const a of links) {
+            const text = (a.textContent || '').trim().toLowerCase();
+            const href = a.getAttribute('href') || '';
+            if (text === 'view profile' && href.startsWith('/') && !href.includes('/direct/')) {
+                const match = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+                if (match && match[1] !== ourHandle) return match[1];
+            }
+        }
+
+        // Method 2: Profile links (href="/handle/" that aren't ours or nav)
+        const navPaths = new Set(['/', '/reels/', '/explore/', '/direct/', '/accounts/']);
+        for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            const match = href.match(/^\/([a-zA-Z0-9._]+)\/?$/);
+            if (match && !navPaths.has(href) && match[1] !== ourHandle) {
+                return match[1];
+            }
+        }
+
+        // Method 3: H2 elements — the thread header shows the handle in an H2
+        const h2s = document.querySelectorAll('h2');
+        for (const h2 of h2s) {
+            const text = (h2.textContent || '').trim();
+            // Skip our own handle and the display name
+            if (text.toLowerCase() === ourHandle) continue;
+            if (text === displayName) continue;
+            // A valid handle is lowercase, has dots/underscores, no spaces
+            if (/^[a-zA-Z0-9._]+$/.test(text) && text.length < 40) {
+                return text.toLowerCase();
+            }
+        }
+
+        return null;
+    }, username);
+
+    if (handle) {
+        logger.info(`[dm-watcher] Resolved handle for "${username}": @${handle}`);
+    }
+
+    // Scroll up to load older messages (find scrollable container in thread area)
     for (let i = 0; i < maxScrolls; i++) {
         const scrolledUp = await page.evaluate(() => {
-            const msgContainer = document.querySelector('div[role="grid"]')
-                || document.querySelector('div[role="list"]')
-                || document.querySelector('main div[style*="overflow"]');
-            if (msgContainer) {
-                const prevTop = msgContainer.scrollTop;
-                msgContainer.scrollTop = 0;
-                return prevTop !== 0;
+            // Find the message area (right panel, not the thread list)
+            const threadList = document.querySelector('[aria-label="Thread list"]');
+            const main = document.querySelector('main');
+            if (!main) return false;
+
+            // Find scrollable divs NOT inside the thread list
+            const divs = main.querySelectorAll('div');
+            for (const d of divs) {
+                if (threadList && threadList.contains(d)) continue;
+                const el = d as HTMLElement;
+                if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200) {
+                    const prevTop = el.scrollTop;
+                    el.scrollTop = 0;
+                    return prevTop !== 0;
+                }
             }
             return false;
         });
@@ -259,39 +220,82 @@ export async function scrapeConversationThread(
         await delay(1500);
     }
 
-    // Extract all messages
+    // Extract messages using span[dir="auto"] outside the Thread list
     const botUsername = (process.env.INSTAGRAM_BOT_USERNAME || 'the_isaiah_dupree').toLowerCase();
     const messages = await page.evaluate((ourUser: string) => {
         const results: any[] = [];
-        // Messages in Instagram DMs are typically in div[role="row"] or similar
-        const rows = document.querySelectorAll('div[role="row"]');
-        for (const row of rows) {
-            const text = (row as HTMLElement).innerText?.trim();
-            if (!text || text.length < 1) continue;
+        const threadList = document.querySelector('[aria-label="Thread list"]');
 
-            // Instagram aligns sent messages to the right (blue bubbles)
-            // Check for blue background or flex-end alignment
-            const style = window.getComputedStyle(row as HTMLElement);
-            const childDivs = row.querySelectorAll('div');
-            let isOurs = false;
-            for (const div of childDivs) {
-                const bg = window.getComputedStyle(div).backgroundColor;
-                // Instagram blue is approximately rgb(0, 149, 246) or similar
-                if (bg.includes('0, 149') || bg.includes('3, 133') || bg.includes('0, 100')) {
-                    isOurs = true;
-                    break;
+        // Helper: check if a span is inside a blue (sent) bubble
+        const isInBlueBubble = (span: Element): boolean => {
+            let el: HTMLElement | null = span as HTMLElement;
+            for (let depth = 0; depth < 10 && el; depth++) {
+                const bg = window.getComputedStyle(el).backgroundColor;
+                if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                    const match = bg.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+                    if (match) {
+                        const [, r, g, b] = match.map(Number);
+                        // Instagram blue: high blue, lower red and green
+                        if (b > 180 && r < 120 && g < 200) return true;
+                        // Purple/gradient tones
+                        if (b > 150 && r < 150 && g < 150) return true;
+                    }
                 }
+                el = el.parentElement;
             }
+            return false;
+        };
 
-            // Also check for text alignment
-            if (!isOurs) {
-                const justify = style.justifyContent || '';
-                if (justify.includes('flex-end') || justify.includes('end')) isOurs = true;
+        // Collect all span[dir="auto"] NOT in the thread list sidebar
+        const allSpans = document.querySelectorAll('span[dir="auto"]');
+        const msgSpans: Array<{ text: string; y: number; x: number; isOurs: boolean; spanEl: Element }> = [];
+
+        const navTexts = new Set(['home', 'reels', 'messages', 'search', 'explore',
+            'notifications', 'create', 'dashboard', 'profile', 'more', 'also from meta',
+            'instagram', 'threads', 'settings']);
+
+        for (const span of allSpans) {
+            if (threadList && threadList.contains(span)) continue;
+            const text = (span.textContent || '').trim();
+            if (!text || navTexts.has(text.toLowerCase())) continue;
+            const rect = span.getBoundingClientRect();
+            if (rect.y < 80 || rect.height === 0) continue;
+            if (text === 'Instagram' || text === 'View profile') continue;
+
+            msgSpans.push({
+                text, y: rect.y, x: rect.x,
+                isOurs: isInBlueBubble(span),
+                spanEl: span
+            });
+        }
+
+        // Filter out header entries (y < 100)
+        const filtered = msgSpans.filter(s => s.y > 100);
+
+        // Group messages by Y-band (gap > 20px = different message)
+        const groups: Array<Array<{ text: string; x: number; isOurs: boolean }>> = [];
+        let currentGroup: Array<{ text: string; x: number; isOurs: boolean }> = [];
+
+        for (let i = 0; i < filtered.length; i++) {
+            if (i > 0 && filtered[i].y - filtered[i - 1].y > 20) {
+                if (currentGroup.length > 0) groups.push(currentGroup);
+                currentGroup = [];
             }
+            currentGroup.push({ text: filtered[i].text, x: filtered[i].x, isOurs: filtered[i].isOurs });
+        }
+        if (currentGroup.length > 0) groups.push(currentGroup);
+
+        for (const group of groups) {
+            const fullText = group.map(g => g.text).join(' ');
+            if (fullText.includes('messaged you about') || fullText.includes('See Post')) continue;
+            if (fullText.length < 2) continue;
+
+            // If ANY span in the group is in a blue bubble, it's our message
+            const isOurs = group.some(g => g.isOurs);
 
             results.push({
                 sender: isOurs ? ourUser : 'them',
-                text: text.slice(0, 500),
+                text: fullText.slice(0, 500),
                 timestamp: '',
                 isOurs
             });
@@ -300,21 +304,23 @@ export async function scrapeConversationThread(
     }, botUsername);
 
     // Deduplicate and filter out UI noise
-    const filtered = messages.filter(m =>
+    const filtered = messages.filter((m: any) =>
         m.text.length > 0 &&
         !m.text.startsWith('Seen') &&
         !m.text.startsWith('Active') &&
-        m.text !== 'Message...'
+        m.text !== 'Message...' &&
+        !m.text.includes('View profile')
     );
 
-    const convo: StoredConversation = {
-        username,
+    const convo: StoredConversation & { handle?: string } = {
+        username: handle || username,
         lastScrapedAt: new Date().toISOString(),
-        messages: filtered
+        messages: filtered,
+        handle: handle || undefined
     };
 
     saveConversation(convo);
-    logger.info(`[dm-watcher] Scraped ${filtered.length} messages from "${username}"`);
+    logger.info(`[dm-watcher] Scraped ${filtered.length} messages from "${username}"${handle ? ` (handle: @${handle})` : ''}`);
     return convo;
 }
 
@@ -347,64 +353,41 @@ export async function scrapeAllConversations(
 
 // ── DM Watcher — polls for new messages ─────────────────────────────
 
-export async function checkForNewDMs(dm: InstagramDM): Promise<{ newMessages: Array<{ from: string; preview: string }> }> {
-    const page = dm.getPage()!;
+export async function checkForNewDMs(dm: InstagramDM, scrollToLoadAll = false): Promise<{ newMessages: Array<{ from: string; preview: string }> }> {
     const state = loadWatcherState();
 
-    await page.goto('https://www.instagram.com/direct/inbox/', {
-        waitUntil: 'domcontentloaded', timeout: 60000
-    });
-    await delay(4000);
+    // Use scrapeInbox which handles DOM + text detection (+ optional scroll)
+    const mergedInbox = await dm.scrapeInbox(scrollToLoadAll);
 
-    // Scrape current inbox state using text-based parsing (same as scrapeFullInbox)
-    const currentInbox = await page.evaluate(() => {
-        const results: Array<{ username: string; lastMessage: string; unread: boolean }> = [];
-        const mainEl = document.querySelector('main');
-        if (!mainEl) return results;
+    // Compare with known state to find new messages (dual: DOM unread + state change)
+    const newMessages: Array<{ from: string; preview: string }> = [];
+    const newMsgSeen = new Set<string>();
+    for (const convo of mergedInbox) {
+        const uKey = convo.username.toLowerCase();
 
-        const mainText = mainEl.innerText || '';
-        const lines = mainText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        const skipWords = ['primary', 'general', 'requests', 'your note', 'search',
-            'start your', 'the_isaiah_dupree', 'send message', 'your messages'];
+        // Signal 1: DOM says unread
+        if (convo.unread && !newMsgSeen.has(uKey)) {
+            newMsgSeen.add(uKey);
+            newMessages.push({ from: convo.username, preview: convo.lastMessage });
+        }
 
-        let i = 0;
-        while (i < lines.length) {
-            const line = lines[i];
-            const lineLower = line.toLowerCase();
-            if (skipWords.some(s => lineLower.startsWith(s)) || line.length < 2) { i++; continue; }
-            const isTimestamp = /^\d+[mhwd]$/.test(line) || /^·/.test(line);
-            if (isTimestamp) { i++; continue; }
-
-            const name = line;
-            let lastMsg = '';
-            if (i + 1 < lines.length) {
-                const next = lines[i + 1];
-                if (!/^\d+[mhwd]$/.test(next)) {
-                    lastMsg = next;
+        // Signal 2: State comparison — message text changed since last check
+        if (!newMsgSeen.has(uKey) && convo.lastMessage) {
+            const knownLast = state.knownLastMessages[uKey];
+            if (convo.lastMessage !== knownLast) {
+                const isOurs = convo.lastMessage.toLowerCase().startsWith('you:') ||
+                    convo.lastMessage.toLowerCase().startsWith('you sent');
+                if (!isOurs) {
+                    newMsgSeen.add(uKey);
+                    newMessages.push({ from: convo.username, preview: convo.lastMessage });
                 }
             }
-
-            if (name.length < 60 && !skipWords.some(s => name.toLowerCase().includes(s))) {
-                results.push({ username: name, lastMessage: lastMsg.slice(0, 100), unread: false });
-            }
-            i += lastMsg ? 3 : 2;
         }
-        return results;
-    });
 
-    // Compare with known state to find new messages
-    const newMessages: Array<{ from: string; preview: string }> = [];
-    for (const convo of currentInbox) {
-        const knownLast = state.knownLastMessages[convo.username.toLowerCase()];
-        if (convo.lastMessage && convo.lastMessage !== knownLast) {
-            // Check if this message is FROM them (not our own sent message)
-            const isOurs = convo.lastMessage.toLowerCase().startsWith('you:');
-            if (!isOurs) {
-                newMessages.push({ from: convo.username, preview: convo.lastMessage });
-            }
-        }
         // Update known state
-        state.knownLastMessages[convo.username.toLowerCase()] = convo.lastMessage;
+        if (convo.lastMessage) {
+            state.knownLastMessages[uKey] = convo.lastMessage;
+        }
     }
 
     state.lastCheckAt = new Date().toISOString();
@@ -434,9 +417,9 @@ export async function startDMWatcher(
     try {
         await dm.initialize();
 
-        // Initial scrape to establish baseline
-        logger.info('[dm-watcher] Initial inbox scan...');
-        await checkForNewDMs(dm);
+        // Initial scrape with full scroll to establish baseline
+        logger.info('[dm-watcher] Initial inbox scan (full scroll)...');
+        await checkForNewDMs(dm, true);
 
         // Poll loop
         const interval = setInterval(async () => {

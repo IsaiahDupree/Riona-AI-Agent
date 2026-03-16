@@ -42,16 +42,27 @@ export function getContactsDueForCheckIn(platform: 'twitter' | 'instagram'): Arr
         // Only check-in with contacts beyond acquaintance, or acquaintances with some engagement
         if (profile.tier === 'acquaintance' && profile.depth.exchangeCount < 2) continue;
 
-        const config = TIER_CONFIGS[profile.tier];
-        const lastContact = profile.lastCheckIn || profile.createdAt;
-        const hoursSince = (now - new Date(lastContact).getTime()) / (1000 * 60 * 60);
-
-        if (hoursSince >= config.checkInFrequencyHours) {
+        // Prefer nextCheckInDue if set (most accurate), fall back to lastCheckIn + frequency
+        if (profile.nextCheckInDue) {
+            const dueTime = new Date(profile.nextCheckInDue).getTime();
+            if (now < dueTime) continue; // Not due yet
+            const hoursSince = (now - dueTime) / (1000 * 60 * 60);
             due.push({
                 username: profile.username,
                 tier: profile.tier,
                 hoursSinceLastContact: Math.round(hoursSince),
             });
+        } else {
+            const config = TIER_CONFIGS[profile.tier];
+            const lastContact = profile.lastCheckIn || profile.createdAt;
+            const hoursSince = (now - new Date(lastContact).getTime()) / (1000 * 60 * 60);
+            if (hoursSince >= config.checkInFrequencyHours) {
+                due.push({
+                    username: profile.username,
+                    tier: profile.tier,
+                    hoursSinceLastContact: Math.round(hoursSince),
+                });
+            }
         }
     }
 

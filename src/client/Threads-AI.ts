@@ -689,7 +689,7 @@ async function postThreadsReply(page: Page, comment: string): Promise<boolean> {
 async function verifyReply(page: Page, comment: string, username: string): Promise<boolean> {
     try {
         // Wait for the dialog to close and any toast/error to appear
-        await delay(2000);
+        await delay(3000);
 
         const result = await page.evaluate((commentText: string, botUser: string) => {
             const bodyText = document.body.innerText;
@@ -699,29 +699,24 @@ async function verifyReply(page: Page, comment: string, username: string): Promi
             const errorPhrases = [
                 "couldn't post", 'try again', 'action blocked',
                 'something went wrong', 'this action was blocked',
-                'we restrict certain activity', 'temporarily blocked'
+                'we restrict certain activity', 'temporarily blocked',
+                'failed to post', "can't reply"
             ];
             const hasError = errorPhrases.some(t => bodyLower.includes(t));
             if (hasError) return { verified: false, reason: 'error_banner' };
 
-            // Check for "Posted" toast confirmation (strongest positive signal on Threads)
-            if (bodyLower.includes('posted')) {
-                return { verified: true, reason: 'posted_toast' };
+            // Check for toast/snackbar confirmation (Threads shows these briefly)
+            // Look for toast elements that might contain confirmation text
+            const toasts = document.querySelectorAll('[role="alert"], [role="status"], [data-testid*="toast"], [class*="toast"], [class*="snackbar"], [class*="Toast"], [class*="Snackbar"]');
+            for (const toast of toasts) {
+                const toastText = (toast.textContent || '').toLowerCase();
+                if (toastText.includes('posted') || toastText.includes('replied') || toastText.includes('sent') || toastText.includes('success')) {
+                    return { verified: true, reason: 'toast_confirmation' };
+                }
             }
 
-            // Check if the reply dialog is gone (no textboxes = dialog closed = submitted)
+            // Check if the reply composer textbox still has our text (not submitted = failed)
             const textboxes = document.querySelectorAll('div[role="textbox"][contenteditable="true"]');
-            if (textboxes.length === 0) {
-                return { verified: true, reason: 'dialog_closed' };
-            }
-
-            // Check if textboxes are empty (comment was consumed by submit)
-            const allEmpty = Array.from(textboxes).every(tb => (tb.textContent || '').trim() === '');
-            if (allEmpty) {
-                return { verified: true, reason: 'textbox_cleared' };
-            }
-
-            // Check if the reply composer textbox still has our text (not submitted)
             const snippet = commentText.slice(0, 30);
             for (const tb of textboxes) {
                 const text = (tb.textContent || '').trim();
@@ -730,9 +725,31 @@ async function verifyReply(page: Page, comment: string, username: string): Promi
                 }
             }
 
-            // Check if our comment text is visible on the page
+            // Check if reply dialog is gone (no textboxes at all = dialog closed = submitted)
+            if (textboxes.length === 0) {
+                return { verified: true, reason: 'dialog_closed' };
+            }
+
+            // Check if all textboxes are empty (comment was consumed by submit)
+            const allEmpty = Array.from(textboxes).every(tb => (tb.textContent || '').trim() === '');
+            if (allEmpty) {
+                return { verified: true, reason: 'textbox_cleared' };
+            }
+
+            // Check if our comment text appears in the page as a posted comment
+            // Look near our bot username to confirm it's OUR posted comment, not just in the prompt
+            const commentElements = document.querySelectorAll('[data-testid*="reply"], [class*="reply"], article, [role="article"]');
+            for (const el of commentElements) {
+                const elText = el.textContent || '';
+                if (elText.includes(snippet) && (elText.toLowerCase().includes(botUser.toLowerCase()) || elText.includes(commentText.slice(0, 50)))) {
+                    return { verified: true, reason: 'comment_visible_in_dom' };
+                }
+            }
+
+            // Fallback: check full body for our comment snippet (less reliable but catches edge cases)
+            // Only if textboxes don't contain it (already checked above)
             if (bodyText.includes(snippet)) {
-                return { verified: true, reason: 'comment_visible_in_dom' };
+                return { verified: true, reason: 'comment_in_body' };
             }
 
             return { verified: false, reason: 'unknown' };

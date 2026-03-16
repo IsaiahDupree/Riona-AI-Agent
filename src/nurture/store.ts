@@ -56,13 +56,25 @@ function createDefaultProfile(username: string, platform: 'twitter' | 'instagram
 
 // ── CRUD ────────────────────────────────────────────────────────────
 
+/**
+ * Load a nurture profile, auto-creating if it doesn't exist.
+ * Validates username to prevent ghost profiles from typos/bad input.
+ */
 export function loadNurtureProfile(username: string, platform: 'twitter' | 'instagram'): NurtureProfile {
+    // Sanitize: trim whitespace, strip @ prefix, lowercase
+    const cleaned = (username || '').trim().replace(/^@/, '').toLowerCase();
+
+    if (!cleaned || cleaned.length < 2 || cleaned.length > 50 || /\s/.test(cleaned)) {
+        logger.warn(`[nurture-store] Invalid username "${username}" — returning ephemeral profile`);
+        return createDefaultProfile(cleaned || 'unknown', platform);
+    }
+
     ensureDir();
-    const filePath = profilePath(username, platform);
+    const filePath = profilePath(cleaned, platform);
     const saved = safeReadJSON<NurtureProfile | null>(filePath, null, 'nurture_profile');
     if (saved) return saved;
 
-    const profile = createDefaultProfile(username, platform);
+    const profile = createDefaultProfile(cleaned, platform);
     saveNurtureProfile(profile);
     return profile;
 }

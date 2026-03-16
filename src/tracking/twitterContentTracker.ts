@@ -171,6 +171,20 @@ function engagementScore(tweet: TrackedTweet): number {
 }
 
 /**
+ * Cleanup old tracked tweets — keep tweets from the last N days.
+ * Completed tweets older than the cutoff are removed to prevent unbounded growth.
+ */
+export function cleanupOldTweets(daysToKeep = 60) {
+    const cutoff = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000).toISOString();
+    const tweets = loadTweets();
+    const filtered = tweets.filter(t => t.postedAt >= cutoff);
+    if (filtered.length < tweets.length) {
+        saveTweets(filtered);
+        logger.info(`[content-tracker] Cleaned up ${tweets.length - filtered.length} old tracked tweets`);
+    }
+}
+
+/**
  * Aggregate performance stats grouped by contentType, style, or topic.
  */
 export function getPerformanceByType(): Record<string, { count: number; avgLikes: number; avgRetweets: number; avgViews: number }> {

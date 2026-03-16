@@ -2,7 +2,7 @@ import { Page, Browser, ElementHandle } from 'puppeteer';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { logger } from '../utils/logger';
-import { formatError } from '../utils/errors';
+import { formatError, sanitizeForPrompt } from '../utils/errors';
 import { delay } from '../utils/delay';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -1477,11 +1477,14 @@ export async function generateTweetContent(options: {
         hot_take: 'Share a bold, provocative opinion that challenges conventional wisdom. Be confident and direct. The kind of tweet that makes people either strongly agree or reply to argue.',
     };
 
-    const prompt = `Generate an original tweet about ${topic || niche}.
+    const cleanLearning = learningContext ? sanitizeForPrompt(learningContext, 2000) : '';
+    const cleanOffer = offerContext ? sanitizeForPrompt(offerContext, 500) : '';
+
+    const prompt = `Generate an original tweet about ${sanitizeForPrompt(topic || niche, 200)}.
 
 Style: ${styleGuide[style] || styleGuide.informative}
-${offerContext ? `\nOffer context: ${offerContext}\n` : ''}
-${learningContext ? `\n${learningContext}\n` : ''}
+${cleanOffer ? `\nOffer context: ${cleanOffer}\n` : ''}
+${cleanLearning ? `\n${cleanLearning}\n` : ''}
 Rules:
 1. Maximum ${maxLength} characters
 2. Sound authentic — write like a real person, not a brand
@@ -1519,11 +1522,13 @@ export async function generateThreadContent(options: {
     topic: string;
     niche?: string;
     tweetCount?: number;
+    brandContext?: string;
+    learningContext?: string;
 } = { topic: 'AI trends' }): Promise<string[]> {
-    const { topic, niche = 'tech & AI', tweetCount = 4 } = options;
+    const { topic, niche = 'tech & AI', tweetCount = 4, brandContext, learningContext } = options;
 
     const prompt = `Write a Twitter/X thread of exactly ${tweetCount} tweets about: ${topic}
-
+${learningContext ? `\n${learningContext}\n` : ''}
 Rules:
 1. First tweet should be a hook — grab attention, make people want to read more
 2. Each tweet is max 280 characters
@@ -1536,12 +1541,16 @@ Rules:
 
 Reply with each tweet on a new line, numbered.`;
 
+    const systemContent = brandContext
+        ? `${brandContext} You write viral Twitter threads that educate, inspire, and drive discussion.`
+        : `You are a thought leader in ${niche} who writes viral Twitter threads. Your threads educate, inspire, and drive discussion.`;
+
     const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
             {
                 role: 'system',
-                content: `You are a thought leader in ${niche} who writes viral Twitter threads. Your threads educate, inspire, and drive discussion.`
+                content: systemContent
             },
             { role: 'user', content: prompt }
         ],
@@ -1639,7 +1648,13 @@ export async function postAIThread(page: Page, options: {
 } = { topic: 'AI trends' }): Promise<PostTweetResult> {
     logger.info(`[twitter-ai] Generating thread about: ${options.topic}`);
 
-    const tweets = await generateThreadContent(options);
+    const tweets = await generateThreadContent({
+        topic: options.topic,
+        niche: options.niche,
+        tweetCount: options.tweetCount,
+        brandContext: options.brandContext,
+        learningContext: options.learningContext,
+    });
 
     if (!tweets || tweets.length === 0) {
         logger.error('[twitter-ai] Failed to generate thread content');
@@ -1717,6 +1732,7 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
         return postStrategicQuoteTweet(page, {
             niche: slot.niche || brand.niche,
             brandContext,
+            learningContext,
         });
     }
 
@@ -1740,6 +1756,7 @@ export async function postStrategicContent(page: Page, runNumber: number): Promi
 async function postStrategicQuoteTweet(page: Page, options: {
     niche: string;
     brandContext?: string;
+    learningContext?: string;
 }): Promise<PostTweetResult> {
     try {
         // Navigate to home feed
@@ -1777,6 +1794,7 @@ async function postStrategicQuoteTweet(page: Page, options: {
 
                 const result = await aiQuoteTweet(page, tweet, metadata.text, metadata.username || 'unknown', {
                     niche: options.niche,
+                    learningContext: options.learningContext,
                 });
 
                 if (result.success) {
@@ -1868,11 +1886,12 @@ export async function autoFollowProspects(page: Page, options: {
 
 export async function aiQuoteTweet(page: Page, tweet: ElementHandle, tweetText: string, author: string, options: {
     niche?: string;
+    learningContext?: string;
 } = {}): Promise<PostTweetResult> {
-    const { niche = 'tech & AI' } = options;
+    const { niche = 'tech & AI', learningContext } = options;
 
     const prompt = `Write commentary for a quote tweet of this tweet by @${author}: "${tweetText}"
-
+${learningContext ? `\n${learningContext}\n` : ''}
 Rules:
 1. Max 200 characters
 2. Add your perspective — agree, disagree, expand, or contextualize

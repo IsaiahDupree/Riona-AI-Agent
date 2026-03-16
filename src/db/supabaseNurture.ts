@@ -2,7 +2,8 @@
  * Supabase Nurture Sync — Fire-and-forget sync for friendship nurture data.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseClient } from './supabaseClient';
 import { logger } from '../utils/logger';
 import { withRetry, formatError } from '../utils/errors';
 import {
@@ -13,21 +14,8 @@ import type { VRContactState } from '../nurture/vr-scheduler';
 import type { DetectedNotification } from '../client/Twitter-Notifications';
 import type { NurtureCommentResult } from '../client/Twitter-Nurture';
 
-let client: SupabaseClient | null = null;
-
 function getClient(): SupabaseClient | null {
-    if (client) return client;
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_KEY;
-    if (!url || !key) return null;
-
-    try {
-        client = createClient(url, key);
-        return client;
-    } catch (e) {
-        logger.warn(`[supabase-nurture] Client creation failed: ${formatError(e)}`);
-        return null;
-    }
+    return getSupabaseClient();
 }
 
 export async function syncNurtureProfileToSupabase(profile: NurtureProfile): Promise<void> {

@@ -32,10 +32,54 @@ export class InstagramDM {
         return this.page;
     }
 
+    /**
+     * Ensure the page is still usable. If the frame is detached (stale),
+     * re-acquire a valid page reference from the browser.
+     */
+    async ensurePage(): Promise<Page> {
+        // Get browser reference — Page.browser() is the most reliable way
+        const browser = this.page?.browser() ?? null;
+
+        // Quick check: try to evaluate on the current page
+        if (this.page) {
+            try {
+                await this.page.evaluate(() => document.readyState);
+                return this.page;
+            } catch (e) {
+                const msg = formatError(e);
+                if (msg.includes('detached Frame') || msg.includes('Session closed') || msg.includes('Target closed')) {
+                    logger.warn(`[dm] Page frame detached, recovering...`);
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        // Recovery: get fresh page from browser
+        if (browser) {
+            const pages = await browser.pages();
+            if (pages.length === 0) {
+                this.page = await browser.newPage();
+                await this.page!.setViewport({ width: 1280, height: 900 });
+                logger.info('[dm] Created new page after recovery');
+            } else {
+                this.page = pages[pages.length - 1];
+                for (let i = 0; i < pages.length - 1; i++) {
+                    try { await pages[i].close(); } catch (_) {}
+                }
+                logger.info(`[dm] Recovered page (closed ${pages.length - 1} stale pages)`);
+            }
+        } else {
+            throw new Error('Cannot recover page — no browser reference available');
+        }
+
+        return this.page!;
+    }
+
     // ── Navigate to DM inbox ────────────────────────────────────────
 
     async navigateToInbox(): Promise<void> {
-        if (!this.page) throw new Error('Page not initialized');
+        this.page = await this.ensurePage();
         logger.info('[dm] Navigating to inbox...');
         await this.page.goto('https://www.instagram.com/direct/inbox/', {
             waitUntil: 'domcontentloaded',
@@ -169,36 +213,262 @@ export class InstagramDM {
 
     // ── Scrape conversation list from inbox ─────────────────────────
 
-    async scrapeInbox(): Promise<ConversationPreview[]> {
+    async scrapeInbox(scrollToLoadAll: boolean = false): Promise<ConversationPreview[]> {
         if (!this.page) throw new Error('Page not initialized');
         await this.navigateToInbox();
         await delay(3000);
 
-        const conversations = await this.page.evaluate(() => {
-            const results: any[] = [];
-            // Instagram DM sidebar has conversation items with links
-            const items = document.querySelectorAll('div[role="listitem"], div[role="row"]');
-            for (const item of items) {
-                const linkEl = item.querySelector('a[href*="/direct/t/"]');
-                const nameEl = item.querySelector('span[dir="auto"]');
-                const text = (item as HTMLElement).innerText || '';
-                const lines = text.split('\n').filter(l => l.trim());
+        // Instagram virtualizes the list — only visible items exist in DOM.
+        // Strategy: use span[dir="auto"] + Y-position grouping to read visible
+        // conversations, then scroll and repeat to accumulate all.
 
-                if (nameEl || lines.length > 0) {
+        // ── DOM span scraper (runs at each scroll position) ──────────
+        const scrapeVisibleSpans = async (): Promise<ConversationPreview[]> => {
+            return await this.page!.evaluate(() => {
+                const results: any[] = [];
+                const threadList = document.querySelector('[aria-label="Thread list"]');
+                if (!threadList) return results;
+
+                const skipTexts = new Set([
+                    'primary', 'general', 'your note', 'start your first note',
+                    'search', 'messages', 'edit', 'new message'
+                ]);
+                const isTimestamp = (s: string): boolean => {
+                    const t = s.trim().toLowerCase();
+                    return /^\d+[mhwds]$/.test(t) ||
+                        /^\d+\s*(hour|min|day|week|month|sec)/i.test(t) ||
+                        /^(yesterday|today|just now|now)$/i.test(t) ||
+                        /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i.test(t) ||
+                        /^\d{1,2}\/\d{1,2}/i.test(t) ||
+                        /^·/.test(s);
+                };
+
+                const spans = threadList.querySelectorAll('span[dir="auto"]');
+                const entries: Array<{ text: string; bold: boolean; y: number }> = [];
+                for (const span of spans) {
+                    const text = (span.textContent || '').trim();
+                    if (!text) continue;
+                    const lower = text.toLowerCase();
+                    if (skipTexts.has(lower) || lower.startsWith('requests')) continue;
+                    const weight = parseInt(window.getComputedStyle(span).fontWeight) || 400;
+                    const rect = span.getBoundingClientRect();
+                    if (rect.height === 0) continue; // hidden/offscreen
+                    entries.push({ text, bold: weight >= 600, y: rect.y });
+                }
+
+                if (entries.length === 0) return results;
+
+                // Group by Y-position: gap > 28px = new conversation
+                const groups: Array<Array<{ text: string; bold: boolean }>> = [];
+                let currentGroup: Array<{ text: string; bold: boolean }> = [entries[0]];
+                for (let i = 1; i < entries.length; i++) {
+                    if (entries[i].y - entries[i - 1].y > 28) {
+                        groups.push(currentGroup);
+                        currentGroup = [];
+                    }
+                    currentGroup.push(entries[i]);
+                }
+                if (currentGroup.length > 0) groups.push(currentGroup);
+
+                for (const group of groups) {
+                    let name = '', message = '', timestamp = '', unread = false;
+                    for (const entry of group) {
+                        if (!name && !isTimestamp(entry.text)) {
+                            name = entry.text;
+                            if (entry.bold) unread = true;
+                        } else if (name && !message && !isTimestamp(entry.text)) {
+                            message = entry.text;
+                            if (entry.bold) unread = true;
+                        } else if (isTimestamp(entry.text)) {
+                            timestamp = entry.text;
+                        }
+                    }
+                    if (!name || name.length > 50) continue;
+                    if (!message && !timestamp) continue; // notes section
                     results.push({
-                        username: nameEl?.textContent?.trim() || lines[0] || '',
-                        lastMessage: lines.length > 1 ? lines[lines.length - 1] : '',
-                        lastMessageTime: '',
-                        unread: false,
+                        username: name,
+                        lastMessage: message.slice(0, 200),
+                        lastMessageTime: timestamp,
+                        unread,
                         profilePicUrl: ''
                     });
                 }
+                return results;
+            });
+        };
+
+        // ── Scroll helper ────────────────────────────────────────────
+        const scrollDown = async () => {
+            await this.page!.evaluate(() => {
+                const threadList = document.querySelector('[aria-label="Thread list"]');
+                if (threadList) {
+                    let el: HTMLElement | null = threadList as HTMLElement;
+                    for (let depth = 0; depth < 8 && el; depth++) {
+                        if (el.scrollHeight > el.clientHeight + 10) {
+                            el.scrollBy(0, el.clientHeight * 0.8);
+                            return;
+                        }
+                        el = el.parentElement;
+                    }
+                }
+                const main = document.querySelector('main');
+                if (main) {
+                    const divs = main.querySelectorAll('div');
+                    for (const d of divs) {
+                        const el = d as HTMLElement;
+                        if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200) {
+                            el.scrollBy(0, el.clientHeight * 0.8);
+                            return;
+                        }
+                    }
+                }
+            });
+        };
+
+        const scrollToTop = async () => {
+            await this.page!.evaluate(() => {
+                const threadList = document.querySelector('[aria-label="Thread list"]');
+                if (threadList) {
+                    let el: HTMLElement | null = threadList as HTMLElement;
+                    for (let depth = 0; depth < 8 && el; depth++) {
+                        if (el.scrollHeight > el.clientHeight + 10) {
+                            el.scrollTop = 0;
+                            return;
+                        }
+                        el = el.parentElement;
+                    }
+                }
+            });
+        };
+
+        // ── Accumulate conversations across scroll positions ─────────
+        const allConversations = new Map<string, ConversationPreview>();
+
+        const mergeResults = (batch: ConversationPreview[]) => {
+            for (const c of batch) {
+                const key = c.username.toLowerCase();
+                if (!allConversations.has(key)) {
+                    allConversations.set(key, c);
+                } else if (c.unread) {
+                    // Update unread status if we see it
+                    const existing = allConversations.get(key)!;
+                    existing.unread = true;
+                }
             }
-            return results;
+        };
+
+        // Initial scrape (visible conversations)
+        const initialBatch = await scrapeVisibleSpans();
+        mergeResults(initialBatch);
+
+        if (scrollToLoadAll) {
+            const MAX_SCROLL_ATTEMPTS = 25;
+            let sameCountStreak = 0;
+            let lastCount = allConversations.size;
+
+            for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
+                await scrollDown();
+                await delay(1200);
+
+                const batch = await scrapeVisibleSpans();
+                mergeResults(batch);
+
+                if (allConversations.size === lastCount) {
+                    sameCountStreak++;
+                    if (sameCountStreak >= 3) break;
+                } else {
+                    sameCountStreak = 0;
+                    lastCount = allConversations.size;
+                }
+            }
+
+            logger.info(`[dm] Scroll found ${allConversations.size} conversations`);
+
+            // Scroll back to top
+            await scrollToTop();
+            await delay(1000);
+        }
+
+        const conversations = Array.from(allConversations.values());
+        const unreadCount = conversations.filter(c => c.unread).length;
+        logger.info(`[dm] Scraped ${conversations.length} conversations from inbox (${unreadCount} unread)`);
+        return conversations;
+    }
+
+    /**
+     * Parse Instagram conversation text lines into ConversationPreview objects.
+     * Instagram inbox text pattern: Name\nTimestamp\nMessage preview
+     */
+    private parseIGConversationText(lines: string[]): ConversationPreview[] {
+        const skipWords = new Set(['primary', 'general', 'requests', 'your note', 'search',
+            'start your', 'send message', 'your messages', 'unread', 'pinned',
+            'muted', 'active', 'online', 'typing', 'messages', 'direct', 'inbox',
+            'start your first note', 'edit', 'new message']);
+        const botUser = (process.env.INSTAGRAM_BOT_USERNAME || '').toLowerCase();
+        const results: ConversationPreview[] = [];
+
+        const isTimestamp = (t: string): boolean => {
+            const s = t.trim().toLowerCase();
+            return /^\d+[mhwds]$/.test(s) ||
+                /^\d+\s*(hour|min|day|week|month|sec)/i.test(s) ||
+                /^(yesterday|today|just now|now)$/i.test(s) ||
+                /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i.test(s) ||
+                /^·/.test(s) ||
+                /^\d{1,2}\/\d{1,2}/i.test(s);
+        };
+
+        const allLines = lines.filter(l => {
+            const t = l.trim().toLowerCase();
+            return t.length > 0 &&
+                !skipWords.has(t) &&
+                t !== botUser &&
+                !t.startsWith('requests') &&
+                !t.startsWith('start your first');
         });
 
-        logger.info(`[dm] Scraped ${conversations.length} conversations from inbox`);
-        return conversations;
+        let i = 0;
+        while (i < allLines.length) {
+            const candidateName = allLines[i].trim();
+            const clean = candidateName.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+
+            // Valid name: reasonable length, not a timestamp, not a message-like line
+            if (clean.length > 1 && candidateName.length < 40 &&
+                !isTimestamp(candidateName) &&
+                !candidateName.startsWith('You:') &&
+                !candidateName.startsWith('You sent') &&
+                !candidateName.includes('. ') &&
+                !/^[a-z]/.test(candidateName) &&
+                candidateName.split(' ').length <= 5) {
+
+                let message = '';
+
+                // Next line might be timestamp, then message
+                if (i + 1 < allLines.length && isTimestamp(allLines[i + 1].trim())) {
+                    if (i + 2 < allLines.length && !isTimestamp(allLines[i + 2].trim())) {
+                        message = allLines[i + 2].trim().slice(0, 100);
+                        i += 3;
+                    } else {
+                        i += 2;
+                    }
+                } else if (i + 1 < allLines.length) {
+                    message = allLines[i + 1].trim().slice(0, 100);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+
+                results.push({
+                    username: candidateName,
+                    lastMessage: message,
+                    lastMessageTime: '',
+                    unread: false,
+                    profilePicUrl: ''
+                });
+            } else {
+                i++;
+            }
+        }
+        return results;
     }
 
     // ── Scrape messages from a specific thread ──────────────────────
@@ -416,23 +686,36 @@ export class InstagramDM {
     private async openExistingThread(username: string): Promise<boolean> {
         if (!this.page) return false;
 
-        // Look for the conversation in the sidebar
+        // Look for the conversation in the sidebar using span text matching
         const found = await this.page.evaluate((name: string) => {
             const nameLower = name.toLowerCase();
+            const threadList = document.querySelector('[aria-label="Thread list"]');
+            if (threadList) {
+                // Match by span text (display name or handle)
+                const spans = threadList.querySelectorAll('span[dir="auto"]');
+                for (const span of spans) {
+                    const text = (span.textContent || '').trim().toLowerCase();
+                    if (text === nameLower || text.includes(nameLower)) {
+                        // Walk up to find clickable container
+                        let el: HTMLElement | null = span as HTMLElement;
+                        for (let i = 0; i < 10 && el; i++) {
+                            el = el.parentElement;
+                            if (!el) break;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.height > 40 && rect.width > 200) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback: links
             const links = document.querySelectorAll('a[href*="/direct/"]');
             for (const link of links) {
                 const text = (link as HTMLElement).innerText?.toLowerCase() || '';
                 if (text.includes(nameLower)) {
                     (link as HTMLElement).click();
-                    return true;
-                }
-            }
-            // Also search by text content in conversation list
-            const items = document.querySelectorAll('div[role="listitem"], div[role="row"]');
-            for (const item of items) {
-                const text = (item as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
-                    (item as HTMLElement).click();
                     return true;
                 }
             }

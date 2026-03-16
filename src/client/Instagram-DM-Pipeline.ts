@@ -11,18 +11,100 @@ import { scrapeProfile, scrapeOurProfile } from './Instagram-Profile';
 import {
     generateDMMessage, generateColdOutreach, generateFollowUp,
     categorizeContact, loadRelationship, saveRelationship, updateWarmth,
-    recordFeedback, getFeedbackStats, MessageFeedback
+    recordFeedback, getFeedbackStats, MessageFeedback, getReplyObjective
 } from './Instagram-DM-AI';
 import { scrapeConversationThread, checkForNewDMs, StoredConversation } from './Instagram-DM-Watcher';
-import { trackDM, hasSentDMTo, createDMSession, saveDMSession, getDMsForUser } from '../tracking/dmTracker';
-import { notifyDMSent, notifyDMApprovalNeeded } from '../utils/telegram';
+import { trackDM, hasSentDMTo, createDMSession, saveDMSession, getDMsForUser, getTodayDMCount } from '../tracking/dmTracker';
+import { syncDMToSupabase } from '../db/supabaseDM';
+import { notifyDMSent, notifyDMApprovalNeeded, notifyDMAutoReply, notifyDMReplyReceived } from '../utils/telegram';
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, DMSendResult, TrackedDM } from '../types/dm';
+import { isJackpotReply, computeOfferReadiness } from '../nurture/vr-scheduler';
+import { computeReplyDelay, scheduleDelayedReply, getReadyReplies, markReplySent, markReplyFailed, cleanupDelayedQueue, hasPendingReply } from '../nurture/vi-delays';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// ── Auto-Reply Constants ─────────────────────────────────────────────
+
+const AUTO_REPLY_MAX_PER_RUN = 5;
+const AUTO_REPLY_COOLDOWN_HOURS = 1;
+const AUTO_REPLY_DELAY_MS = 60000;
+const OPT_OUT_KEYWORDS = ['stop', 'unsubscribe', 'leave me alone', 'block', 'report', 'spam', "don't message", 'no thanks'];
+
+export interface DMAutoReplyResult {
+    processed: number;
+    replied: number;
+    skipped: number;
+    failed: number;
+    details: Array<{ username: string; action: 'replied' | 'skipped' | 'failed'; reason?: string }>;
+    dryRunMessages?: Array<{ username: string; message: string; delayMinutes: number; isJackpot: boolean }>;
+}
+
+// ── Bot / Automated Account Detection ───────────────────────────────
+
+const BOT_LINK_PATTERNS = ['http://', 'https://', 'www.', 'bit.ly/', '.com/', '.co/'];
+const BOT_DOWNLOAD_PHRASES = [
+    'download', 'free guide', 'free ebook', 'click here', 'click below',
+    'click on', 'link in bio', 'grab your', 'get your free', 'tap the link', 'tap here'
+];
+const BOT_WELCOME_PHRASES = [
+    'thanks for following', 'thank you for following', 'thanks for connecting',
+    'thanks for the follow', 'welcome!', 'welcome to'
+];
+const BOT_LEAD_MAGNET_PHRASES = [
+    'exclusive access', 'limited time', 'sign up', 'register now',
+    'claim your', 'free trial', 'discount code', 'use code', 'promo code',
+    'join my newsletter', 'join our newsletter', 'subscribe to'
+];
+const BOT_USERNAME_PATTERNS = [
+    /\d{5,}$/,              // ends with 5+ digits
+    /_bot$/i,               // ends with _bot
+    /_official\d+$/i,       // _official123
+    /^(marketing|growth|leads|sales)\d+/i, // marketing123, growth99
+    /__.*__/,               // double underscores
+];
+
+export function isLikelyBot(preview: string, username?: string): { isBot: boolean; reason: string } {
+    const lower = (preview || '').toLowerCase();
+
+    // Check link/spam patterns
+    if (BOT_LINK_PATTERNS.some(p => lower.includes(p))) {
+        return { isBot: true, reason: 'contains link/URL' };
+    }
+
+    // Check download/freebie language
+    const dlMatch = BOT_DOWNLOAD_PHRASES.find(p => lower.includes(p));
+    if (dlMatch) {
+        return { isBot: true, reason: `download/freebie language: "${dlMatch}"` };
+    }
+
+    // Check automated welcome messages
+    const welcomeMatch = BOT_WELCOME_PHRASES.find(p => lower.includes(p));
+    if (welcomeMatch) {
+        return { isBot: true, reason: `automated welcome: "${welcomeMatch}"` };
+    }
+
+    // Check lead magnet language
+    const leadMatch = BOT_LEAD_MAGNET_PHRASES.find(p => lower.includes(p));
+    if (leadMatch) {
+        return { isBot: true, reason: `lead magnet language: "${leadMatch}"` };
+    }
+
+    // Check username patterns
+    if (username) {
+        const uLower = username.toLowerCase();
+        for (const pattern of BOT_USERNAME_PATTERNS) {
+            if (pattern.test(uLower)) {
+                return { isBot: true, reason: `bot-like username pattern: ${pattern}` };
+            }
+        }
+    }
+
+    return { isBot: false, reason: '' };
+}
 
 // ── Offer Catalog ───────────────────────────────────────────────────
 
@@ -95,10 +177,25 @@ function getDefaultOffers(): Offer[] {
 
 export function matchOffer(
     theirProfile: ProfileInfo,
-    relationship: RelationshipInfo
+    relationship: RelationshipInfo,
+    username?: string,
+    platform?: 'twitter' | 'instagram'
 ): Offer | null {
     const offers = loadOffers().filter(o => o.active);
     const bio = (theirProfile.bio || '').toLowerCase();
+
+    // Check offer readiness if VR state is available
+    if (username && platform) {
+        try {
+            const readiness = computeOfferReadiness(username, platform);
+            if (readiness.score < 0.45) {
+                logger.info(`[pipeline] Offer readiness too low for @${username}: ${readiness.score.toFixed(2)} (need 0.45+)`);
+                return null;
+            }
+        } catch (e) {
+            logger.debug(`[pipeline] Offer readiness check skipped for @${username}: ${formatError(e)}`);
+        }
+    }
 
     for (const offer of offers) {
         // Check warmth threshold
@@ -213,9 +310,9 @@ export class DMPipeline {
     // ── Process a single target: scrape → categorize → generate → queue/send ──
 
     async processTarget(username: string): Promise<PendingSend | null> {
-        const page = this.dm.getPage();
-        if (!page) {
-            logger.error('[pipeline] Browser page not available — cannot process target');
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.error(`[pipeline] Browser page not available — cannot process target: ${formatError(e)}`);
             return null;
         }
 
@@ -258,7 +355,7 @@ export class DMPipeline {
         let matchedOffer: Offer | undefined;
 
         if (this.config.offerEnabled) {
-            const offer = matchOffer(theirProfile, relationship);
+            const offer = matchOffer(theirProfile, relationship, username, 'instagram');
             if (offer) {
                 objective = offer.messageHint;
                 matchedOffer = offer;
@@ -384,8 +481,7 @@ export class DMPipeline {
 
         for (const username of usernames) {
             // Check daily limit
-            const today = getDMsForUser(username); // TODO: get total today count
-            if (stats.sent >= this.config.maxDMsPerDay) {
+            if (getTodayDMCount() >= this.config.maxDMsPerDay) {
                 logger.info(`[pipeline] Daily limit reached (${this.config.maxDMsPerDay})`);
                 break;
             }
@@ -418,12 +514,469 @@ export class DMPipeline {
         return stats;
     }
 
+    // ── Auto-reply to incoming DMs ─────────────────────────────────────
+
+    async processDMAutoReplies(options?: { dryRun?: boolean }): Promise<DMAutoReplyResult> {
+        const result: DMAutoReplyResult = { processed: 0, replied: 0, skipped: 0, failed: 0, details: [] };
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.warn(`[pipeline] Browser page not available — cannot process auto-replies: ${formatError(e)}`);
+            return result;
+        }
+
+        const ourUsername = (process.env.INSTAGRAM_BOT_USERNAME || '').toLowerCase();
+
+        // 1. Detect new incoming messages
+        let newMessages: Array<{ from: string; preview: string }> = [];
+        try {
+            const detected = await checkForNewDMs(this.dm);
+            newMessages = detected.newMessages;
+        } catch (e) {
+            logger.error(`[pipeline] Failed to check for new DMs: ${formatError(e)}`);
+            return result;
+        }
+
+        if (newMessages.length === 0) {
+            logger.info('[pipeline] Auto-reply: no new messages to process');
+            return result;
+        }
+
+        logger.info(`[pipeline] Auto-reply: ${newMessages.length} new message(s) to evaluate`);
+
+        for (const { from, preview } of newMessages) {
+            const username = from.toLowerCase().replace('@', '');
+            result.processed++;
+
+            // GUARD: skip our own messages
+            if (username === ourUsername) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'own message' });
+                continue;
+            }
+
+            // GUARD: per-user cooldown
+            if (hasSentDMTo(username, AUTO_REPLY_COOLDOWN_HOURS)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `cooldown (${AUTO_REPLY_COOLDOWN_HOURS}h)` });
+                continue;
+            }
+
+            // GUARD: daily limit
+            if (getTodayDMCount() >= this.config.maxDMsPerDay) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'daily limit reached' });
+                continue;
+            }
+
+            // GUARD: max replies per run
+            if (result.replied >= AUTO_REPLY_MAX_PER_RUN) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'max replies per run reached' });
+                continue;
+            }
+
+            // GUARD: already have a pending delayed reply for this user
+            if (hasPendingReply(username, 'instagram')) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'reply already scheduled' });
+                continue;
+            }
+
+            // GUARD: opt-out detection
+            const previewLower = preview.toLowerCase();
+            if (OPT_OUT_KEYWORDS.some(k => previewLower.includes(k))) {
+                logger.info(`[pipeline] Auto-reply: opt-out detected from @${username}`);
+                const rel = loadRelationship(username);
+                rel.warmth = Math.max(0, rel.warmth - 20);
+                rel.notes.push(`Opt-out detected: "${preview.slice(0, 50)}" (${new Date().toISOString()})`);
+                saveRelationship(username, rel);
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'opt-out detected' });
+                continue;
+            }
+
+            // GUARD: bot / automated account detection
+            const botCheck = isLikelyBot(preview, username);
+            if (botCheck.isBot) {
+                logger.info(`[pipeline] Auto-reply: bot detected from @${username}: ${botCheck.reason}`);
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `bot: ${botCheck.reason}` });
+                continue;
+            }
+
+            // Scrape conversation thread to verify it's our turn
+            try {
+                const thread = await scrapeConversationThread(this.dm, username, 3);
+                const messages = thread.messages;
+
+                // Use resolved handle from thread header (falls back to display name)
+                const resolvedHandle = (thread as any).handle || username;
+
+                // GUARD: check it's our turn to reply (last message must be theirs)
+                if (messages.length > 0 && messages[messages.length - 1].isOurs) {
+                    result.skipped++;
+                    result.details.push({ username: resolvedHandle, action: 'skipped', reason: 'already replied (their turn)' });
+                    continue;
+                }
+
+                // Load relationship & profile using resolved handle
+                const relationship = loadRelationship(resolvedHandle);
+                if (!this.ourProfile) {
+                    this.ourProfile = await scrapeOurProfile(page);
+                }
+
+                let theirProfile: ProfileInfo;
+                try {
+                    theirProfile = await scrapeProfile(page, resolvedHandle);
+                } catch (e) {
+                    logger.warn(`[pipeline] Failed to scrape profile for @${resolvedHandle}, using minimal: ${formatError(e)}`);
+                    theirProfile = { username: resolvedHandle, fullName: username, bio: '', followerCount: 0, followingCount: 0, postCount: 0, isVerified: false };
+                }
+
+                // Get the last message from them for objective generation
+                const lastTheirMessage = [...messages].reverse().find(m => !m.isOurs);
+                const objective = getReplyObjective(relationship, lastTheirMessage?.text || preview);
+
+                // Check jackpot mechanics
+                const jackpotDecision = isJackpotReply(resolvedHandle, 'instagram');
+                const isJackpot = jackpotDecision.jackpot;
+                if (isJackpot) {
+                    logger.info(`[pipeline] JACKPOT reply for @${resolvedHandle}: ${jackpotDecision.reason}`);
+                }
+
+                // Generate AI reply (with jackpot flag for enhanced response)
+                const replyMessage = await generateDMMessage({
+                    ourProfile: this.ourProfile,
+                    theirProfile,
+                    conversationHistory: messages,
+                    relationship,
+                    objective,
+                    isJackpot
+                });
+
+                // Compute VI delay and schedule instead of sending immediately
+                const delayMs = computeReplyDelay(resolvedHandle, 'instagram', relationship.stage, isJackpot);
+                const delayMinutes = Math.round(delayMs / 60000);
+
+                if (options?.dryRun) {
+                    // Dry-run: log what would be sent but don't schedule
+                    if (!result.dryRunMessages) result.dryRunMessages = [];
+                    result.dryRunMessages.push({
+                        username: resolvedHandle,
+                        message: replyMessage,
+                        delayMinutes,
+                        isJackpot
+                    });
+                    result.replied++;
+                    result.details.push({ username: resolvedHandle, action: 'replied', reason: `dry-run: would schedule in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[pipeline] DRY RUN reply to @${resolvedHandle} in ${delayMinutes}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 80)}..."`);
+                } else {
+                    const sendAfter = new Date(Date.now() + delayMs).toISOString();
+
+                    scheduleDelayedReply({
+                        username: resolvedHandle,
+                        platform: 'instagram',
+                        replyMessage,
+                        sendAfter,
+                        context: {
+                            relationship,
+                            objective,
+                            isJackpot,
+                            theirMessage: lastTheirMessage?.text || preview,
+                            displayName: username !== resolvedHandle ? username : undefined
+                        }
+                    });
+
+                    result.replied++;
+                    result.details.push({ username: resolvedHandle, action: 'replied', reason: `scheduled in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[pipeline] Scheduled reply to @${resolvedHandle} in ${delayMinutes}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 50)}..."`);
+                }
+
+                // Rate limit delay between processing
+                if (result.replied < AUTO_REPLY_MAX_PER_RUN) {
+                    await delay(5000); // Short delay between scheduling (not sending)
+                }
+
+            } catch (e) {
+                result.failed++;
+                result.details.push({ username, action: 'failed', reason: formatError(e) });
+                logger.error(`[pipeline] Auto-reply error for @${username}: ${formatError(e)}`);
+            }
+        }
+
+        logger.info(`[pipeline] Auto-reply complete: ${result.replied} replied, ${result.skipped} skipped, ${result.failed} failed`);
+        return result;
+    }
+
+    // ── Catch up on missed replies (backfill) ──────────────────────────
+
+    async catchUpMissedReplies(options?: { dryRun?: boolean; maxConversations?: number }): Promise<DMAutoReplyResult> {
+        const result: DMAutoReplyResult = { processed: 0, replied: 0, skipped: 0, failed: 0, details: [] };
+        if (options?.dryRun) result.dryRunMessages = [];
+
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.warn(`[pipeline] Browser page not available — cannot catch up: ${formatError(e)}`);
+            return result;
+        }
+
+        const ourUsername = (process.env.INSTAGRAM_BOT_USERNAME || '').toLowerCase();
+        const maxConvos = options?.maxConversations || 20;
+
+        // 1. Scrape full inbox to get all conversations
+        logger.info(`[pipeline] Catch-up: scanning inbox for missed replies...`);
+        let inbox: Array<{ username: string; lastMessage: string; lastMessageTime: string; unread: boolean }> = [];
+        try {
+            inbox = await this.dm.scrapeInbox(true); // full scroll
+        } catch (e) {
+            logger.error(`[pipeline] Catch-up: failed to scrape inbox: ${formatError(e)}`);
+            return result;
+        }
+
+        logger.info(`[pipeline] Catch-up: found ${inbox.length} conversations, checking up to ${maxConvos}`);
+
+        let checked = 0;
+        for (const convo of inbox) {
+            if (checked >= maxConvos) break;
+            if (result.replied >= AUTO_REPLY_MAX_PER_RUN) break;
+
+            const displayName = convo.username;
+            const username = displayName.toLowerCase().replace('@', '');
+
+            // Skip our own messages
+            if (username === ourUsername) continue;
+
+            // Quick filter: if last message starts with "You:" it's our turn — skip
+            const lastMsgLower = (convo.lastMessage || '').toLowerCase();
+            if (lastMsgLower.startsWith('you:') || lastMsgLower.startsWith('you sent')) {
+                continue;
+            }
+
+            // Bot filter on preview
+            const botCheck = isLikelyBot(convo.lastMessage, username);
+            if (botCheck.isBot) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `bot: ${botCheck.reason}` });
+                continue;
+            }
+
+            // Opt-out filter on preview
+            if (OPT_OUT_KEYWORDS.some(k => lastMsgLower.includes(k))) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'opt-out detected' });
+                continue;
+            }
+
+            // Already have a pending reply scheduled
+            if (hasPendingReply(username, 'instagram')) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'reply already scheduled' });
+                continue;
+            }
+
+            // Daily limit
+            if (getTodayDMCount() >= this.config.maxDMsPerDay) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'daily limit reached' });
+                continue;
+            }
+
+            // Deep-scrape this thread to verify it's actually our turn
+            checked++;
+            result.processed++;
+            try {
+                const thread = await scrapeConversationThread(this.dm, displayName, 3);
+                const messages = thread.messages;
+                const resolvedHandle = (thread as any).handle || username;
+
+                // Check if pending reply for resolved handle too
+                if (resolvedHandle !== username && hasPendingReply(resolvedHandle, 'instagram')) {
+                    result.skipped++;
+                    result.details.push({ username: resolvedHandle, action: 'skipped', reason: 'reply already scheduled' });
+                    continue;
+                }
+
+                // Verify last message is theirs
+                if (messages.length === 0 || messages[messages.length - 1].isOurs) {
+                    result.skipped++;
+                    result.details.push({ username: resolvedHandle, action: 'skipped', reason: 'already replied (their turn)' });
+                    continue;
+                }
+
+                // Re-check bot filter with full thread context
+                const lastTheirMessage = [...messages].reverse().find(m => !m.isOurs);
+                if (lastTheirMessage) {
+                    const threadBotCheck = isLikelyBot(lastTheirMessage.text, resolvedHandle);
+                    if (threadBotCheck.isBot) {
+                        result.skipped++;
+                        result.details.push({ username: resolvedHandle, action: 'skipped', reason: `bot: ${threadBotCheck.reason}` });
+                        continue;
+                    }
+                }
+
+                // Cooldown check on resolved handle
+                if (hasSentDMTo(resolvedHandle, AUTO_REPLY_COOLDOWN_HOURS)) {
+                    result.skipped++;
+                    result.details.push({ username: resolvedHandle, action: 'skipped', reason: `cooldown (${AUTO_REPLY_COOLDOWN_HOURS}h)` });
+                    continue;
+                }
+
+                // Load relationship & profile
+                const relationship = loadRelationship(resolvedHandle);
+                if (!this.ourProfile) {
+                    this.ourProfile = await scrapeOurProfile(page);
+                }
+
+                let theirProfile: ProfileInfo;
+                try {
+                    theirProfile = await scrapeProfile(page, resolvedHandle);
+                } catch (e) {
+                    logger.warn(`[pipeline] Catch-up: failed to scrape profile for @${resolvedHandle}, using minimal: ${formatError(e)}`);
+                    theirProfile = { username: resolvedHandle, fullName: displayName, bio: '', followerCount: 0, followingCount: 0, postCount: 0, isVerified: false };
+                }
+
+                const objective = getReplyObjective(relationship, lastTheirMessage?.text || convo.lastMessage);
+
+                // Jackpot check
+                const jackpotDecision = isJackpotReply(resolvedHandle, 'instagram');
+                const isJackpot = jackpotDecision.jackpot;
+
+                // Generate AI reply
+                const replyMessage = await generateDMMessage({
+                    ourProfile: this.ourProfile,
+                    theirProfile,
+                    conversationHistory: messages,
+                    relationship,
+                    objective,
+                    isJackpot
+                });
+
+                // Compute delay
+                const delayMs = computeReplyDelay(resolvedHandle, 'instagram', relationship.stage, isJackpot);
+                const delayMinutes = Math.round(delayMs / 60000);
+
+                if (options?.dryRun) {
+                    result.dryRunMessages!.push({
+                        username: resolvedHandle,
+                        message: replyMessage,
+                        delayMinutes,
+                        isJackpot
+                    });
+                    result.replied++;
+                    result.details.push({ username: resolvedHandle, action: 'replied', reason: `dry-run: would schedule in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[pipeline] CATCH-UP DRY RUN @${resolvedHandle}: "${replyMessage.slice(0, 80)}..." (${delayMinutes}min)`);
+                } else {
+                    const sendAfter = new Date(Date.now() + delayMs).toISOString();
+                    scheduleDelayedReply({
+                        username: resolvedHandle,
+                        platform: 'instagram',
+                        replyMessage,
+                        sendAfter,
+                        context: {
+                            relationship,
+                            objective,
+                            isJackpot,
+                            theirMessage: lastTheirMessage?.text || convo.lastMessage,
+                            displayName: displayName !== resolvedHandle ? displayName : undefined
+                        }
+                    });
+                    result.replied++;
+                    result.details.push({ username: resolvedHandle, action: 'replied', reason: `catch-up: scheduled in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[pipeline] CATCH-UP scheduled @${resolvedHandle} in ${delayMinutes}min: "${replyMessage.slice(0, 50)}..."`);
+                }
+
+                await delay(5000); // Rate limit between processing
+
+            } catch (e) {
+                result.failed++;
+                result.details.push({ username, action: 'failed', reason: formatError(e) });
+                logger.error(`[pipeline] Catch-up error for @${username}: ${formatError(e)}`);
+            }
+        }
+
+        logger.info(`[pipeline] Catch-up complete: ${result.replied} replied, ${result.skipped} skipped, ${result.failed} failed (checked ${checked} threads)`);
+        return result;
+    }
+
+    // ── Process delayed replies (VI schedule) ──────────────────────────
+
+    async processDelayedReplies(): Promise<{ sent: number; failed: number }> {
+        const stats = { sent: 0, failed: 0 };
+        const ready = getReadyReplies('instagram');
+
+        if (ready.length === 0) return stats;
+
+        logger.info(`[pipeline] ${ready.length} delayed reply(ies) ready to send`);
+
+        // Note: replies to incoming DMs are NOT counted against the daily outreach limit.
+        // Replying to someone who messaged us is expected behavior, not cold outreach.
+        // We still cap at AUTO_REPLY_MAX_PER_RUN (5) per cycle to avoid spam bursts.
+        for (const entry of ready) {
+            if (stats.sent >= AUTO_REPLY_MAX_PER_RUN) {
+                logger.info(`[pipeline] Max replies per run reached — deferring ${ready.length - stats.sent - stats.failed} delayed reply(ies)`);
+                break;
+            }
+
+            try {
+                // Try handle first, fall back to display name if thread not found
+                let sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage);
+                if (!sendResult.success && sendResult.error?.includes('No existing thread') && entry.context.displayName) {
+                    logger.info(`[pipeline] Thread not found by handle @${entry.username}, trying display name "${entry.context.displayName}"...`);
+                    sendResult = await this.dm.sendToExistingThread(entry.context.displayName, entry.replyMessage);
+                }
+
+                if (sendResult.success) {
+                    markReplySent(entry.id);
+
+                    const tracked: TrackedDM = {
+                        recipientUsername: entry.username,
+                        messageText: entry.replyMessage,
+                        timestamp: new Date().toISOString(),
+                        direction: 'outbound',
+                        verified: sendResult.verified,
+                        sessionId: `auto_reply_${Date.now()}`,
+                        conversationId: entry.username,
+                        relationshipCategory: entry.context.relationship.category,
+                        approvalStatus: 'auto'
+                    };
+                    trackDM(tracked);
+                    updateWarmth(entry.username, 'message_sent');
+                    syncDMToSupabase(tracked).catch(() => {});
+                    await notifyDMAutoReply(
+                        'Instagram',
+                        entry.username,
+                        entry.context.theirMessage || '(unknown)',
+                        entry.replyMessage
+                    ).catch(() => {});
+
+                    stats.sent++;
+                    logger.info(`[pipeline] Sent delayed reply to @${entry.username} (jackpot=${entry.context.isJackpot})`);
+                } else {
+                    markReplyFailed(entry.id, sendResult.error || 'Send failed');
+                    stats.failed++;
+                    logger.error(`[pipeline] Delayed reply failed for @${entry.username}: ${sendResult.error}`);
+                }
+
+                await delay(AUTO_REPLY_DELAY_MS);
+            } catch (e) {
+                markReplyFailed(entry.id, formatError(e));
+                stats.failed++;
+                logger.error(`[pipeline] Delayed reply error for @${entry.username}: ${formatError(e)}`);
+            }
+        }
+
+        // Periodic cleanup
+        cleanupDelayedQueue();
+
+        return stats;
+    }
+
     // ── Check for replies and update feedback loop ──────────────────
 
     async checkRepliesAndUpdateFeedback(): Promise<number> {
-        const page = this.dm.getPage();
-        if (!page) {
-            logger.error('[pipeline] Browser page not available — cannot check replies');
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.error(`[pipeline] Browser page not available — cannot check replies: ${formatError(e)}`);
             return 0;
         }
         let repliesFound = 0;
@@ -439,8 +992,16 @@ export class DMPipeline {
 
         const trackedUsers = new Set(existingFeedback.map(f => f.recipientUsername.toLowerCase()));
 
-        // Check each conversation we've sent DMs to
-        const allDMs = getDMsForUser('').length > 0 ? [] : []; // We need all users
+        // Scrape inbox ONCE, then match against all relationships
+        let newMessages: Array<{ from: string; preview: string }> = [];
+        try {
+            const inboxResult = await checkForNewDMs(this.dm);
+            newMessages = inboxResult.newMessages;
+        } catch (e) {
+            logger.warn('[pipeline] Failed to check inbox for replies: ' + formatError(e));
+            return 0;
+        }
+
         const relationshipsDir = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'relationships');
         if (!fs.existsSync(relationshipsDir)) return 0;
 
@@ -453,28 +1014,27 @@ export class DMPipeline {
             if (outbound.length === 0) continue;
             if (trackedUsers.has(username)) continue; // Already have feedback
 
-            // Check for new messages from this user via inbox
-            try {
-                const { newMessages } = await checkForNewDMs(this.dm);
-                const theirReply = newMessages.find(m => m.from.toLowerCase().includes(username));
-                if (theirReply) {
-                    // Analyze sentiment
-                    const sentiment = analyzeSentiment(theirReply.preview);
-                    const lastOutbound = outbound[outbound.length - 1];
-                    const hoursSince = (Date.now() - new Date(lastOutbound.timestamp).getTime()) / (1000 * 60 * 60);
+            // Match against the single inbox scrape
+            const theirReply = newMessages.find(m => m.from.toLowerCase().includes(username));
+            if (theirReply) {
+                const sentiment = analyzeSentiment(theirReply.preview);
+                const lastOutbound = outbound[outbound.length - 1];
+                const hoursSince = (Date.now() - new Date(lastOutbound.timestamp).getTime()) / (1000 * 60 * 60);
 
-                    recordFeedback({
-                        messageId: lastOutbound.sessionId,
-                        recipientUsername: username,
-                        messageSentAt: lastOutbound.timestamp,
-                        gotReply: true,
-                        replyText: theirReply.preview,
-                        replySentiment: sentiment,
-                        replyWithinHours: Math.round(hoursSince * 10) / 10
-                    });
-                    repliesFound++;
-                }
-            } catch (e) { logger.warn('[pipeline] Failed to check replies for user: ' + formatError(e)); }
+                recordFeedback({
+                    messageId: lastOutbound.sessionId,
+                    recipientUsername: username,
+                    messageSentAt: lastOutbound.timestamp,
+                    gotReply: true,
+                    replyText: theirReply.preview,
+                    replySentiment: sentiment,
+                    replyWithinHours: Math.round(hoursSince * 10) / 10
+                });
+                repliesFound++;
+
+                // Notify Telegram about the reply
+                await notifyDMReplyReceived('Instagram', username, theirReply.preview, sentiment, hoursSince).catch(() => {});
+            }
         }
 
         logger.info(`[pipeline] Feedback check: ${repliesFound} new replies found`);

@@ -6,24 +6,42 @@
  */
 
 import { TwitterDM } from './Twitter-DM';
+import { checkForNewTwitterDMs } from './Twitter-DM-Watcher';
 import { scrapeTwitterProfile, scrapeOurTwitterProfile } from './Twitter-Profile';
 import {
     generateDMMessage, categorizeContact, loadRelationship, saveRelationship,
-    updateWarmth, recordFeedback, getFeedbackStats, MessageFeedback
+    updateWarmth, recordFeedback, getFeedbackStats, MessageFeedback, getReplyObjective
 } from './Twitter-DM-AI';
 import {
     trackTwitterDM, hasSentTwitterDMTo, createTwitterDMSession, saveTwitterDMSession,
     getTwitterDMsForUser, getTodayTwitterDMCount
 } from '../tracking/twitterDMTracker';
-import { notifyDMSent, notifyDMApprovalNeeded } from '../utils/telegram';
+import { notifyDMSent, notifyDMApprovalNeeded, notifyDMAutoReply, notifyDMReplyReceived } from '../utils/telegram';
 import { syncTwitterDMToSupabase, syncTwitterProfileToSupabase } from '../db/supabaseTwitterDM';
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, TrackedDM } from '../types/dm';
+import { isJackpotReply, computeOfferReadiness } from '../nurture/vr-scheduler';
+import { computeReplyDelay, scheduleDelayedReply, getReadyReplies, markReplySent, markReplyFailed, cleanupDelayedQueue, hasPendingReply } from '../nurture/vi-delays';
 import * as fs from 'fs';
 import * as path from 'path';
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// ── Auto-Reply Constants ─────────────────────────────────────────────
+
+const AUTO_REPLY_MAX_PER_RUN = 5;
+const AUTO_REPLY_COOLDOWN_HOURS = 1;
+const AUTO_REPLY_DELAY_MS = 30000; // 30s — Twitter less strict than IG
+const OPT_OUT_KEYWORDS = ['stop', 'unsubscribe', 'leave me alone', 'block', 'report', 'spam', "don't message", 'no thanks'];
+
+export interface DMAutoReplyResult {
+    processed: number;
+    replied: number;
+    skipped: number;
+    failed: number;
+    details: Array<{ username: string; action: 'replied' | 'skipped' | 'failed'; reason?: string }>;
+}
 
 // ── Offer Catalog ───────────────────────────────────────────────────
 
@@ -96,10 +114,25 @@ function getDefaultOffers(): Offer[] {
 
 export function matchOffer(
     theirProfile: ProfileInfo,
-    relationship: RelationshipInfo
+    relationship: RelationshipInfo,
+    username?: string,
+    platform?: 'twitter' | 'instagram'
 ): Offer | null {
     const offers = loadOffers().filter(o => o.active);
     const bio = (theirProfile.bio || '').toLowerCase();
+
+    // Check offer readiness if VR state is available
+    if (username && platform) {
+        try {
+            const readiness = computeOfferReadiness(username, platform);
+            if (readiness.score < 0.45) {
+                logger.info(`[twitter-pipeline] Offer readiness too low for @${username}: ${readiness.score.toFixed(2)} (need 0.45+)`);
+                return null;
+            }
+        } catch (e) {
+            logger.debug(`[twitter-pipeline] Offer readiness check skipped for @${username}: ${formatError(e)}`);
+        }
+    }
 
     for (const offer of offers) {
         if (relationship.warmth < offer.minWarmth) continue;
@@ -209,9 +242,9 @@ export class TwitterDMPipeline {
     // ── Process a single target: scrape → categorize → generate → queue/send ──
 
     async processTarget(username: string): Promise<PendingSend | null> {
-        const page = this.dm.getPage();
-        if (!page) {
-            logger.error('[twitter-pipeline] Browser page not available — cannot process target');
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.error(`[twitter-pipeline] Browser page not available — cannot process target: ${formatError(e)}`);
             return null;
         }
 
@@ -256,7 +289,7 @@ export class TwitterDMPipeline {
         let matchedOffer: Offer | undefined;
 
         if (this.config.offerEnabled) {
-            const offer = matchOffer(theirProfile, relationship);
+            const offer = matchOffer(theirProfile, relationship, username, 'twitter');
             if (offer) {
                 objective = offer.messageHint;
                 matchedOffer = offer;
@@ -300,7 +333,7 @@ export class TwitterDMPipeline {
             const sends = loadPendingSends();
             sends.push(pending);
             savePendingSends(sends);
-            await notifyDMApprovalNeeded(username, message, pending.id);
+            await notifyDMApprovalNeeded(username, message, pending.id, 'Twitter');
             logger.info(`[twitter-pipeline] Queued DM for @${username} — awaiting approval (${pending.id})`);
             return pending;
         }
@@ -318,7 +351,7 @@ export class TwitterDMPipeline {
             if (result.success) {
                 pending.status = 'sent';
                 updateWarmth(pending.recipientUsername, 'message_sent');
-                await notifyDMSent(pending.recipientUsername, pending.message, result.verified);
+                await notifyDMSent(pending.recipientUsername, pending.message, result.verified, 'Twitter');
 
                 // Track the DM
                 const tracked: TrackedDM = {
@@ -430,6 +463,242 @@ export class TwitterDMPipeline {
         return stats;
     }
 
+    // ── Auto-reply to incoming DMs ─────────────────────────────────────
+
+    async processDMAutoReplies(): Promise<DMAutoReplyResult> {
+        const result: DMAutoReplyResult = { processed: 0, replied: 0, skipped: 0, failed: 0, details: [] };
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.warn(`[twitter-pipeline] Browser page not available — cannot process auto-replies: ${formatError(e)}`);
+            return result;
+        }
+
+        const ourUsername = (process.env.TWITTER_BOT_USERNAME || '').toLowerCase();
+
+        // 1. Detect new messages via dual detection (DOM unread + state comparison)
+        let unreadConversations: Array<{ username: string; lastMessage: string }> = [];
+        try {
+            const detected = await checkForNewTwitterDMs(this.dm);
+            unreadConversations = detected.newMessages.map(m => ({
+                username: m.from,
+                lastMessage: m.preview
+            }));
+            if (detected.newMessages.length > 0) {
+                logger.info(`[twitter-pipeline] Detection: ${detected.unreadFromDOM} DOM-unread, ${detected.detectedByState} state-changed`);
+            }
+        } catch (e) {
+            logger.error(`[twitter-pipeline] Failed to detect new DMs: ${formatError(e)}`);
+            return result;
+        }
+
+        if (unreadConversations.length === 0) {
+            logger.info('[twitter-pipeline] Auto-reply: no new messages detected');
+            return result;
+        }
+
+        logger.info(`[twitter-pipeline] Auto-reply: ${unreadConversations.length} new conversation(s) to evaluate`);
+
+        for (const { username: rawUsername, lastMessage } of unreadConversations) {
+            const username = rawUsername.toLowerCase().replace('@', '');
+            result.processed++;
+
+            // GUARD: skip our own messages
+            if (username === ourUsername) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'own message' });
+                continue;
+            }
+
+            // GUARD: per-user cooldown
+            if (hasSentTwitterDMTo(username, AUTO_REPLY_COOLDOWN_HOURS)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `cooldown (${AUTO_REPLY_COOLDOWN_HOURS}h)` });
+                continue;
+            }
+
+            // GUARD: daily limit
+            if (getTodayTwitterDMCount() >= this.config.maxDMsPerDay) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'daily limit reached' });
+                continue;
+            }
+
+            // GUARD: max replies per run
+            if (result.replied >= AUTO_REPLY_MAX_PER_RUN) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'max replies per run reached' });
+                continue;
+            }
+
+            // GUARD: already have a pending delayed reply for this user
+            if (hasPendingReply(username, 'twitter')) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'reply already scheduled' });
+                continue;
+            }
+
+            // GUARD: opt-out detection
+            const previewLower = lastMessage.toLowerCase();
+            if (OPT_OUT_KEYWORDS.some(k => previewLower.includes(k))) {
+                logger.info(`[twitter-pipeline] Auto-reply: opt-out detected from @${username}`);
+                const rel = loadRelationship(username);
+                rel.warmth = Math.max(0, rel.warmth - 20);
+                rel.notes.push(`Opt-out detected: "${lastMessage.slice(0, 50)}" (${new Date().toISOString()})`);
+                saveRelationship(username, rel);
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'opt-out detected' });
+                continue;
+            }
+
+            // Scrape conversation thread to verify it's our turn
+            try {
+                const messages = await this.dm.scrapeThread(username, 3);
+
+                // GUARD: check it's our turn to reply (last message must be theirs)
+                if (messages.length > 0 && messages[messages.length - 1].isOurs) {
+                    result.skipped++;
+                    result.details.push({ username, action: 'skipped', reason: 'already replied (their turn)' });
+                    continue;
+                }
+
+                // Load relationship & profile
+                const relationship = loadRelationship(username);
+                if (!this.ourProfile) {
+                    this.ourProfile = await scrapeOurTwitterProfile(page);
+                }
+
+                let theirProfile: ProfileInfo;
+                try {
+                    theirProfile = await scrapeTwitterProfile(page, username);
+                } catch (e) {
+                    logger.warn(`[twitter-pipeline] Failed to scrape profile for @${username}, using minimal: ${formatError(e)}`);
+                    theirProfile = { username, fullName: username, bio: '', followerCount: 0, followingCount: 0, postCount: 0, isVerified: false };
+                }
+
+                // Get the last message from them for objective generation
+                const lastTheirMessage = [...messages].reverse().find(m => !m.isOurs);
+                const objective = getReplyObjective(relationship, lastTheirMessage?.text || lastMessage);
+
+                // Check jackpot mechanics
+                const jackpotDecision = isJackpotReply(username, 'twitter');
+                const isJackpot = jackpotDecision.jackpot;
+                if (isJackpot) {
+                    logger.info(`[twitter-pipeline] JACKPOT reply for @${username}: ${jackpotDecision.reason}`);
+                }
+
+                // Generate AI reply (with jackpot flag for enhanced response)
+                const replyMessage = await generateDMMessage({
+                    ourProfile: this.ourProfile,
+                    theirProfile,
+                    conversationHistory: messages,
+                    relationship,
+                    objective,
+                    isJackpot
+                });
+
+                // Compute VI delay and schedule instead of sending immediately
+                const delayMs = computeReplyDelay(username, 'twitter', relationship.stage, isJackpot);
+                const sendAfter = new Date(Date.now() + delayMs).toISOString();
+
+                scheduleDelayedReply({
+                    username,
+                    platform: 'twitter',
+                    replyMessage,
+                    sendAfter,
+                    context: {
+                        relationship,
+                        objective,
+                        isJackpot,
+                        theirMessage: lastTheirMessage?.text || lastMessage
+                    }
+                });
+
+                result.replied++;
+                result.details.push({ username, action: 'replied', reason: `scheduled in ${Math.round(delayMs / 60000)}min${isJackpot ? ' (jackpot)' : ''}` });
+                logger.info(`[twitter-pipeline] Scheduled reply to @${username} in ${Math.round(delayMs / 60000)}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 50)}..."`);
+
+                // Rate limit delay between processing
+                if (result.replied < AUTO_REPLY_MAX_PER_RUN) {
+                    await delay(5000); // Short delay between scheduling (not sending)
+                }
+
+            } catch (e) {
+                result.failed++;
+                result.details.push({ username, action: 'failed', reason: formatError(e) });
+                logger.error(`[twitter-pipeline] Auto-reply error for @${username}: ${formatError(e)}`);
+            }
+        }
+
+        logger.info(`[twitter-pipeline] Auto-reply complete: ${result.replied} replied, ${result.skipped} skipped, ${result.failed} failed`);
+        return result;
+    }
+
+    // ── Process delayed replies (VI schedule) ──────────────────────────
+
+    async processDelayedReplies(): Promise<{ sent: number; failed: number }> {
+        const stats = { sent: 0, failed: 0 };
+        const ready = getReadyReplies('twitter');
+
+        if (ready.length === 0) return stats;
+
+        logger.info(`[twitter-pipeline] ${ready.length} delayed reply(ies) ready to send`);
+
+        for (const entry of ready) {
+            // Recheck daily limit before each send
+            if (getTodayTwitterDMCount() >= this.config.maxDMsPerDay) {
+                logger.info(`[twitter-pipeline] Daily limit reached — deferring ${ready.length - stats.sent - stats.failed} delayed reply(ies)`);
+                break;
+            }
+
+            try {
+                const sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage);
+
+                if (sendResult.success) {
+                    markReplySent(entry.id);
+
+                    const tracked: TrackedDM = {
+                        recipientUsername: entry.username,
+                        messageText: entry.replyMessage,
+                        timestamp: new Date().toISOString(),
+                        direction: 'outbound',
+                        verified: sendResult.verified,
+                        sessionId: `auto_reply_${Date.now()}`,
+                        conversationId: entry.username,
+                        relationshipCategory: entry.context.relationship.category,
+                        approvalStatus: 'auto'
+                    };
+                    trackTwitterDM(tracked);
+                    updateWarmth(entry.username, 'message_sent');
+                    syncTwitterDMToSupabase(tracked).catch(() => {});
+                    await notifyDMAutoReply(
+                        'Twitter',
+                        entry.username,
+                        entry.context.theirMessage || '(unknown)',
+                        entry.replyMessage
+                    ).catch(() => {});
+
+                    stats.sent++;
+                    logger.info(`[twitter-pipeline] Sent delayed reply to @${entry.username} (jackpot=${entry.context.isJackpot})`);
+                } else {
+                    markReplyFailed(entry.id, sendResult.error || 'Send failed');
+                    stats.failed++;
+                    logger.error(`[twitter-pipeline] Delayed reply failed for @${entry.username}: ${sendResult.error}`);
+                }
+
+                await delay(AUTO_REPLY_DELAY_MS);
+            } catch (e) {
+                markReplyFailed(entry.id, formatError(e));
+                stats.failed++;
+                logger.error(`[twitter-pipeline] Delayed reply error for @${entry.username}: ${formatError(e)}`);
+            }
+        }
+
+        // Periodic cleanup
+        cleanupDelayedQueue();
+
+        return stats;
+    }
+
     // ── Check for replies and update feedback loop ──────────────────
 
     async checkRepliesAndUpdateFeedback(): Promise<number> {
@@ -450,6 +719,22 @@ export class TwitterDMPipeline {
         const relationshipsDir = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'relationships');
         if (!fs.existsSync(relationshipsDir)) return 0;
 
+        // Use inbox scrape to detect replies — much faster than opening individual threads
+        // The inbox shows last messages; if it doesn't start with "You:", it's a reply
+        let inboxConversations: import('../types/dm').ConversationPreview[] = [];
+        try {
+            inboxConversations = await this.dm.scrapeInbox(true); // Scroll to load all conversations
+        } catch (e) {
+            logger.warn('[twitter-pipeline] Failed to scrape inbox for feedback check: ' + formatError(e));
+        }
+
+        // Build a lookup from conversation username → last message
+        const inboxMap = new Map<string, { lastMessage: string; username: string }>();
+        for (const conv of inboxConversations) {
+            const normalizedName = conv.username.toLowerCase().replace(/[^a-z0-9_]/g, '');
+            inboxMap.set(normalizedName, { lastMessage: conv.lastMessage, username: conv.username });
+        }
+
         const userFiles = fs.readdirSync(relationshipsDir).filter(f => f.endsWith('.json'));
         for (const file of userFiles) {
             const username = file.replace('.json', '');
@@ -459,29 +744,33 @@ export class TwitterDMPipeline {
             if (outbound.length === 0) continue;
             if (trackedUsers.has(username)) continue;
 
-            // Scrape the conversation to check for replies
-            try {
-                const messages = await this.dm.scrapeThread(username, 2);
-                const theirReplies = messages.filter(m => !m.isOurs);
+            // Check if the inbox shows a reply (last message NOT from us)
+            const normalizedUsername = username.toLowerCase().replace(/[^a-z0-9_]/g, '');
+            const inboxEntry = inboxMap.get(normalizedUsername);
 
-                if (theirReplies.length > 0) {
-                    const latestReply = theirReplies[theirReplies.length - 1];
-                    const sentiment = analyzeSentiment(latestReply.text);
-                    const lastOutbound = outbound[outbound.length - 1];
-                    const hoursSince = (Date.now() - new Date(lastOutbound.timestamp).getTime()) / (1000 * 60 * 60);
+            if (inboxEntry && inboxEntry.lastMessage) {
+                const lastMsg = inboxEntry.lastMessage.trim();
+                // If the last message starts with "You:", it's our message — no reply yet
+                if (lastMsg.startsWith('You:')) continue;
 
-                    recordFeedback({
-                        messageId: lastOutbound.sessionId,
-                        recipientUsername: username,
-                        messageSentAt: lastOutbound.timestamp,
-                        gotReply: true,
-                        replyText: latestReply.text,
-                        replySentiment: sentiment,
-                        replyWithinHours: Math.round(hoursSince * 10) / 10
-                    });
-                    repliesFound++;
-                }
-            } catch (e) { logger.warn(`[twitter-pipeline] Failed to check replies for @${username}: ` + formatError(e)); }
+                // It's a reply from them
+                const sentiment = analyzeSentiment(lastMsg);
+                const lastOutbound = outbound[outbound.length - 1];
+                const hoursSince = (Date.now() - new Date(lastOutbound.timestamp).getTime()) / (1000 * 60 * 60);
+
+                recordFeedback({
+                    messageId: lastOutbound.sessionId,
+                    recipientUsername: username,
+                    messageSentAt: lastOutbound.timestamp,
+                    gotReply: true,
+                    replyText: lastMsg,
+                    replySentiment: sentiment,
+                    replyWithinHours: Math.round(hoursSince * 10) / 10
+                });
+                repliesFound++;
+
+                await notifyDMReplyReceived('Twitter', username, lastMsg, sentiment, hoursSince).catch(() => {});
+            }
         }
 
         logger.info(`[twitter-pipeline] Feedback check: ${repliesFound} new replies found`);

@@ -240,7 +240,40 @@ async function scheduledRun() {
             }
         }
 
-        // Close browser after nurture phase
+        // ── Check IG notifications + reply to replies ────────────────────
+        const IG_NOTIF_FREQUENCY = parseInt(process.env.IG_NOTIF_FREQUENCY || '3', 10);
+        if (instagramAI && runNumber % IG_NOTIF_FREQUENCY === 0) {
+            try {
+                const page = instagramAI.getPage();
+                if (page) {
+                    const {
+                        checkIGNotifications,
+                        processIGReplyNotifications,
+                    } = await import('./client/Instagram-Notifications');
+
+                    const notifResult = await checkIGNotifications(page, 20);
+                    if (notifResult.newNotifications.length > 0) {
+                        logger.info(
+                            `[scheduler] IG Notifications: ${notifResult.newNotifications.length} new ` +
+                            `(${notifResult.replies} replies, ${notifResult.likes} likes)`
+                        );
+                    }
+
+                    // IG comment reply automation disabled — focus on DM responses instead
+                    // const replyResult = await processIGReplyNotifications(page, 5);
+                    // if (replyResult.replied > 0) {
+                    //     logger.info(
+                    //         `[scheduler] IG Reply handler: ${replyResult.replied} replies sent, ` +
+                    //         `${replyResult.skipped} skipped, ${replyResult.failed} failed`
+                    //     );
+                    // }
+                }
+            } catch (notifErr) {
+                logger.warn(`[scheduler] IG notification check failed (non-fatal): ${formatError(notifErr)}`);
+            }
+        }
+
+        // Close browser after notification/nurture phase
         if (instagramAI) {
             try { await instagramAI.close(); } catch (_) { /* already closed */ }
         }

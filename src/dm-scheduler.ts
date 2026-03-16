@@ -6,11 +6,11 @@
 
 import { InstagramDM } from './client/Instagram-DM';
 import { startDMWatcher, checkForNewDMs } from './client/Instagram-DM-Watcher';
-import { DMPipeline, loadConfig, loadPendingSends } from './client/Instagram-DM-Pipeline';
-import { getTodayDMCount } from './tracking/dmTracker';
+import { DMPipeline, loadConfig, loadPendingSends, DMAutoReplyResult } from './client/Instagram-DM-Pipeline';
+import { getTodayDMCount, cleanupOldDMs } from './tracking/dmTracker';
 import { getTodayDMLimit, getDMLimitInfo } from './config/dm-limits';
 import { isGoodSendingTime, analyzeFeedbackAndLearn } from './client/Instagram-DM-Analytics';
-import { notifyStartup, notifyError } from './utils/telegram';
+import { notifyStartup, notifyError, notifyNewDM } from './utils/telegram';
 import { logger } from './utils/logger';
 import { safeReadJSON, safeWriteJSON, formatError } from './utils/errors';
 import * as path from 'path';
@@ -20,6 +20,11 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 const CHECK_INTERVAL = parseInt(process.env.DM_CHECK_INTERVAL_MINUTES || '5', 10) * 60 * 1000;
 const PIPELINE_INTERVAL = parseInt(process.env.DM_PIPELINE_INTERVAL_MINUTES || '30', 10) * 60 * 1000;
 const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'outreach_targets.json');
+let pipelineRunCount = 0;
+
+// Simple mutex to prevent watcher/pipeline from colliding on browser navigation
+let navigating = false;
+let navigatingOwner = '';
 
 (async () => {
     const config = loadConfig();
@@ -46,16 +51,74 @@ const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'outreac
         await dm.initialize();
         logger.info('[dm-scheduler] Browser initialized');
 
+        // ── One-time catch-up: reply to missed incoming DMs ──
+        try {
+            navigating = true;
+            navigatingOwner = 'catch-up';
+            const catchUpPipeline = new DMPipeline(dm, { autoApprove: true, maxDMsPerDay: getTodayDMLimit() });
+            logger.info('[dm-scheduler] Running one-time catch-up for missed replies...');
+            const catchUpResult = await catchUpPipeline.catchUpMissedReplies();
+            if (catchUpResult.replied > 0) {
+                logger.info(`[dm-scheduler] Catch-up: scheduled ${catchUpResult.replied} reply(ies), skipped ${catchUpResult.skipped}, failed ${catchUpResult.failed}`);
+                for (const d of catchUpResult.details) {
+                    logger.info(`[dm-scheduler]   @${d.username}: ${d.action} — ${d.reason || ''}`);
+                }
+            } else {
+                logger.info(`[dm-scheduler] Catch-up: no missed replies to process (skipped ${catchUpResult.skipped})`);
+            }
+        } catch (e) {
+            logger.error(`[dm-scheduler] Catch-up error (non-fatal): ${formatError(e)}`);
+        } finally {
+            navigating = false;
+        }
+
         // ── DM Watcher Loop (check for new messages) ──
         async function watcherLoop() {
             while (true) {
                 try {
+                    if (navigating) {
+                        logger.info(`[dm-scheduler] Watcher waiting — ${navigatingOwner} navigating`);
+                        await delay(10000);
+                        continue;
+                    }
+                    navigating = true;
+                    navigatingOwner = 'watcher';
+
+                    const pipeline = new DMPipeline(dm, { autoApprove: true, maxDMsPerDay: getTodayDMLimit() });
+
+                    // Process any delayed replies that are ready (VI schedule)
+                    try {
+                        const delayedResult = await pipeline.processDelayedReplies();
+                        if (delayedResult.sent > 0) {
+                            logger.info(`[dm-scheduler] Sent ${delayedResult.sent} delayed reply(ies)`);
+                        }
+                    } catch (e) {
+                        logger.error(`[dm-scheduler] Delayed reply error (non-fatal): ${formatError(e)}`);
+                    }
+
                     const { newMessages } = await checkForNewDMs(dm);
                     if (newMessages.length > 0) {
                         logger.info(`[dm-scheduler] ${newMessages.length} new message(s) detected`);
+
+                        // Notify Telegram for each new incoming DM
+                        for (const msg of newMessages) {
+                            await notifyNewDM(msg.from, msg.preview, 'Instagram').catch(() => {});
+                        }
+
+                        // Auto-reply to new incoming DMs (schedules via VI delays)
+                        try {
+                            const replyResult = await pipeline.processDMAutoReplies();
+                            if (replyResult.replied > 0) {
+                                logger.info(`[dm-scheduler] Scheduled ${replyResult.replied} reply(ies) via VI delay`);
+                            }
+                        } catch (e) {
+                            logger.error(`[dm-scheduler] Auto-reply error (non-fatal): ${formatError(e)}`);
+                        }
                     }
                 } catch (e) {
                     logger.error(`[dm-scheduler] Watcher error: ${formatError(e)}`);
+                } finally {
+                    navigating = false;
                 }
                 await delay(CHECK_INTERVAL);
             }
@@ -68,6 +131,13 @@ const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'outreac
 
             while (true) {
                 try {
+                    // Wait for watcher to finish if it's navigating
+                    while (navigating) {
+                        await delay(5000);
+                    }
+                    navigating = true;
+                    navigatingOwner = 'pipeline';
+
                     const dynamicLimit = getTodayDMLimit();
                     const pipeline = new DMPipeline(dm, { autoApprove: true, maxDMsPerDay: dynamicLimit });
                     const pConfig = { ...loadConfig(), maxDMsPerDay: dynamicLimit, autoApprove: true };
@@ -146,8 +216,36 @@ const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'dm', 'outreac
                         logger.error(`[dm-scheduler] Learning analysis error: ${formatError(e)}`);
                     }
 
+                    // 5. Periodic DM log cleanup (runs every cycle, only writes if old entries exist)
+                    try {
+                        cleanupOldDMs(90);
+                    } catch (e) {
+                        logger.warn(`[dm-scheduler] DM cleanup error (non-fatal): ${formatError(e)}`);
+                    }
+
+                    // 6. Periodic bulk sync to Supabase (every 10th pipeline cycle)
+                    pipelineRunCount++;
+                    if (pipelineRunCount % 10 === 0) {
+                        try {
+                            const { bulkSyncToSupabase } = await import('./db/supabaseDM');
+                            const syncResult = await bulkSyncToSupabase();
+                            logger.info(`[dm-scheduler] IG DM bulk sync: ${syncResult.conversations} contacts, ${syncResult.messages} msgs`);
+                        } catch (syncErr) {
+                            logger.debug(`[dm-scheduler] Bulk sync failed (non-fatal): ${formatError(syncErr)}`);
+                        }
+                        try {
+                            const { syncPendingSendsToSupabase, syncCommentsToSupabase } = await import('./db/supabaseSync');
+                            await syncPendingSendsToSupabase('instagram');
+                            await syncCommentsToSupabase('instagram');
+                        } catch (syncErr) {
+                            logger.debug(`[dm-scheduler] Periodic sync failed (non-fatal): ${formatError(syncErr)}`);
+                        }
+                    }
+
                 } catch (e) {
                     logger.error(`[dm-scheduler] Pipeline error: ${formatError(e)}`);
+                } finally {
+                    navigating = false;
                 }
 
                 await delay(PIPELINE_INTERVAL);

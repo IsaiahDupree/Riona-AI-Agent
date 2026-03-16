@@ -56,6 +56,7 @@ chrome-profile/
 chrome-profile-twitter/
 chrome-profile-threads/
 chrome-profile-niche-test/
+chrome-profile-twitter-dm/
 
 # Test scripts (ad-hoc)
 test-*.ts

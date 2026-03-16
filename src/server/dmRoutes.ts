@@ -16,6 +16,7 @@ import {
     analyzeFeedbackAndLearn, getAllLearnings, getBestSendingHours
 } from '../client/Instagram-DM-Analytics';
 import { bulkSyncToSupabase } from '../db/supabaseDM';
+import { bulkSyncTwitterToSupabase } from '../db/supabaseTwitterDM';
 
 const router = Router();
 
@@ -474,11 +475,17 @@ router.get('/analytics/timing', (_req: Request, res: Response) => {
 
 // ── Supabase Sync ───────────────────────────────────────────────────
 
-// POST /api/dm/sync — Bulk sync local data to Supabase
+// POST /api/dm/sync — Bulk sync local data to Supabase (both platforms)
 router.post('/sync', async (_req: Request, res: Response) => {
     try {
-        const result = await bulkSyncToSupabase();
-        res.json(result);
+        const [igResult, twResult] = await Promise.all([
+            bulkSyncToSupabase(),
+            bulkSyncTwitterToSupabase(),
+        ]);
+        res.json({
+            instagram: igResult,
+            twitter: twResult,
+        });
     } catch (e) {
         res.status(500).json({ error: 'Sync failed', details: e instanceof Error ? e.message : String(e) });
     }

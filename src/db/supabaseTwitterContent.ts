@@ -3,26 +3,14 @@
  * Fire-and-forget pattern matching supabaseTwitterDM.ts.
  */
 
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseClient } from './supabaseClient';
 import { logger } from '../utils/logger';
 import { withRetry, formatError } from '../utils/errors';
 import { TrackedTweet, CheckBack } from '../tracking/twitterContentTracker';
 
-let client: SupabaseClient | null = null;
-
 function getClient(): SupabaseClient | null {
-    if (client) return client;
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_KEY;
-    if (!url || !key) return null;
-
-    try {
-        client = createClient(url, key);
-        return client;
-    } catch (e) {
-        logger.warn(`[supabase-twitter-content] Client creation failed: ${formatError(e)}`);
-        return null;
-    }
+    return getSupabaseClient();
 }
 
 // ── Sync a posted tweet to Supabase ─────────────────────────────────

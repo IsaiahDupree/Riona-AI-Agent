@@ -2,19 +2,38 @@ import { Page, ElementHandle } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { screenshotPath, formatError } from '../utils/errors';
 import { DMSendResult, DMMessage, ConversationPreview } from '../types/dm';
+import * as path from 'path';
+import * as fs from 'fs';
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 const TIMEOUT = 60000;
+const TWITTER_DM_PROFILE = path.join(process.cwd(), process.env.TWITTER_DM_CHROME_PROFILE || 'chrome-profile-twitter-dm');
 
 // ── Twitter/X DM Automation ─────────────────────────────────────────
 
 export class TwitterDM {
     private page: Page | null = null;
     private browser: any = null;
+    private shared: boolean = false;
 
     constructor() {}
 
+    /**
+     * Create a TwitterDM instance that wraps an existing Puppeteer Page.
+     * Used when sharing a browser session with the main Twitter scheduler.
+     */
+    static fromPage(page: Page): TwitterDM {
+        const dm = new TwitterDM();
+        dm.page = page;
+        dm.browser = page.browser();
+        dm.shared = true;
+        return dm;
+    }
+
     async initialize(): Promise<void> {
+        if (!fs.existsSync(TWITTER_DM_PROFILE)) {
+            fs.mkdirSync(TWITTER_DM_PROFILE, { recursive: true });
+        }
         const puppeteer = await import('puppeteer');
         this.browser = await puppeteer.default.launch({
             headless: false,
@@ -24,15 +43,114 @@ export class TwitterDM {
                 '--disable-blink-features=AutomationControlled',
                 '--window-size=1280,900'
             ],
-            userDataDir: './chrome-profile'
+            userDataDir: TWITTER_DM_PROFILE
         });
         const pages = await this.browser.pages();
         this.page = pages[0] || await this.browser.newPage();
         await this.page!.setViewport({ width: 1280, height: 900 });
+
+        // Ensure we're logged in to Twitter
+        await this.ensureLoggedIn();
         logger.info('[twitter-dm] Browser initialized');
     }
 
+    /**
+     * Check if we're logged in, and if not, perform auto-login using env credentials.
+     */
+    private async ensureLoggedIn(): Promise<void> {
+        if (!this.page) return;
+
+        await this.page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: TIMEOUT });
+        await delay(2000);
+
+        const currentUrl = this.page.url();
+        if (!currentUrl.includes('/login') && !currentUrl.includes('/i/flow/login')) {
+            logger.info('[twitter-dm] Session valid (via browser profile)');
+            return;
+        }
+
+        // Need to log in
+        const username = process.env.TWITTER_BOT_USERNAME;
+        const password = process.env.TWITTER_BOT_PASSWORD;
+        if (!username || !password) {
+            throw new Error('[twitter-dm] Not logged in and no TWITTER_BOT_USERNAME/PASSWORD set');
+        }
+
+        logger.info('[twitter-dm] Session expired, logging in...');
+        await this.page.goto('https://x.com/i/flow/login', { waitUntil: 'networkidle2', timeout: TIMEOUT });
+
+        // Username
+        await this.page.waitForSelector('input[autocomplete="username"], input[name="text"]', { timeout: TIMEOUT });
+        await delay(1000);
+        const usernameInput = await this.page.$('input[autocomplete="username"]') || await this.page.$('input[name="text"]');
+        if (!usernameInput) throw new Error('[twitter-dm] Username input not found');
+        await usernameInput.type(username, { delay: 50 });
+
+        // Click Next
+        const nextBtn = await this.page.evaluateHandle(() => {
+            const buttons = document.querySelectorAll('button, [role="button"]');
+            for (const btn of buttons) {
+                if ((btn.textContent || '').trim().toLowerCase() === 'next') return btn;
+            }
+            return null;
+        });
+        if (nextBtn) {
+            await (nextBtn as ElementHandle<Element>).click();
+            await delay(2000);
+        }
+
+        // Handle verification step (unusual login)
+        const verificationInput = await this.page.$('input[data-testid="ocfEnterTextTextInput"]');
+        if (verificationInput) {
+            const verificationValue = process.env.TWITTER_BOT_EMAIL || process.env.TWITTER_BOT_PHONE || '';
+            if (verificationValue) {
+                await verificationInput.type(verificationValue, { delay: 50 });
+                const verifyNext = await this.page.$('[data-testid="ocfEnterTextNextButton"]');
+                if (verifyNext) { await verifyNext.click(); await delay(2000); }
+            } else {
+                logger.warn('[twitter-dm] Verification step but no TWITTER_BOT_EMAIL/PHONE set');
+            }
+        }
+
+        // Password
+        await this.page.waitForSelector('input[name="password"], input[type="password"]', { timeout: TIMEOUT });
+        const passwordInput = await this.page.$('input[name="password"]') || await this.page.$('input[type="password"]');
+        if (!passwordInput) throw new Error('[twitter-dm] Password input not found');
+        await passwordInput.type(password, { delay: 50 });
+
+        // Click Log in
+        const loginBtn = await this.page.$('[data-testid="LoginForm_Login_Button"]');
+        if (loginBtn) {
+            await loginBtn.click();
+        } else {
+            await this.page.evaluate(() => {
+                const buttons = document.querySelectorAll('button, [role="button"]');
+                for (const btn of buttons) {
+                    if ((btn.textContent || '').trim().toLowerCase() === 'log in') {
+                        (btn as HTMLElement).click(); return;
+                    }
+                }
+            });
+        }
+
+        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: TIMEOUT }).catch(() => {});
+        await delay(3000);
+
+        const finalUrl = this.page.url();
+        if (finalUrl.includes('/login') || finalUrl.includes('/i/flow/login')) {
+            throw new Error('[twitter-dm] Login failed — still on login page');
+        }
+
+        logger.info('[twitter-dm] Login successful');
+    }
+
     async close(): Promise<void> {
+        if (this.shared) {
+            // Don't close shared browser — owned by the main scheduler
+            this.page = null;
+            this.browser = null;
+            return;
+        }
         try {
             if (this.browser) {
                 await this.browser.close();
@@ -48,10 +166,50 @@ export class TwitterDM {
         return this.page;
     }
 
+    /**
+     * Ensure the page is still usable. If the frame is detached (stale),
+     * close extra pages/tabs and re-acquire a valid page reference.
+     */
+    async ensurePage(): Promise<Page> {
+        if (!this.browser) throw new Error('Browser not initialized');
+
+        // Quick check: try to evaluate on the current page
+        if (this.page) {
+            try {
+                await this.page.evaluate(() => document.readyState);
+                return this.page;
+            } catch (e) {
+                const msg = formatError(e);
+                if (msg.includes('detached Frame') || msg.includes('Session closed') || msg.includes('Target closed')) {
+                    logger.warn(`[twitter-dm] Page frame detached, recovering...`);
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        // Recovery: get all open pages, close extras, keep one
+        const pages = await this.browser.pages();
+        if (pages.length === 0) {
+            this.page = await this.browser.newPage();
+            await this.page!.setViewport({ width: 1280, height: 900 });
+            logger.info('[twitter-dm] Created new page after recovery');
+        } else {
+            // Use the last page (most recently active), close the rest
+            this.page = pages[pages.length - 1];
+            for (let i = 0; i < pages.length - 1; i++) {
+                try { await pages[i].close(); } catch (_) {}
+            }
+            logger.info(`[twitter-dm] Recovered page (closed ${pages.length - 1} stale pages)`);
+        }
+
+        return this.page!;
+    }
+
     // ── Navigate to DM inbox ────────────────────────────────────────
 
     async navigateToInbox(): Promise<void> {
-        if (!this.page) throw new Error('Page not initialized');
+        this.page = await this.ensurePage();
         logger.info('[twitter-dm] Navigating to inbox...');
         await this.page.goto('https://x.com/messages', {
             waitUntil: 'domcontentloaded',
@@ -59,9 +217,54 @@ export class TwitterDM {
         });
         await delay(3000);
 
+        // Handle DM PIN lock (Twitter security feature)
+        await this.handlePinPrompt();
+
         // Dismiss any pop-up dialogs
         await this.dismissDialogs();
         logger.info('[twitter-dm] Inbox loaded');
+    }
+
+    /**
+     * If Twitter shows a PIN prompt to unlock DMs, enter the PIN automatically.
+     */
+    private async handlePinPrompt(): Promise<void> {
+        if (!this.page) return;
+
+        const currentUrl = this.page.url();
+        if (!currentUrl.includes('/pin/recovery') && !currentUrl.includes('/pin')) return;
+
+        const pin = process.env.TWITTER_DM_PIN || '7911';
+        logger.info('[twitter-dm] PIN prompt detected, entering PIN...');
+
+        try {
+            // Wait for PIN input container
+            const pinInput = await this.page.$('[data-testid="pin-code-input-container"] input, input[inputmode="numeric"]');
+            if (pinInput) {
+                await pinInput.type(pin, { delay: 100 });
+                await delay(500);
+
+                // Submit PIN via Enter key (most reliable across Twitter UI variants)
+                await this.page.keyboard.press('Enter');
+                await delay(3000);
+            } else {
+                // Try typing into any visible input on the pin page
+                await this.page.keyboard.type(pin, { delay: 100 });
+                await delay(500);
+                await this.page.keyboard.press('Enter');
+                await delay(3000);
+            }
+
+            // Check if we got past the PIN
+            const afterUrl = this.page.url();
+            if (afterUrl.includes('/pin')) {
+                logger.warn('[twitter-dm] Still on PIN page after entry — PIN may be incorrect');
+            } else {
+                logger.info('[twitter-dm] PIN accepted, DMs unlocked');
+            }
+        } catch (e) {
+            logger.warn(`[twitter-dm] PIN entry failed: ${formatError(e)}`);
+        }
     }
 
     // ── Send a DM to a user by searching their name ─────────────────
@@ -172,35 +375,556 @@ export class TwitterDM {
 
     // ── Scrape conversation list from inbox ─────────────────────────
 
-    async scrapeInbox(): Promise<ConversationPreview[]> {
+    async scrapeInbox(scrollToLoadAll: boolean = false): Promise<ConversationPreview[]> {
         if (!this.page) throw new Error('Page not initialized');
         await this.navigateToInbox();
         await delay(3000);
 
-        const conversations = await this.page.evaluate(() => {
-            const results: any[] = [];
-            // Twitter/X DM sidebar has conversation items
-            const items = document.querySelectorAll('div[data-testid="conversation"], div[role="listitem"], div[role="row"]');
-            for (const item of items) {
-                const nameEl = item.querySelector('span[dir="ltr"]') || item.querySelector('span[dir="auto"]');
-                const text = (item as HTMLElement).innerText || '';
-                const lines = text.split('\n').filter((l: string) => l.trim());
+        // If scrollToLoadAll, scroll the inbox panel collecting text at each position
+        // Twitter virtualizes the list — only visible items exist in DOM at any time
+        const collectedTexts = new Set<string>();
+        if (scrollToLoadAll) {
+            const MAX_SCROLL_ATTEMPTS = 25;
+            let sameCountStreak = 0;
+            let lastCollectedSize = 0;
 
-                if (nameEl || lines.length > 0) {
-                    results.push({
-                        username: nameEl?.textContent?.trim() || lines[0] || '',
-                        lastMessage: lines.length > 1 ? lines[lines.length - 1] : '',
-                        lastMessageTime: '',
-                        unread: false,
-                        profilePicUrl: ''
-                    });
+            // Collect text at initial position first
+            const collectVisibleText = async () => {
+                return await this.page!.evaluate(() => {
+                    const panel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                    if (!panel) return '';
+                    return (panel as HTMLElement).innerText || '';
+                });
+            };
+
+            const initialText = await collectVisibleText();
+            initialText.split('\n').filter((l: string) => l.trim()).forEach(l => collectedTexts.add(l.trim()));
+
+            for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
+                // Scroll down incrementally
+                await this.page.evaluate(() => {
+                    const panel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                    if (!panel) return;
+                    const containers = panel.querySelectorAll('div');
+                    for (const c of containers) {
+                        const el = c as HTMLElement;
+                        if (el.scrollHeight > el.clientHeight + 10) {
+                            el.scrollBy(0, el.clientHeight * 0.8); // Scroll ~80% of viewport
+                            return;
+                        }
+                    }
+                });
+                await delay(1200);
+
+                // Collect text at new scroll position
+                const newText = await collectVisibleText();
+                const newLines = newText.split('\n').filter((l: string) => l.trim());
+                newLines.forEach(l => collectedTexts.add(l.trim()));
+
+                // Check if we found new content
+                if (collectedTexts.size === lastCollectedSize) {
+                    sameCountStreak++;
+                    if (sameCountStreak >= 3) break; // No more content
+                } else {
+                    sameCountStreak = 0;
+                    lastCollectedSize = collectedTexts.size;
                 }
             }
+
+            logger.info(`[twitter-dm] Scroll collected ${collectedTexts.size} unique text lines`);
+
+            // Scroll back to top for clean state
+            await this.page.evaluate(() => {
+                const panel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                if (!panel) return;
+                const containers = panel.querySelectorAll('div');
+                for (const c of containers) {
+                    const el = c as HTMLElement;
+                    if (el.scrollHeight > el.clientHeight + 10) {
+                        el.scrollTop = 0;
+                        return;
+                    }
+                }
+            });
+            await delay(1000);
+        }
+
+        const conversations = await this.page.evaluate(() => {
+            const results: any[] = [];
+
+            // Strategy 1: Try data-testid selectors (older Twitter UI)
+            let items = document.querySelectorAll(
+                'div[data-testid="conversation"], div[data-testid="cellInnerDiv"], div[role="listitem"], div[role="row"]'
+            );
+
+            // Strategy 2: New Twitter Chat UI — conversations are clickable divs
+            // inside the dm-inbox-panel with profile images and text
+            if (items.length === 0) {
+                // Find the inbox panel and look for conversation rows with images
+                const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]')
+                    || document.querySelector('[data-testid="DmScrollerContainer"]');
+                if (inboxPanel) {
+                    // Each conversation has an <a> tag or clickable div with an img (avatar)
+                    const links = inboxPanel.querySelectorAll('a[href*="/messages/"], a[href*="/i/chat/"]');
+                    if (links.length > 0) {
+                        items = links;
+                    } else {
+                        // Fallback: look for divs that contain both an image and text
+                        // Only use if we find multiple (>= 2) candidates with profile images
+                        // to avoid picking up UI chrome buttons (settings, new chat, etc.)
+                        const candidates = inboxPanel.querySelectorAll('div[role="button"], div[tabindex="0"]');
+                        const validCandidates = Array.from(candidates).filter(c => {
+                            const hasImg = c.querySelector('img') !== null;
+                            const text = (c as HTMLElement).innerText || '';
+                            const lines = text.split('\n').filter((l: string) => l.trim());
+                            return hasImg && lines.length >= 2 && text.length > 5 && text.length < 400;
+                        });
+                        if (validCandidates.length >= 2) items = validCandidates as any;
+                    }
+                }
+            }
+
+            // Strategy 3: Parse dm-inbox-panel's scrollable conversation list directly
+            // Structure: dm-inbox-panel > div(3 children) > [header, conversation-list, ?]
+            // The conversation list child contains direct children that are conversation rows
+            if (items.length === 0) {
+                const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]')
+                    || document.querySelector('[data-testid="DmScrollerContainer"]');
+                if (inboxPanel) {
+                    // Find the scrollable child that contains conversation items.
+                    // The panel typically has one wrapper div with 2-4 children:
+                    // a header (tabs like "All", "Requests"), the conversation list, etc.
+                    // The conversation list is the child with the most sub-children OR
+                    // the one containing profile images.
+                    const wrapperDiv = inboxPanel.children[0];
+                    if (wrapperDiv && wrapperDiv.children.length >= 2) {
+                        let convListEl: Element | null = null;
+                        let maxChildren = 0;
+
+                        // Find the child that contains profile images — that's the conversation list
+                        for (let i = 0; i < wrapperDiv.children.length; i++) {
+                            const child = wrapperDiv.children[i];
+                            const imgs = child.querySelectorAll('img');
+                            const hasProfileImg = Array.from(imgs).some(img => {
+                                const src = img.src || '';
+                                return src.includes('twimg') || src.includes('profile');
+                            });
+                            if (hasProfileImg && child.children.length > maxChildren) {
+                                maxChildren = child.children.length;
+                                convListEl = child;
+                            }
+                        }
+
+                        // If no child has profile images, pick the one with most children
+                        if (!convListEl) {
+                            for (let i = 0; i < wrapperDiv.children.length; i++) {
+                                const child = wrapperDiv.children[i];
+                                if (child.children.length > maxChildren) {
+                                    maxChildren = child.children.length;
+                                    convListEl = child;
+                                }
+                            }
+                        }
+
+                        if (convListEl) {
+                            // Unwrap single-child wrappers to find the actual list container
+                            let listContainer = convListEl;
+                            for (let depth = 0; depth < 3; depth++) {
+                                if (listContainer.children.length === 1 && listContainer.children[0].children.length > 1) {
+                                    listContainer = listContainer.children[0];
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            // If listContainer has mixed children (tabs + list wrapper),
+                            // find the child with the most sub-children or profile images
+                            if (listContainer.children.length >= 2 && listContainer.children.length <= 4) {
+                                let bestChild: Element | null = null;
+                                let bestScore = 0;
+                                for (let ci = 0; ci < listContainer.children.length; ci++) {
+                                    const child = listContainer.children[ci];
+                                    const childText = (child as HTMLElement).innerText || '';
+                                    const childImgs = child.querySelectorAll('img');
+                                    // Score: number of sub-children + number of images
+                                    const score = child.children.length + childImgs.length;
+                                    if (score > bestScore && childText.length > 50) {
+                                        bestScore = score;
+                                        bestChild = child;
+                                    }
+                                }
+                                // If the best child has significantly more children than others, dive in
+                                if (bestChild && bestChild.children.length >= 2) {
+                                    listContainer = bestChild;
+                                    // Unwrap again if needed
+                                    for (let depth = 0; depth < 2; depth++) {
+                                        if (listContainer.children.length === 1 && listContainer.children[0].children.length > 1) {
+                                            listContainer = listContainer.children[0];
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Each direct child of the list container is a conversation row
+                            const candidates: Element[] = [];
+                            for (let i = 0; i < listContainer.children.length; i++) {
+                                const row = listContainer.children[i] as HTMLElement;
+                                const text = row.innerText || '';
+                                const lines = text.split('\n').filter((l: string) => l.trim());
+                                // Skip header-like items (tabs: "All", "Requests", "Search", "Chat")
+                                if (lines.length <= 2 && /^(All|Requests|Search|Chat|Messages)$/i.test(lines[0]?.trim() || '')) continue;
+                                // A conversation row: has a name + some text, not too long (< 300 per row)
+                                if (lines.length >= 2 && text.length > 5 && text.length < 300) {
+                                    candidates.push(row);
+                                }
+                            }
+                            if (candidates.length >= 2) items = candidates as any;
+                        }
+                    }
+                }
+            }
+
+            // Strategy 4 (old Strategy 3): Use profile images as anchors to find conversation rows
+            if (items.length === 0) {
+                // Find all profile images in the inbox panel
+                const inboxEl = document.querySelector('[data-testid="dm-inbox-panel"]') || document.body;
+                const allImgs = inboxEl.querySelectorAll('img');
+                const profileImgs = Array.from(allImgs).filter(img => {
+                    const src = img.src || '';
+                    return src.includes('twimg') || src.includes('profile');
+                });
+
+                const seen = new Set<Element>();
+                for (const img of profileImgs) {
+                    // Walk up to find the clickable conversation row
+                    // Looking for an element that contains: 1 img + text with name + message preview
+                    let el: Element | null = img;
+                    for (let i = 0; i < 10 && el; i++) {
+                        el = el.parentElement;
+                        if (!el || seen.has(el)) continue;
+                        // Skip if this is the main inbox panel itself or the wrapper
+                        if (el.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
+                        if (el.getAttribute?.('data-testid') === 'DmScrollerContainer') break;
+
+                        const innerText = (el as HTMLElement).innerText || '';
+                        const lines = innerText.split('\n').filter((l: string) => l.trim());
+                        // A conversation row typically has 2-5 lines (name, time, message)
+                        if (lines.length >= 2 && lines.length <= 8 && innerText.length < 400) {
+                            // Verify this looks like a conversation (has name-like text)
+                            const firstLine = lines[0].trim();
+                            if (firstLine.length > 0 && firstLine.length < 50) {
+                                // Also check this element has a profile image inside
+                                const hasImg = el.querySelector('img') !== null;
+                                if (hasImg) {
+                                    seen.add(el);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (seen.size > 0) items = Array.from(seen) as any;
+            }
+
+            for (const item of items) {
+                const text = (item as HTMLElement).innerText || '';
+                const lines = text.split('\n').filter((l: string) => l.trim());
+                if (lines.length === 0) continue;
+
+                // Extract username: look for spans, or use first line of text
+                const nameEl = item.querySelector('span[dir="ltr"]') || item.querySelector('span[dir="auto"]');
+                let username = nameEl?.textContent?.trim() || '';
+
+                // If no name found via span, use the first non-empty line
+                // that doesn't look like a time indicator
+                if (!username) {
+                    for (const line of lines) {
+                        if (!/^\d+[hmd]$|^(All|Requests|Search)$/i.test(line.trim())) {
+                            username = line.trim();
+                            break;
+                        }
+                    }
+                }
+                if (!username) continue;
+
+                // Extract last message: usually the last line, or line containing "You:"
+                let lastMessage = '';
+                for (let i = lines.length - 1; i >= 0; i--) {
+                    const line = lines[i].trim();
+                    // Skip time indicators and tab labels
+                    if (/^\d+[hmd]$|^(All|Requests|Search)$/i.test(line)) continue;
+                    if (line === username) continue;
+                    lastMessage = line;
+                    break;
+                }
+
+                // ── Unread detection ──────────────────────────────
+                let unread = false;
+
+                // Method 1: Bold text detection (more than just name being bold)
+                const spans = item.querySelectorAll('span');
+                let boldCount = 0;
+                for (const span of spans) {
+                    const weight = parseInt(window.getComputedStyle(span).fontWeight) || 400;
+                    if (weight >= 700) boldCount++;
+                }
+                if (boldCount > 1) unread = true;
+
+                // Method 2: Small circular unread indicator dot
+                if (!unread) {
+                    const children = item.querySelectorAll('div, span');
+                    for (const child of children) {
+                        const rect = (child as HTMLElement).getBoundingClientRect();
+                        if (rect.width >= 4 && rect.width <= 12 && rect.height >= 4 && rect.height <= 12) {
+                            const cStyle = window.getComputedStyle(child as HTMLElement);
+                            const br = parseFloat(cStyle.borderRadius) || 0;
+                            if (br >= rect.width / 2 - 1) {
+                                const bg = cStyle.backgroundColor;
+                                if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)') {
+                                    unread = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Method 3: aria-label containing "unread"
+                if (!unread) {
+                    const ariaLabel = (item as HTMLElement).getAttribute('aria-label') || '';
+                    if (/unread/i.test(ariaLabel)) unread = true;
+                }
+
+                results.push({
+                    username,
+                    lastMessage,
+                    lastMessageTime: '',
+                    unread,
+                    profilePicUrl: ''
+                });
+            }
+
+            // Strategy 5 (final text fallback): Parse panel innerText into conversation chunks
+            // Runs when DOM-based strategies produced 0 results — most resilient to UI changes
+            if (results.length === 0) {
+                const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]')
+                    || document.querySelector('[data-testid="DmScrollerContainer"]');
+                if (inboxPanel) {
+                    const fullText = (inboxPanel as HTMLElement).innerText || '';
+                    const allLines = fullText.split('\n').filter((l: string) => l.trim());
+
+                    const headerLabels = new Set(['chat', 'search', 'all', 'requests', 'messages', 'compose', 'new message']);
+                    let startIdx = 0;
+                    while (startIdx < allLines.length && headerLabels.has(allLines[startIdx].trim().toLowerCase())) {
+                        startIdx++;
+                    }
+
+                    const isTimeIndicator = (line: string): boolean => {
+                        const t = line.trim();
+                        return /^\d+[hmdw]$/i.test(t) ||
+                            /^\d+\s*(hour|min|day|week|month|sec)/i.test(t) ||
+                            /^(yesterday|today|just now)$/i.test(t) ||
+                            /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i.test(t) ||
+                            /^\d{1,2}\/\d{1,2}/i.test(t);
+                    };
+
+                    const textConversations: Array<{name: string; time: string; message: string}> = [];
+                    let i = startIdx;
+                    while (i < allLines.length) {
+                        const candidateName = allLines[i].trim();
+                        const visibleName5 = candidateName.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+                        const isLikelyName5 = visibleName5.length > 1 && candidateName.length < 35 &&
+                            !isTimeIndicator(candidateName) &&
+                            !candidateName.startsWith('You:') &&
+                            !candidateName.startsWith('Hey') &&
+                            !candidateName.startsWith('Hi ') &&
+                            !candidateName.startsWith('We ') &&
+                            !candidateName.startsWith('I ') &&
+                            !candidateName.startsWith('```') &&
+                            !candidateName.includes('. ') &&
+                            !candidateName.includes('! ') &&
+                            !candidateName.includes('? ') &&
+                            !/^[a-z]/.test(candidateName) &&
+                            candidateName.split(' ').length <= 5 &&
+                            !headerLabels.has(candidateName.toLowerCase());
+
+                        if (isLikelyName5) {
+                            let time = '';
+                            let message = '';
+
+                            if (i + 1 < allLines.length && isTimeIndicator(allLines[i + 1].trim())) {
+                                time = allLines[i + 1].trim();
+                                if (i + 2 < allLines.length && !isTimeIndicator(allLines[i + 2].trim())) {
+                                    const nextLine = allLines[i + 2].trim();
+                                    if (i + 3 >= allLines.length || !isTimeIndicator(allLines[i + 3].trim()) || nextLine.startsWith('You:') || nextLine.length > 40) {
+                                        message = nextLine;
+                                        i += 3;
+                                    } else {
+                                        i += 2;
+                                    }
+                                } else {
+                                    i += 2;
+                                }
+                            } else if (i + 1 < allLines.length) {
+                                message = allLines[i + 1].trim();
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+
+                            textConversations.push({ name: candidateName, time, message });
+                        } else {
+                            i++;
+                        }
+                    }
+
+                    for (const conv of textConversations) {
+                        results.push({
+                            username: conv.name,
+                            lastMessage: conv.message,
+                            lastMessageTime: conv.time,
+                            unread: false,
+                            profilePicUrl: ''
+                        });
+                    }
+                }
+            }
+
             return results;
         });
 
-        logger.info(`[twitter-dm] Scraped ${conversations.length} conversations from inbox`);
+        // If scrollToLoadAll collected extra text, parse it and merge with DOM results
+        if (scrollToLoadAll && collectedTexts.size > 0) {
+            const scrollConversations = this.parseConversationText(Array.from(collectedTexts));
+            // Merge: add any conversations not already found by DOM scraping
+            const existingNames = new Set(conversations.map((c: any) => c.username.toLowerCase()));
+            for (const conv of scrollConversations) {
+                if (!existingNames.has(conv.username.toLowerCase())) {
+                    conversations.push(conv);
+                    existingNames.add(conv.username.toLowerCase());
+                }
+            }
+        }
+
+        // Debug: capture screenshot when no conversations found
+        if (conversations.length === 0) {
+            try {
+                await this.page.screenshot({ path: screenshotPath('twitter-dm-empty-inbox.png'), fullPage: false });
+                // Also log the page URL and any visible text for debugging
+                const debugInfo = await this.page.evaluate(() => {
+                    const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                    const panelChildren = inboxPanel ? Array.from(inboxPanel.children).map(c => ({
+                        tag: c.tagName,
+                        testId: c.getAttribute?.('data-testid') || '',
+                        childCount: c.children?.length || 0,
+                        text: (c as HTMLElement).innerText?.slice(0, 60) || ''
+                    })).slice(0, 10) : [];
+                    const imgs = document.querySelectorAll('img');
+                    const imgSrcs = Array.from(imgs).map(i => i.src || '').filter(s => s.includes('twimg') || s.includes('profile')).slice(0, 5);
+                    const links = document.querySelectorAll('a[href*="/messages"], a[href*="/i/chat/"]');
+                    const buttons = document.querySelectorAll('[data-testid="dm-inbox-panel"] [role="button"], [data-testid="dm-inbox-panel"] [tabindex="0"]');
+                    return {
+                        url: window.location.href,
+                        testIds: Array.from(document.querySelectorAll('[data-testid]')).map(
+                            el => el.getAttribute('data-testid')
+                        ).filter((v, i, a) => a.indexOf(v) === i).slice(0, 20),
+                        panelChildren,
+                        imgSrcs,
+                        linkCount: links.length,
+                        buttonCount: buttons.length,
+                        inboxPanelHTML: inboxPanel?.innerHTML?.slice(0, 500) || 'no panel'
+                    };
+                });
+                logger.warn(`[twitter-dm] Empty inbox scrape — URL: ${debugInfo.url}, testIds: ${debugInfo.testIds.join(', ')}`);
+                logger.warn(`[twitter-dm] Debug: ${debugInfo.linkCount} links, ${debugInfo.buttonCount} buttons, ${debugInfo.imgSrcs.length} profile imgs`);
+                logger.warn(`[twitter-dm] Panel children: ${JSON.stringify(debugInfo.panelChildren).slice(0, 300)}`);
+                logger.debug(`[twitter-dm] Panel HTML: ${debugInfo.inboxPanelHTML}`);
+            } catch (_) {}
+        }
+
+        const unreadCount = conversations.filter((c: any) => c.unread).length;
+        logger.info(`[twitter-dm] Scraped ${conversations.length} conversations from inbox (${unreadCount} unread)`);
         return conversations;
+    }
+
+    /**
+     * Parse conversation data from raw text lines (used by scroll collection and Strategy 5).
+     * Expects lines like: Name, TimeIndicator, Message preview
+     */
+    private parseConversationText(lines: string[]): ConversationPreview[] {
+        const headerLabels = new Set(['chat', 'search', 'all', 'requests', 'messages', 'compose', 'new message']);
+        const results: ConversationPreview[] = [];
+
+        // Filter and sort lines (remove headers)
+        const allLines = lines.filter(l => l.trim() && !headerLabels.has(l.trim().toLowerCase()));
+
+        const isTimeIndicator = (line: string): boolean => {
+            const t = line.trim();
+            return /^\d+[hmdw]$/i.test(t) ||
+                /^\d+\s*(hour|min|day|week|month|sec)/i.test(t) ||
+                /^(yesterday|today|just now)$/i.test(t) ||
+                /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d+/i.test(t) ||
+                /^\d{1,2}\/\d{1,2}/i.test(t);
+        };
+
+        let i = 0;
+        while (i < allLines.length) {
+            const candidateName = allLines[i].trim();
+            // A valid name: short, not a time indicator, not a message preview
+            const visibleName = candidateName.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+            const isLikelyName = visibleName.length > 1 && candidateName.length < 35 &&
+                !isTimeIndicator(candidateName) &&
+                !candidateName.startsWith('You:') &&
+                !candidateName.startsWith('Hey') &&
+                !candidateName.startsWith('Hi ') &&
+                !candidateName.startsWith('We ') &&
+                !candidateName.startsWith('I ') &&
+                !candidateName.startsWith('```') &&
+                !candidateName.includes('. ') && // Sentences have periods followed by spaces
+                !candidateName.includes('! ') && // Exclamations
+                !candidateName.includes('? ') && // Questions
+                !/^[a-z]/.test(candidateName) && // Names start with uppercase (or emoji/special)
+                candidateName.split(' ').length <= 5 && // Names rarely have 5+ words
+                !headerLabels.has(candidateName.toLowerCase());
+
+            if (isLikelyName) {
+                let time = '';
+                let message = '';
+
+                if (i + 1 < allLines.length && isTimeIndicator(allLines[i + 1].trim())) {
+                    time = allLines[i + 1].trim();
+                    if (i + 2 < allLines.length && !isTimeIndicator(allLines[i + 2].trim())) {
+                        const nextLine = allLines[i + 2].trim();
+                        if (i + 3 >= allLines.length || !isTimeIndicator(allLines[i + 3].trim()) || nextLine.startsWith('You:') || nextLine.length > 40) {
+                            message = nextLine;
+                            i += 3;
+                        } else {
+                            i += 2;
+                        }
+                    } else {
+                        i += 2;
+                    }
+                } else if (i + 1 < allLines.length) {
+                    message = allLines[i + 1].trim();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+
+                results.push({
+                    username: candidateName,
+                    lastMessage: message,
+                    lastMessageTime: time,
+                    unread: false,
+                    profilePicUrl: ''
+                });
+            } else {
+                i++;
+            }
+        }
+        return results;
     }
 
     // ── Scrape messages from a specific thread ──────────────────────
@@ -558,6 +1282,7 @@ export class TwitterDM {
         // First try: use the inbox search bar (placeholder is just "Search")
         // On /i/chat/ page, the search bar is a styled element, may need to click first
         const searchSelectors = [
+            '[data-testid="dm-search-bar"] input',
             'input[placeholder="Search"]',
             'input[placeholder="Search Direct Messages"]',
             'input[aria-label="Search"]',
@@ -578,7 +1303,13 @@ export class TwitterDM {
         // If no direct input found, try clicking the search area to activate it
         if (!searchBar) {
             const activated = await this.page.evaluate(() => {
-                // Find any element with "Search" text in the DM sidebar area
+                // First try: click the dm-search-bar testid container
+                const dmSearchBar = document.querySelector('[data-testid="dm-search-bar"]');
+                if (dmSearchBar) {
+                    (dmSearchBar as HTMLElement).click();
+                    return true;
+                }
+                // Second try: find any element with "Search" text in the DM sidebar area
                 const allEls = document.querySelectorAll('div, span, label');
                 for (const el of allEls) {
                     const text = (el as HTMLElement).innerText?.trim();
@@ -590,7 +1321,7 @@ export class TwitterDM {
                 return false;
             });
             if (activated) {
-                await delay(500);
+                await delay(1500); // Twitter needs time to expand the search input
                 // Now look for the input that appeared
                 for (const sel of searchSelectors) {
                     searchBar = await this.page.$(sel);
@@ -599,9 +1330,11 @@ export class TwitterDM {
                         break;
                     }
                 }
-                // Try generic input
+                // Try generic input anywhere in dm-inbox-panel or page
                 if (!searchBar) {
-                    searchBar = await this.page.$('input[type="text"]');
+                    searchBar = await this.page.$('[data-testid="dm-inbox-panel"] input')
+                        || await this.page.$('input[type="text"]')
+                        || await this.page.$('input[type="search"]');
                     if (searchBar) logger.info('[twitter-dm] Found search bar via generic input after activation');
                 }
             }
@@ -664,23 +1397,63 @@ export class TwitterDM {
             logger.warn('[twitter-dm] No inbox search bar found');
         }
 
-        // Second try: visually scan sidebar conversations
+        // Second try: visually scan sidebar conversations by text content
         const found = await this.page.evaluate((name: string) => {
             const nameLower = name.toLowerCase();
-            const conversations = document.querySelectorAll('div[data-testid="conversation"], a[href*="/messages/"]');
-            for (const conv of conversations) {
+
+            // Try legacy selectors first
+            const legacySelectors = 'div[data-testid="conversation"], a[href*="/messages/"], div[role="listitem"], div[role="row"]';
+            for (const conv of document.querySelectorAll(legacySelectors)) {
                 const text = (conv as HTMLElement).innerText?.toLowerCase() || '';
                 if (text.includes(nameLower)) {
                     (conv as HTMLElement).click();
                     return true;
                 }
             }
-            const items = document.querySelectorAll('div[role="listitem"], div[role="row"]');
-            for (const item of items) {
-                const text = (item as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
-                    (item as HTMLElement).click();
-                    return true;
+
+            // New Chat UI: find conversation rows inside dm-inbox-panel by text
+            const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]');
+            if (inboxPanel) {
+                // Walk through all profile images and find the one next to the target name
+                const imgs = inboxPanel.querySelectorAll('img');
+                for (const img of imgs) {
+                    // Walk up to find the conversation row containing this image
+                    let el: Element | null = img;
+                    for (let depth = 0; depth < 8 && el; depth++) {
+                        el = el.parentElement;
+                        if (!el) break;
+                        if (el.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
+                        const innerText = (el as HTMLElement).innerText?.toLowerCase() || '';
+                        // Check if this element's text contains the target name
+                        // and is a reasonable conversation row (not the whole panel)
+                        if (innerText.includes(nameLower) && innerText.length < 300) {
+                            (el as HTMLElement).click();
+                            return true;
+                        }
+                    }
+                }
+
+                // Fallback: find any element with the name text and click it
+                const allSpans = inboxPanel.querySelectorAll('span');
+                for (const span of allSpans) {
+                    const text = span.textContent?.trim().toLowerCase() || '';
+                    if (text === nameLower || text.includes(nameLower)) {
+                        // Click the closest clickable ancestor
+                        let clickTarget: HTMLElement | null = span as HTMLElement;
+                        for (let d = 0; d < 5 && clickTarget; d++) {
+                            clickTarget = clickTarget.parentElement;
+                            if (!clickTarget) break;
+                            if (clickTarget.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
+                            const style = window.getComputedStyle(clickTarget);
+                            if (style.cursor === 'pointer' || clickTarget.getAttribute('role') === 'button' || clickTarget.tabIndex >= 0) {
+                                clickTarget.click();
+                                return true;
+                            }
+                        }
+                        // If no clickable ancestor, click the span's parent
+                        (span.parentElement || span as HTMLElement).click();
+                        return true;
+                    }
                 }
             }
             return false;

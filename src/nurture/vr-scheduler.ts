@@ -33,10 +33,14 @@ export interface VRContactState {
     username: string;
     platform: 'twitter' | 'instagram';
 
-    // VR state
+    // VR state (comments)
     counter: number;           // Interactions since last reinforcement
     nextThreshold: number;     // Next N to trigger comment
     meanN: number;             // Current mean for geometric distribution (starts ~3)
+
+    // VR state (DM replies — for jackpot mechanics)
+    dmReplyCounter: number;       // DM replies since last jackpot
+    dmNextThreshold: number;      // Next N to trigger jackpot reply
 
     // Relationship health (0.0 - 1.0)
     health: number;
@@ -101,6 +105,7 @@ const HEALTH_DELTAS = {
     time_decay_per_day: -0.005, // Slow decay without interaction
     dm_reply_received: 0.10,    // They replied to our DM
     dm_ignored: -0.06,          // DM got no reply
+    we_replied: 0.05,           // We replied to their reply (strengthens relationship)
 };
 
 // ── File persistence ─────────────────────────────────────────────────
@@ -153,7 +158,12 @@ export function loadVRState(username: string, platform: 'twitter' | 'instagram')
     ensureDir();
     const fp = statePath(username, platform);
     const saved = safeReadJSON<VRContactState | null>(fp, null, 'vr_state');
-    if (saved) return saved;
+    if (saved) {
+        // Backward compat: add DM jackpot fields if missing
+        if (saved.dmReplyCounter === undefined) saved.dmReplyCounter = 0;
+        if (saved.dmNextThreshold === undefined) saved.dmNextThreshold = drawGeometric(DEFAULT_MEAN_N * 2);
+        return saved;
+    }
 
     const now = new Date().toISOString();
     const initialThreshold = drawGeometric(DEFAULT_MEAN_N);
@@ -164,6 +174,8 @@ export function loadVRState(username: string, platform: 'twitter' | 'instagram')
         counter: 0,
         nextThreshold: initialThreshold,
         meanN: DEFAULT_MEAN_N,
+        dmReplyCounter: 0,
+        dmNextThreshold: drawGeometric(DEFAULT_MEAN_N * 2),
         health: HEALTH_INITIAL,
         healthHistory: [{ value: HEALTH_INITIAL, delta: 0, reason: 'initial', at: now }],
         totalReinforcements: 0,
@@ -419,6 +431,10 @@ export function updateHealth(
     }
 
     saveVRState(state);
+
+    // RL feedback: auto-adjust meanN based on health trend
+    adjustMeanNFromHealth(username, platform);
+
     return state.health;
 }
 
@@ -538,5 +554,147 @@ export function getVRStats(platform?: 'twitter' | 'instagram'): {
         totalComments,
         totalRepliesReceived: totalReplies,
         bestArms,
+    };
+}
+
+// ── Feature: RL Meta-Optimization (health → meanN feedback loop) ────
+
+const RL_LEARNING_RATE = 0.12;
+
+/**
+ * Auto-adjust meanN based on recent health trend.
+ * Declining health → engage more (lower meanN).
+ * Rising health → space out (raise meanN).
+ */
+function adjustMeanNFromHealth(username: string, platform: 'twitter' | 'instagram'): void {
+    const state = loadVRState(username, platform);
+    const recent = state.healthHistory.slice(-5);
+    if (recent.length < 3) return; // Need enough data
+
+    const avgDelta = recent.reduce((sum, h) => sum + h.delta, 0) / recent.length;
+
+    if (avgDelta < -0.02) {
+        // Health declining → engage more (lower meanN)
+        const oldMean = state.meanN;
+        state.meanN = Math.max(MIN_MEAN_N, state.meanN - 0.5);
+        if (state.meanN !== oldMean) {
+            logger.info(`[vr-scheduler] RL: @${username} health declining (avg delta ${avgDelta.toFixed(3)}) → meanN ${oldMean.toFixed(1)} → ${state.meanN.toFixed(1)}`);
+        }
+    } else if (avgDelta > 0.02) {
+        // Health rising → space out (raise meanN)
+        const oldMean = state.meanN;
+        state.meanN = Math.min(MAX_MEAN_N, state.meanN + 0.3);
+        if (state.meanN !== oldMean) {
+            logger.info(`[vr-scheduler] RL: @${username} health rising (avg delta ${avgDelta.toFixed(3)}) → meanN ${oldMean.toFixed(1)} → ${state.meanN.toFixed(1)}`);
+        }
+    }
+
+    saveVRState(state);
+}
+
+// ── Feature: Jackpot DM Reply Mechanics ──────────────────────────────
+
+export interface JackpotDecision {
+    jackpot: boolean;
+    reason: string;
+}
+
+/**
+ * Determine if this DM reply should be a "big reward" (jackpot).
+ * Uses a separate VR counter from comment engagement.
+ * Jackpot replies are longer, more personal, higher-effort AI messages.
+ */
+export function isJackpotReply(
+    username: string,
+    platform: 'twitter' | 'instagram',
+): JackpotDecision {
+    const state = loadVRState(username, platform);
+
+    state.dmReplyCounter++;
+
+    if (state.dmReplyCounter >= state.dmNextThreshold) {
+        // Jackpot! Reset and draw next threshold
+        state.dmReplyCounter = 0;
+        // Jackpots are rarer than comment reinforcements — use 2x meanN
+        const jackpotMeanN = Math.max(MIN_MEAN_N, state.meanN * 2);
+        state.dmNextThreshold = drawGeometric(jackpotMeanN);
+
+        saveVRState(state);
+        logger.info(`[vr-scheduler] JACKPOT reply for @${username} | nextN=${state.dmNextThreshold} | meanN=${jackpotMeanN.toFixed(1)}`);
+
+        return {
+            jackpot: true,
+            reason: `VR threshold reached (counter was ${state.dmNextThreshold})`,
+        };
+    }
+
+    saveVRState(state);
+    return {
+        jackpot: false,
+        reason: `Counter ${state.dmReplyCounter}/${state.dmNextThreshold} — standard reply`,
+    };
+}
+
+// ── Feature: Offer Readiness Score ──────────────────────────────────
+
+export interface OfferReadinessResult {
+    score: number; // 0.0 - 1.0
+    breakdown: {
+        healthComponent: number;
+        tierComponent: number;
+        velocityComponent: number;
+        sentimentComponent: number;
+    };
+}
+
+const TIER_WEIGHTS: Record<string, number> = {
+    acquaintance: 0,
+    casual_friend: 0.2,
+    close_friend: 0.5,
+    inner_circle: 0.8,
+};
+
+/**
+ * Compute how ready a contact is to receive an offer.
+ * Combines health, tier, engagement velocity, and sentiment ratio.
+ */
+export function computeOfferReadiness(
+    username: string,
+    platform: 'twitter' | 'instagram',
+): OfferReadinessResult {
+    const state = loadVRState(username, platform);
+
+    // Health component (0-1)
+    const healthComponent = state.health;
+
+    // Tier component — load nurture profile if available
+    let tierComponent = 0;
+    try {
+        const { loadNurtureProfile } = require('./store');
+        const profile = loadNurtureProfile(username, platform);
+        tierComponent = TIER_WEIGHTS[profile.tier] ?? 0;
+    } catch (_) { /* nurture not initialized */ }
+
+    // Engagement velocity: count positive events in last 14 days
+    const twoWeeksAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const recentHistory = state.healthHistory.filter(h => new Date(h.at).getTime() > twoWeeksAgo);
+    const positiveEvents = recentHistory.filter(h => h.delta > 0).length;
+    // Normalize: 10+ positive events in 14 days = max velocity
+    const velocityComponent = Math.min(1, positiveEvents / 10);
+
+    // Sentiment ratio: proportion of positive events in recent history
+    const totalRecent = recentHistory.length;
+    const sentimentComponent = totalRecent > 0 ? positiveEvents / totalRecent : 0.5;
+
+    const score = Math.min(1, Math.max(0,
+        (healthComponent * 0.35) +
+        (tierComponent * 0.25) +
+        (velocityComponent * 0.25) +
+        (sentimentComponent * 0.15)
+    ));
+
+    return {
+        score,
+        breakdown: { healthComponent, tierComponent, velocityComponent, sentimentComponent },
     };
 }

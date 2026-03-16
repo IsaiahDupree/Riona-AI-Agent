@@ -5,9 +5,10 @@
  */
 
 import { TwitterDM } from './client/Twitter-DM';
+import { checkForNewTwitterDMs, initializeTwitterWatcherState } from './client/Twitter-DM-Watcher';
 import { TwitterDMPipeline, loadConfig as loadPipelineConfig } from './client/Twitter-DM-Pipeline';
 import { collectNicheProspects } from './client/Twitter-AI';
-import { getTodayTwitterDMCount } from './tracking/twitterDMTracker';
+import { getTodayTwitterDMCount, cleanupOldTwitterDMs } from './tracking/twitterDMTracker';
 import { getTodayDMLimit, getDMLimitInfo } from './config/dm-limits';
 import { notifyNewDM, notifyError, notifyStartup } from './utils/telegram';
 import { logger } from './utils/logger';
@@ -20,6 +21,7 @@ const CHECK_INTERVAL = parseInt(process.env.TWITTER_DM_CHECK_INTERVAL_MINUTES ||
 const PIPELINE_INTERVAL = parseInt(process.env.TWITTER_DM_PIPELINE_INTERVAL_MINUTES || '30', 10) * 60 * 1000;
 const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
 const AUTO_APPROVE = process.env.TWITTER_DM_AUTO_APPROVE === 'true';
+let twitterDmPipelineRunCount = 0;
 const NICHE_HASHTAGS = (process.env.TWITTER_NICHE_HASHTAGS || '').split(',').map(h => h.trim()).filter(Boolean);
 
 // Simple mutex to prevent watcher/pipeline from colliding on navigation
@@ -62,6 +64,14 @@ function saveTargets(targets: string[]) {
 
         const pipeline = new TwitterDMPipeline(dm, pipelineConfig);
 
+        // Initialize watcher state on first run (establishes baseline without triggering replies)
+        try {
+            await initializeTwitterWatcherState(dm);
+            logger.info('[twitter-dm-scheduler] Watcher state initialized');
+        } catch (e) {
+            logger.warn(`[twitter-dm-scheduler] Watcher state init failed (non-fatal): ${formatError(e)}`);
+        }
+
         // ── DM Watcher Loop (check for new messages) ──
         async function watcherLoop() {
             while (true) {
@@ -75,7 +85,8 @@ function saveTargets(targets: string[]) {
                     navigatingOwner = 'watcher';
 
                     // Quick badge check before full inbox scrape
-                    const page = dm.getPage();
+                    let page;
+                    try { page = await dm.ensurePage(); } catch (_) { page = null; }
                     if (page) {
                         try {
                             const { readTwitterBadges } = await import('./client/NotificationBadgeReader');
@@ -86,17 +97,38 @@ function saveTargets(targets: string[]) {
                         } catch (_) { /* non-fatal */ }
                     }
 
+                    // Process any delayed replies that are ready (VI schedule)
+                    try {
+                        const delayedResult = await pipeline.processDelayedReplies();
+                        if (delayedResult.sent > 0) {
+                            logger.info(`[twitter-dm-scheduler] Sent ${delayedResult.sent} delayed reply(ies)`);
+                        }
+                    } catch (e) {
+                        logger.error(`[twitter-dm-scheduler] Delayed reply error (non-fatal): ${formatError(e)}`);
+                    }
+
+                    // Check for new messages using dual detection (DOM unread + state comparison)
                     logger.info('[twitter-dm-scheduler] Checking inbox for new messages...');
-                    const conversations = await dm.scrapeInbox();
-                    const unread = conversations.filter(c => c.unread);
-                    if (unread.length > 0) {
-                        logger.info(`[twitter-dm-scheduler] ${unread.length} unread conversation(s) detected`);
-                        for (const conv of unread) {
-                            logger.info(`[twitter-dm-scheduler] Unread from: ${conv.username} — "${conv.lastMessage.slice(0, 50)}"`);
-                            await notifyNewDM(conv.username, conv.lastMessage).catch(() => {});
+                    const detected = await checkForNewTwitterDMs(dm);
+
+                    if (detected.newMessages.length > 0) {
+                        logger.info(`[twitter-dm-scheduler] ${detected.newMessages.length} new message(s) detected (DOM: ${detected.unreadFromDOM}, state: ${detected.detectedByState})`);
+                        for (const msg of detected.newMessages) {
+                            logger.info(`[twitter-dm-scheduler] New from: ${msg.from} — "${msg.preview.slice(0, 50)}"`);
+                            await notifyNewDM(msg.from, msg.preview, 'Twitter').catch(() => {});
+                        }
+
+                        // Auto-reply to new DMs (schedules via VI delays)
+                        try {
+                            const replyResult = await pipeline.processDMAutoReplies();
+                            if (replyResult.replied > 0) {
+                                logger.info(`[twitter-dm-scheduler] Scheduled ${replyResult.replied} reply(ies) via VI delay`);
+                            }
+                        } catch (e) {
+                            logger.error(`[twitter-dm-scheduler] Auto-reply error (non-fatal): ${formatError(e)}`);
                         }
                     } else {
-                        logger.info(`[twitter-dm-scheduler] No new messages (${conversations.length} conversations total)`);
+                        logger.info('[twitter-dm-scheduler] No new messages');
                     }
                 } catch (e) {
                     logger.error(`[twitter-dm-scheduler] Watcher error: ${formatError(e)}`);
@@ -153,9 +185,10 @@ function saveTargets(targets: string[]) {
                                 nicheIndex++;
                                 logger.info(`[twitter-dm-scheduler] Auto-collecting prospects for "${searchTerm}"`);
                                 try {
-                                    const page = dm.getPage();
-                                    if (page) {
-                                        await collectNicheProspects(page, searchTerm, 20);
+                                    let prospectPage;
+                                    try { prospectPage = await dm.ensurePage(); } catch (_) { prospectPage = null; }
+                                    if (prospectPage) {
+                                        await collectNicheProspects(prospectPage, searchTerm, 20);
                                         targets = loadTargets();
                                     }
                                 } catch (e) {
@@ -220,6 +253,31 @@ function saveTargets(targets: string[]) {
                         if (demoted.length > 0) logger.info(`[twitter-dm-scheduler] Tier demotions: ${demoted.join(', ')}`);
                     } catch (e) {
                         logger.warn(`[twitter-dm-scheduler] Tier evaluation error (non-fatal): ${formatError(e)}`);
+                    }
+
+                    // 6. Periodic DM log cleanup
+                    try {
+                        cleanupOldTwitterDMs(90);
+                    } catch (e) {
+                        logger.warn(`[twitter-dm-scheduler] DM cleanup error (non-fatal): ${formatError(e)}`);
+                    }
+
+                    // 7. Periodic bulk sync to Supabase (every 10th pipeline cycle)
+                    twitterDmPipelineRunCount++;
+                    if (twitterDmPipelineRunCount % 10 === 0) {
+                        try {
+                            const { bulkSyncTwitterToSupabase } = await import('./db/supabaseTwitterDM');
+                            const syncResult = await bulkSyncTwitterToSupabase();
+                            logger.info(`[twitter-dm-scheduler] Bulk sync: ${syncResult.conversations} contacts, ${syncResult.messages} msgs`);
+                        } catch (syncErr) {
+                            logger.debug(`[twitter-dm-scheduler] Bulk sync failed (non-fatal): ${formatError(syncErr)}`);
+                        }
+                        try {
+                            const { syncPendingSendsToSupabase } = await import('./db/supabaseSync');
+                            await syncPendingSendsToSupabase('twitter');
+                        } catch (syncErr) {
+                            logger.debug(`[twitter-dm-scheduler] Pending sends sync failed (non-fatal): ${formatError(syncErr)}`);
+                        }
                     }
 
                 } catch (e) {

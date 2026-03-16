@@ -173,3 +173,31 @@ export function swallowWith<T>(label: string, fallback: T): (error: unknown) => 
         return fallback;
     };
 }
+
+// ── Prompt Injection Sanitization ───────────────────────────────────
+
+/**
+ * Sanitize user-controlled text before interpolating into AI prompts.
+ * Strips patterns that could override system instructions:
+ * - Fake role markers (System:, Assistant:, etc.)
+ * - Instruction override phrases
+ * - Excessive length (truncated)
+ */
+export function sanitizeForPrompt(text: string, maxLength: number = 500): string {
+    if (!text) return '';
+
+    let cleaned = text.slice(0, maxLength);
+
+    // Strip fake role/instruction markers at line starts
+    cleaned = cleaned.replace(/^(system|assistant|user|human|instruction|prompt)\s*:/gim, '[filtered]:');
+
+    // Strip common injection phrases
+    cleaned = cleaned.replace(/ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|rules?|prompts?)/gi, '[filtered]');
+    cleaned = cleaned.replace(/override\s+(all\s+)?(safety|system|previous)/gi, '[filtered]');
+    cleaned = cleaned.replace(/you\s+are\s+now\s+/gi, '[filtered] ');
+    cleaned = cleaned.replace(/forget\s+(everything|all|your)\s+(above|previous|prior|instructions?)/gi, '[filtered]');
+    cleaned = cleaned.replace(/new\s+instructions?\s*:/gi, '[filtered]:');
+    cleaned = cleaned.replace(/disregard\s+(all|any|previous|prior)/gi, '[filtered]');
+
+    return cleaned.trim();
+}

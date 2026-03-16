@@ -10,6 +10,8 @@ import {
     TrackedTweet,
     TweetEngagement,
     getPerformanceByType,
+    getTopPerformers,
+    getBottomPerformers,
 } from '../tracking/twitterContentTracker';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -135,41 +137,88 @@ export function analyzeContentPerformance(): ContentLearning[] {
 
 /**
  * Returns formatted string for AI prompt injection based on past performance.
+ * Includes aggregate stats + top/bottom tweet examples for concrete guidance.
  */
 export function getContentLearningContext(contentType?: string, style?: string): string {
     const learnings = safeReadJSON<ContentLearning[]>(LEARNINGS_FILE, [], 'content_learnings');
-    if (learnings.length === 0) return '';
 
     const parts: string[] = [];
 
-    // Find relevant learning
-    if (contentType && style) {
-        const specific = learnings.find(l => l.contentType === contentType && l.style === style);
-        if (specific) {
-            parts.push(`Your ${style} ${contentType} tweets avg ${specific.avgLikes} likes, ${specific.avgRetweets} RTs (${specific.sampleSize} samples, ${specific.engagementRate}% engagement rate).`);
-            if (specific.bestTopics.length > 0) {
-                parts.push(`Best topics: ${specific.bestTopics.join(', ')}.`);
+    // Aggregate stats from learnings
+    if (learnings.length > 0) {
+        if (contentType && style) {
+            const specific = learnings.find(l => l.contentType === contentType && l.style === style);
+            if (specific) {
+                parts.push(`Your ${style} ${contentType} tweets avg ${specific.avgLikes} likes, ${specific.avgRetweets} RTs (${specific.sampleSize} samples, ${specific.engagementRate}% engagement rate).`);
+                if (specific.bestTopics.length > 0) {
+                    parts.push(`Best topics: ${specific.bestTopics.join(', ')}.`);
+                }
             }
         }
-    }
 
-    // Compare across types
-    const sorted = [...learnings].sort((a, b) => b.engagementRate - a.engagementRate);
-    if (sorted.length >= 2) {
-        const best = sorted[0];
-        const worst = sorted[sorted.length - 1];
-        if (best.engagementRate > worst.engagementRate * 1.5) {
-            parts.push(`${best.style} ${best.contentType} tweets outperform ${worst.style} ${worst.contentType} (${best.engagementRate}% vs ${worst.engagementRate}% engagement).`);
+        // Compare across types
+        const sorted = [...learnings].sort((a, b) => b.engagementRate - a.engagementRate);
+        if (sorted.length >= 2) {
+            const best = sorted[0];
+            const worst = sorted[sorted.length - 1];
+            if (best.engagementRate > worst.engagementRate * 1.5) {
+                parts.push(`${best.style} ${best.contentType} tweets outperform ${worst.style} ${worst.contentType} (${best.engagementRate}% vs ${worst.engagementRate}% engagement).`);
+            }
+        }
+
+        // Highlight question tweets if they drive replies
+        const questionLearning = learnings.find(l => l.style === 'question');
+        if (questionLearning && contentType !== 'engagement') {
+            parts.push(`Questions get ${questionLearning.avgLikes} likes avg — consider ending with a question.`);
         }
     }
 
-    // Highlight question tweets if they drive replies
-    const questionLearning = learnings.find(l => l.style === 'question');
-    if (questionLearning && contentType !== 'engagement') {
-        parts.push(`Questions get ${questionLearning.avgLikes} likes avg — consider ending with a question.`);
-    }
+    // Top performer examples — show the AI what worked
+    try {
+        const top = getTopPerformers(3);
+        if (top.length > 0) {
+            parts.push('\nYour best-performing tweets (study and emulate the tone/structure):');
+            for (const tweet of top) {
+                const cb = tweet.checkBacks.find(c => c.period === '24_hours' && c.metrics);
+                if (cb?.metrics) {
+                    const text = tweet.text.slice(0, 200);
+                    parts.push(`- "${text}" (${cb.metrics.likes}L, ${cb.metrics.retweets}RT, ${cb.metrics.replies}R, ${cb.metrics.views}V)`);
+                }
+            }
+        }
+    } catch (_) { /* tracker not populated yet */ }
+
+    // Bottom performer examples — show the AI what to avoid
+    try {
+        const bottom = getBottomPerformers(3);
+        if (bottom.length > 0) {
+            // Only show bottom if they're meaningfully worse than top
+            const topScore = (() => {
+                try { const t = getTopPerformers(1); return t[0] ? engagementScoreFromTweet(t[0]) : 0; } catch { return 0; }
+            })();
+            const bottomScore = engagementScoreFromTweet(bottom[0]);
+
+            if (topScore > 0 && bottomScore < topScore * 0.3) {
+                parts.push('\nYour worst-performing tweets (avoid this style/structure):');
+                for (const tweet of bottom) {
+                    const cb = tweet.checkBacks.find(c => c.period === '24_hours' && c.metrics);
+                    if (cb?.metrics) {
+                        const text = tweet.text.slice(0, 200);
+                        parts.push(`- "${text}" (${cb.metrics.likes}L, ${cb.metrics.retweets}RT, ${cb.metrics.replies}R, ${cb.metrics.views}V)`);
+                    }
+                }
+            }
+        }
+    } catch (_) { /* tracker not populated yet */ }
 
     return parts.length > 0 ? `Performance insights: ${parts.join(' ')}` : '';
+}
+
+/** Helper to compute engagement score from a TrackedTweet */
+function engagementScoreFromTweet(tweet: TrackedTweet): number {
+    const cb = tweet.checkBacks.find(c => c.period === '24_hours' && c.metrics);
+    if (!cb?.metrics) return 0;
+    return cb.metrics.likes + cb.metrics.retweets * 2 + cb.metrics.replies * 3;
 }
 
 // ── Offer performance ───────────────────────────────────────────────

@@ -100,7 +100,7 @@ export async function notifyRunComplete(summary: RunSummary): Promise<void> {
 }
 
 export async function notifyDailyTargetReached(platform: string, total: number, target: number, verified: number): Promise<void> {
-    const icon = platform === 'Instagram' ? '📸' : '🧵';
+    const icon = platformIcon(platform);
     const msg = `🎯 ${icon} <b>${platform} Daily Target Reached!</b>\n\n` +
         `💬 Total: <b>${total}/${target}</b>\n` +
         `✅ Verified: ${verified}\n` +
@@ -110,13 +110,13 @@ export async function notifyDailyTargetReached(platform: string, total: number, 
 }
 
 export async function notifyError(platform: string, error: string): Promise<void> {
-    const icon = platform === 'Instagram' ? '📸' : '🧵';
+    const icon = platformIcon(platform);
     const msg = `🚨 ${icon} <b>${platform} Error</b>\n\n${escapeHtml(error.slice(0, 500))}`;
     await sendTelegram(msg);
 }
 
 export async function notifyStartup(platform: string, target: number, postsPerRun: number, intervalMin: number): Promise<void> {
-    const icon = platform === 'Instagram' ? '📸' : '🧵';
+    const icon = platformIcon(platform);
     const msg = `🟢 ${icon} <b>${platform} Scheduler Started</b>\n\n` +
         `🎯 Target: ${target}/day\n` +
         `📝 Posts/run: ${postsPerRun}\n` +
@@ -127,28 +127,100 @@ export async function notifyStartup(platform: string, target: number, postsPerRu
 
 // ── DM Notifications ─────────────────────────────────────────────────
 
-export async function notifyNewDM(from: string, preview: string): Promise<void> {
-    const msg = `📩 <b>New Instagram DM</b>\n\n` +
+export async function notifyNewDM(from: string, preview: string, platform: string = 'Instagram'): Promise<void> {
+    const icon = platformIcon(platform);
+    const msg = `📩 ${icon} <b>New ${platform} DM</b>\n\n` +
         `From: <b>@${escapeHtml(from)}</b>\n` +
         `Message: ${escapeHtml(preview.slice(0, 200))}`;
     await sendTelegram(msg);
 }
 
-export async function notifyDMSent(to: string, message: string, verified: boolean): Promise<void> {
-    const icon = verified ? '✅' : '⚠️';
-    const msg = `${icon} <b>DM Sent</b>\n\n` +
+export async function notifyDMSent(to: string, message: string, verified: boolean, platform: string = 'Instagram'): Promise<void> {
+    const statusIcon = verified ? '✅' : '⚠️';
+    const icon = platformIcon(platform);
+    const msg = `${statusIcon} ${icon} <b>${platform} DM Sent</b>\n\n` +
         `To: <b>@${escapeHtml(to)}</b>\n` +
         `Message: ${escapeHtml(message.slice(0, 200))}\n` +
         `Verified: ${verified ? 'Yes' : 'No'}`;
     await sendTelegram(msg);
 }
 
-export async function notifyDMApprovalNeeded(to: string, proposedMessage: string, approvalId: string): Promise<void> {
-    const msg = `🔔 <b>DM Approval Needed</b>\n\n` +
+export async function notifyDMApprovalNeeded(to: string, proposedMessage: string, approvalId: string, platform: string = 'Instagram'): Promise<void> {
+    const icon = platformIcon(platform);
+    const msg = `🔔 ${icon} <b>${platform} DM Approval Needed</b>\n\n` +
         `To: <b>@${escapeHtml(to)}</b>\n` +
         `Proposed: ${escapeHtml(proposedMessage.slice(0, 200))}\n\n` +
         `ID: <code>${approvalId}</code>`;
     await sendTelegram(msg);
+}
+
+export async function notifyDMAutoReply(platform: string, from: string, theirMessage: string, ourReply: string, delayMinutes?: number): Promise<void> {
+    const icon = platformIcon(platform);
+    let msg = `💬 ${icon} <b>${platform} Auto-Reply</b>\n\n`;
+    msg += `👤 <b>@${escapeHtml(from)}</b> said:\n`;
+    msg += `<i>${escapeHtml(theirMessage.slice(0, 200))}</i>\n\n`;
+    msg += `🤖 Our reply:\n`;
+    msg += `${escapeHtml(ourReply.slice(0, 200))}`;
+    if (delayMinutes) msg += `\n\n⏱ Scheduled after ${delayMinutes}m delay`;
+    await sendTelegram(msg);
+}
+
+export async function notifyDMReplyReceived(platform: string, from: string, theirReply: string, sentiment: string, hoursSince?: number): Promise<void> {
+    const icon = platformIcon(platform);
+    const sentimentIcon = sentiment === 'positive' ? '😊' : sentiment === 'negative' ? '😟' : '😐';
+    let msg = `📨 ${icon} <b>${platform} Reply Received</b>\n\n`;
+    msg += `👤 <b>@${escapeHtml(from)}</b> replied:\n`;
+    msg += `<i>${escapeHtml(theirReply.slice(0, 200))}</i>\n\n`;
+    msg += `${sentimentIcon} Sentiment: ${sentiment}`;
+    if (hoursSince) msg += `\n⏱ ${Math.round(hoursSince)}h after our message`;
+    await sendTelegram(msg);
+}
+
+// ── Strategic Content Notifications ──────────────────────────────────
+
+export async function notifyContentPosted(platform: string, contentType: string, style: string, text: string, tweetUrl?: string): Promise<void> {
+    const icon = platformIcon(platform);
+    let msg = `📝 ${icon} <b>${platform} Content Posted</b>\n\n`;
+    msg += `Type: ${contentType}/${style}\n`;
+    msg += `Text: ${escapeHtml(text.slice(0, 250))}`;
+    if (tweetUrl) msg += `\n🔗 ${escapeHtml(tweetUrl)}`;
+    await sendTelegram(msg);
+}
+
+export async function notifyNurtureActivity(platform: string, commentsPosted: number, contactsVisited: number, details?: string): Promise<void> {
+    if (commentsPosted === 0) return;
+    const icon = platformIcon(platform);
+    let msg = `🌱 ${icon} <b>${platform} Nurture Activity</b>\n\n`;
+    msg += `💬 Comments: ${commentsPosted}\n`;
+    msg += `👥 Contacts visited: ${contactsVisited}`;
+    if (details) msg += `\n${escapeHtml(details.slice(0, 200))}`;
+    await sendTelegram(msg);
+}
+
+export async function notifyContentAnalysis(platform: string, learningsCount: number, topTweet?: string, topEngagement?: string): Promise<void> {
+    if (learningsCount === 0) return;
+    const icon = platformIcon(platform);
+    let msg = `📊 ${icon} <b>${platform} Content Analysis</b>\n\n`;
+    msg += `📈 ${learningsCount} learning(s) generated\n`;
+    if (topTweet) msg += `\n🏆 Top: "${escapeHtml(topTweet.slice(0, 150))}"\n${topEngagement || ''}`;
+    await sendTelegram(msg);
+}
+
+export async function notifyEngagementCheckBacks(platform: string, processed: number, avgLikes: number, avgRetweets: number): Promise<void> {
+    if (processed === 0) return;
+    const icon = platformIcon(platform);
+    const msg = `🔄 ${icon} <b>${platform} Engagement Check</b>\n\n` +
+        `Checked: ${processed} tweet(s)\n` +
+        `Avg: ${avgLikes} likes, ${avgRetweets} RTs`;
+    await sendTelegram(msg);
+}
+
+function platformIcon(platform: string): string {
+    const lower = platform.toLowerCase();
+    if (lower.includes('instagram')) return '📸';
+    if (lower.includes('twitter')) return '🐦';
+    if (lower.includes('threads')) return '🧵';
+    return '📱';
 }
 
 function progressBar(pct: number): string {

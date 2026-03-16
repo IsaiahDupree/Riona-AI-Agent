@@ -101,11 +101,13 @@ export function evaluateTier(
         const meetsEngagement = engagementWithOurContent >= threshold.minEngagementWithOurContent;
         const meetsTime = daysSinceCreated >= threshold.minDaysSinceFirstContact;
 
-        if (meetsReplies && meetsSentiment && meetsDepth && meetsTime) {
+        if (meetsReplies && meetsSentiment && meetsDepth && meetsEngagement && meetsTime) {
             const nextTier = TIER_ORDER[currentIndex + 1];
-            if (meetsReplies) reasons.push(`${replyCount} replies (need ${threshold.minReplyCount})`);
-            if (meetsSentiment) reasons.push(`${Math.round(positiveSentimentRatio * 100)}% positive`);
-            if (meetsDepth) reasons.push(`depth ${profile.depth.conversationQualityScore}+${depthBonus} bonus`);
+            reasons.push(`${replyCount} replies (need ${threshold.minReplyCount})`);
+            reasons.push(`${Math.round(positiveSentimentRatio * 100)}% positive (need ${Math.round(threshold.minPositiveSentimentRatio * 100)}%)`);
+            reasons.push(`depth ${profile.depth.conversationQualityScore}+${depthBonus} (need ${threshold.minConversationDepthScore})`);
+            reasons.push(`${engagementWithOurContent} engagements (need ${threshold.minEngagementWithOurContent})`);
+            reasons.push(`${Math.round(daysSinceCreated)}d (need ${threshold.minDaysSinceFirstContact}d)`);
 
             return { shouldPromote: true, shouldDemote: false, nextTier, reasons };
         }
@@ -161,6 +163,7 @@ export function demoteTier(username: string, platform: 'twitter' | 'instagram'):
     const now = new Date().toISOString();
 
     profile.tier = newTier;
+    profile.tierPromotedAt = now; // Reset inactivity clock to demotion time
     profile.tierHistory.push({ tier: newTier, at: now });
 
     const config = TIER_CONFIGS[newTier];
@@ -205,12 +208,18 @@ export function runTierEvaluation(platform?: 'twitter' | 'instagram'): {
     const demoted: string[] = [];
 
     for (const profile of profiles) {
-        // Use depth metrics as a proxy for reply count and sentiment
-        // In production, this should read from the actual DM tracker
         const replyCount = profile.depth.exchangeCount;
         const sentimentRatio = profile.depth.personalDisclosureLevel > 50 ? 0.7 : 0.4;
 
-        const evaluation = evaluateTier(profile, replyCount, sentimentRatio);
+        // Read engagement from VR health history (positive events = engagement with our content)
+        let engagement = 0;
+        try {
+            const { loadVRState } = require('./vr-scheduler');
+            const vrState = loadVRState(profile.username, profile.platform);
+            engagement = vrState.totalRepliesReceived;
+        } catch (_) { /* VR not initialized */ }
+
+        const evaluation = evaluateTier(profile, replyCount, sentimentRatio, engagement);
 
         if (evaluation.shouldPromote) {
             promoteTier(profile.username, profile.platform);

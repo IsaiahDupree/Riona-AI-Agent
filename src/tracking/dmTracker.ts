@@ -51,9 +51,11 @@ export function trackDM(dm: TrackedDM) {
 }
 
 export function getTodayDMCount(): number {
-    const today = todayStr();
     const dms = loadDMs();
-    return dms.filter(d => d.direction === 'outbound' && d.timestamp.startsWith(today)).length;
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const cutoff = todayStart.getTime();
+    return dms.filter(d => d.direction === 'outbound' && new Date(d.timestamp).getTime() >= cutoff).length;
 }
 
 export function getAllDMs(): TrackedDM[] {
