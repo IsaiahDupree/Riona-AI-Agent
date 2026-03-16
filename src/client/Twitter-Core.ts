@@ -1092,6 +1092,10 @@ export async function postTweet(
             return { success: false, error: 'Tweet compose textarea not found' };
         }
 
+        // Ensure input is focused before typing — prevents front truncation
+        await textInput.click();
+        await delay(500);
+
         // If this is a quote tweet, paste the URL first, then the text
         if (options.quoteTweetUrl) {
             await page.keyboard.type(options.text + '\n' + options.quoteTweetUrl, { delay: getRandomDelay(15, 40) });
@@ -1283,7 +1287,7 @@ export async function quoteTweet(
 
         // Type the commentary
         await quoteInput.click();
-        await delay(300);
+        await delay(500);
         await page.keyboard.type(commentary, { delay: getRandomDelay(15, 40) });
         await delay(1000);
 
@@ -1369,6 +1373,8 @@ export async function postThread(
             return { success: false, error: 'Compose textarea not found for thread' };
         }
 
+        await firstInput.click();
+        await delay(500);
         await page.keyboard.type(tweets[0].text, { delay: getRandomDelay(15, 40) });
         await delay(500);
 

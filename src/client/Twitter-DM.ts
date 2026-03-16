@@ -1555,11 +1555,43 @@ export class TwitterDM {
             return false;
         }
 
-        // Click to focus and type
+        // Focus the input reliably — Twitter's DM input can swallow early keystrokes
+        await msgInput.click();
+        await delay(300);
+        // Triple-click to select any existing text, then clear it
+        await msgInput.click({ clickCount: 3 });
+        await delay(200);
+        await this.page.keyboard.press('Backspace');
+        await delay(300);
+        // Click again to ensure cursor is properly positioned
         await msgInput.click();
         await delay(500);
+
+        // Type the message
         await this.page.keyboard.type(message, { delay: 40 });
         await delay(1000);
+
+        // Verify the typed text wasn't truncated at the front
+        const typedText = await msgInput.evaluate(el => {
+            if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value;
+            return (el as HTMLElement).innerText || el.textContent || '';
+        });
+        const typedTrimmed = typedText.trim();
+        const expectedStart = message.slice(0, 15);
+        if (typedTrimmed.length > 0 && !typedTrimmed.startsWith(expectedStart)) {
+            logger.warn(`[twitter-dm] Front truncation detected! Expected "${expectedStart}..." but got "${typedTrimmed.slice(0, 20)}...". Retrying...`);
+            // Clear and retype
+            await this.page.keyboard.down('Control');
+            await this.page.keyboard.press('a');
+            await this.page.keyboard.up('Control');
+            await delay(200);
+            await this.page.keyboard.press('Backspace');
+            await delay(500);
+            await msgInput.click();
+            await delay(500);
+            await this.page.keyboard.type(message, { delay: 50 });
+            await delay(1000);
+        }
 
         // Find and click the Send button
         let sent = false;
