@@ -686,46 +686,77 @@ export class InstagramDM {
     private async openExistingThread(username: string): Promise<boolean> {
         if (!this.page) return false;
 
-        // Look for the conversation in the sidebar using span text matching
-        const found = await this.page.evaluate((name: string) => {
-            const nameLower = name.toLowerCase();
-            const threadList = document.querySelector('[aria-label="Thread list"]');
-            if (threadList) {
-                // Match by span text (display name or handle)
-                const spans = threadList.querySelectorAll('span[dir="auto"]');
-                for (const span of spans) {
-                    const text = (span.textContent || '').trim().toLowerCase();
-                    if (text === nameLower || text.includes(nameLower)) {
-                        // Walk up to find clickable container
-                        let el: HTMLElement | null = span as HTMLElement;
-                        for (let i = 0; i < 10 && el; i++) {
-                            el = el.parentElement;
-                            if (!el) break;
-                            const rect = el.getBoundingClientRect();
-                            if (rect.height > 40 && rect.width > 200) {
-                                el.click();
-                                return true;
+        const MAX_SCROLL_ATTEMPTS = 10;
+        const page = this.page;
+
+        // Search function that looks for the thread in the currently visible sidebar
+        const searchSidebar = async (name: string): Promise<boolean> => {
+            return page.evaluate((nameLower: string) => {
+                const threadList = document.querySelector('[aria-label="Thread list"]');
+                if (threadList) {
+                    const spans = threadList.querySelectorAll('span[dir="auto"]');
+                    for (const span of spans) {
+                        const text = (span.textContent || '').trim().toLowerCase();
+                        if (text === nameLower || text.includes(nameLower)) {
+                            let el: HTMLElement | null = span as HTMLElement;
+                            for (let i = 0; i < 10 && el; i++) {
+                                el = el.parentElement;
+                                if (!el) break;
+                                const rect = el.getBoundingClientRect();
+                                if (rect.height > 40 && rect.width > 200) {
+                                    el.click();
+                                    return true;
+                                }
                             }
                         }
                     }
                 }
-            }
-            // Fallback: links
-            const links = document.querySelectorAll('a[href*="/direct/"]');
-            for (const link of links) {
-                const text = (link as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
-                    (link as HTMLElement).click();
-                    return true;
+                // Fallback: links
+                const links = document.querySelectorAll('a[href*="/direct/"]');
+                for (const link of links) {
+                    const text = (link as HTMLElement).innerText?.toLowerCase() || '';
+                    if (text.includes(nameLower)) {
+                        (link as HTMLElement).click();
+                        return true;
+                    }
                 }
-            }
-            return false;
-        }, username);
+                return false;
+            }, name.toLowerCase());
+        };
 
-        if (found) {
+        // First attempt: search without scrolling
+        if (await searchSidebar(username)) {
             logger.info(`[dm] Opened existing thread with "${username}"`);
+            return true;
         }
-        return found;
+
+        // Scroll sidebar and search at each position
+        for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
+            const scrolled = await page.evaluate(() => {
+                const threadList = document.querySelector('[aria-label="Thread list"]');
+                if (!threadList) return false;
+                const before = threadList.scrollTop;
+                threadList.scrollBy(0, threadList.clientHeight * 0.8);
+                return threadList.scrollTop !== before;
+            });
+
+            if (!scrolled) break; // Hit bottom
+            await new Promise(r => setTimeout(r, 1500));
+
+            if (await searchSidebar(username)) {
+                logger.info(`[dm] Opened existing thread with "${username}" (after ${attempt + 1} scroll(s))`);
+                return true;
+            }
+        }
+
+        // Reset scroll to top for clean state
+        await page.evaluate(() => {
+            const threadList = document.querySelector('[aria-label="Thread list"]');
+            if (threadList) threadList.scrollTop = 0;
+        });
+
+        logger.warn(`[dm] Thread not found for "${username}" after scrolling`);
+        return false;
     }
 
     private async typeAndSendMessage(message: string): Promise<boolean> {

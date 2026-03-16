@@ -72,6 +72,22 @@ function saveTargets(targets: string[]) {
             logger.warn(`[twitter-dm-scheduler] Watcher state init failed (non-fatal): ${formatError(e)}`);
         }
 
+        // ── One-time catch-up: reply to missed incoming DMs ──
+        try {
+            navigating = true;
+            navigatingOwner = 'catch-up';
+            const catchUpResult = await pipeline.catchUpMissedReplies();
+            if (catchUpResult.replied > 0) {
+                logger.info(`[twitter-dm-scheduler] Catch-up: scheduled ${catchUpResult.replied} reply(ies)`);
+            } else {
+                logger.info('[twitter-dm-scheduler] Catch-up: no missed replies to process');
+            }
+        } catch (e) {
+            logger.warn(`[twitter-dm-scheduler] Catch-up failed (non-fatal): ${formatError(e)}`);
+        } finally {
+            navigating = false;
+        }
+
         // ── DM Watcher Loop (check for new messages) ──
         async function watcherLoop() {
             while (true) {

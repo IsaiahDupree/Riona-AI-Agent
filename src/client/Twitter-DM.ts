@@ -1397,72 +1397,100 @@ export class TwitterDM {
             logger.warn('[twitter-dm] No inbox search bar found');
         }
 
-        // Second try: visually scan sidebar conversations by text content
-        const found = await this.page.evaluate((name: string) => {
-            const nameLower = name.toLowerCase();
+        // Second try: visually scan sidebar with scrolling
+        const MAX_SCROLL_ATTEMPTS = 10;
+        const page = this.page;
 
-            // Try legacy selectors first
-            const legacySelectors = 'div[data-testid="conversation"], a[href*="/messages/"], div[role="listitem"], div[role="row"]';
-            for (const conv of document.querySelectorAll(legacySelectors)) {
-                const text = (conv as HTMLElement).innerText?.toLowerCase() || '';
-                if (text.includes(nameLower)) {
-                    (conv as HTMLElement).click();
-                    return true;
+        const scanSidebar = async (name: string): Promise<boolean> => {
+            return page.evaluate((nameLower: string) => {
+                // Legacy selectors
+                const legacySelectors = 'div[data-testid="conversation"], a[href*="/messages/"], div[role="listitem"], div[role="row"]';
+                for (const conv of document.querySelectorAll(legacySelectors)) {
+                    const text = (conv as HTMLElement).innerText?.toLowerCase() || '';
+                    if (text.includes(nameLower)) {
+                        (conv as HTMLElement).click();
+                        return true;
+                    }
                 }
-            }
-
-            // New Chat UI: find conversation rows inside dm-inbox-panel by text
-            const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]');
-            if (inboxPanel) {
-                // Walk through all profile images and find the one next to the target name
-                const imgs = inboxPanel.querySelectorAll('img');
-                for (const img of imgs) {
-                    // Walk up to find the conversation row containing this image
-                    let el: Element | null = img;
-                    for (let depth = 0; depth < 8 && el; depth++) {
-                        el = el.parentElement;
-                        if (!el) break;
-                        if (el.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
-                        const innerText = (el as HTMLElement).innerText?.toLowerCase() || '';
-                        // Check if this element's text contains the target name
-                        // and is a reasonable conversation row (not the whole panel)
-                        if (innerText.includes(nameLower) && innerText.length < 300) {
-                            (el as HTMLElement).click();
+                // New Chat UI
+                const inboxPanel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                if (inboxPanel) {
+                    const imgs = inboxPanel.querySelectorAll('img');
+                    for (const img of imgs) {
+                        let el: Element | null = img;
+                        for (let depth = 0; depth < 8 && el; depth++) {
+                            el = el.parentElement;
+                            if (!el) break;
+                            if (el.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
+                            const innerText = (el as HTMLElement).innerText?.toLowerCase() || '';
+                            if (innerText.includes(nameLower) && innerText.length < 300) {
+                                (el as HTMLElement).click();
+                                return true;
+                            }
+                        }
+                    }
+                    const allSpans = inboxPanel.querySelectorAll('span');
+                    for (const span of allSpans) {
+                        const text = span.textContent?.trim().toLowerCase() || '';
+                        if (text === nameLower || text.includes(nameLower)) {
+                            let clickTarget: HTMLElement | null = span as HTMLElement;
+                            for (let d = 0; d < 5 && clickTarget; d++) {
+                                clickTarget = clickTarget.parentElement;
+                                if (!clickTarget) break;
+                                if (clickTarget.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
+                                const style = window.getComputedStyle(clickTarget);
+                                if (style.cursor === 'pointer' || clickTarget.getAttribute('role') === 'button' || clickTarget.tabIndex >= 0) {
+                                    clickTarget.click();
+                                    return true;
+                                }
+                            }
+                            (span.parentElement || span as HTMLElement).click();
                             return true;
                         }
                     }
                 }
+                return false;
+            }, name.toLowerCase());
+        };
 
-                // Fallback: find any element with the name text and click it
-                const allSpans = inboxPanel.querySelectorAll('span');
-                for (const span of allSpans) {
-                    const text = span.textContent?.trim().toLowerCase() || '';
-                    if (text === nameLower || text.includes(nameLower)) {
-                        // Click the closest clickable ancestor
-                        let clickTarget: HTMLElement | null = span as HTMLElement;
-                        for (let d = 0; d < 5 && clickTarget; d++) {
-                            clickTarget = clickTarget.parentElement;
-                            if (!clickTarget) break;
-                            if (clickTarget.getAttribute?.('data-testid') === 'dm-inbox-panel') break;
-                            const style = window.getComputedStyle(clickTarget);
-                            if (style.cursor === 'pointer' || clickTarget.getAttribute('role') === 'button' || clickTarget.tabIndex >= 0) {
-                                clickTarget.click();
-                                return true;
-                            }
-                        }
-                        // If no clickable ancestor, click the span's parent
-                        (span.parentElement || span as HTMLElement).click();
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }, username);
-
-        if (found) {
+        // First scan without scrolling
+        if (await scanSidebar(username)) {
             logger.info(`[twitter-dm] Opened existing thread with "${username}"`);
+            return true;
         }
-        return found;
+
+        // Scroll sidebar and scan at each position
+        for (let attempt = 0; attempt < MAX_SCROLL_ATTEMPTS; attempt++) {
+            const scrolled = await page.evaluate(() => {
+                const panel = document.querySelector('[data-testid="dm-inbox-panel"]');
+                if (!panel) return false;
+                // Find scrollable child container
+                const scrollable = panel.querySelector('[style*="overflow"]') || panel;
+                const before = scrollable.scrollTop;
+                scrollable.scrollBy(0, scrollable.clientHeight * 0.8);
+                return scrollable.scrollTop !== before;
+            });
+
+            if (!scrolled) break;
+            await delay(1500);
+
+            if (await scanSidebar(username)) {
+                logger.info(`[twitter-dm] Opened existing thread with "${username}" (after ${attempt + 1} scroll(s))`);
+                return true;
+            }
+        }
+
+        // Reset scroll
+        await page.evaluate(() => {
+            const panel = document.querySelector('[data-testid="dm-inbox-panel"]');
+            if (panel) {
+                const scrollable = panel.querySelector('[style*="overflow"]') || panel;
+                scrollable.scrollTop = 0;
+            }
+        });
+
+        logger.warn(`[twitter-dm] Thread not found for "${username}" after scrolling`);
+        return false;
     }
 
     private async typeAndSendMessage(message: string): Promise<boolean> {

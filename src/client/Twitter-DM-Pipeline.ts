@@ -23,6 +23,7 @@ import { formatError } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, TrackedDM } from '../types/dm';
 import { isJackpotReply, computeOfferReadiness } from '../nurture/vr-scheduler';
 import { computeReplyDelay, scheduleDelayedReply, getReadyReplies, markReplySent, markReplyFailed, cleanupDelayedQueue, hasPendingReply } from '../nurture/vi-delays';
+import { isLikelyBot } from './Instagram-DM-Pipeline';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -41,7 +42,11 @@ export interface DMAutoReplyResult {
     skipped: number;
     failed: number;
     details: Array<{ username: string; action: 'replied' | 'skipped' | 'failed'; reason?: string }>;
+    dryRunMessages?: Array<{ username: string; message: string; delayMinutes: number; isJackpot: boolean }>;
 }
+
+// Re-export isLikelyBot from Instagram pipeline for cross-platform use
+export { isLikelyBot } from './Instagram-DM-Pipeline';
 
 // ── Offer Catalog ───────────────────────────────────────────────────
 
@@ -465,8 +470,9 @@ export class TwitterDMPipeline {
 
     // ── Auto-reply to incoming DMs ─────────────────────────────────────
 
-    async processDMAutoReplies(): Promise<DMAutoReplyResult> {
+    async processDMAutoReplies(options?: { dryRun?: boolean }): Promise<DMAutoReplyResult> {
         const result: DMAutoReplyResult = { processed: 0, replied: 0, skipped: 0, failed: 0, details: [] };
+        if (options?.dryRun) result.dryRunMessages = [];
         let page;
         try { page = await this.dm.ensurePage(); } catch (e) {
             logger.warn(`[twitter-pipeline] Browser page not available — cannot process auto-replies: ${formatError(e)}`);
@@ -550,6 +556,15 @@ export class TwitterDMPipeline {
                 continue;
             }
 
+            // GUARD: bot / automated account detection
+            const botCheck = isLikelyBot(lastMessage, username);
+            if (botCheck.isBot) {
+                logger.info(`[twitter-pipeline] Auto-reply: bot detected from @${username}: ${botCheck.reason}`);
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `bot: ${botCheck.reason}` });
+                continue;
+            }
+
             // Scrape conversation thread to verify it's our turn
             try {
                 const messages = await this.dm.scrapeThread(username, 3);
@@ -598,24 +613,35 @@ export class TwitterDMPipeline {
 
                 // Compute VI delay and schedule instead of sending immediately
                 const delayMs = computeReplyDelay(username, 'twitter', relationship.stage, isJackpot);
-                const sendAfter = new Date(Date.now() + delayMs).toISOString();
+                const delayMinutes = Math.round(delayMs / 60000);
 
-                scheduleDelayedReply({
-                    username,
-                    platform: 'twitter',
-                    replyMessage,
-                    sendAfter,
-                    context: {
-                        relationship,
-                        objective,
-                        isJackpot,
-                        theirMessage: lastTheirMessage?.text || lastMessage
-                    }
-                });
+                if (options?.dryRun) {
+                    if (!result.dryRunMessages) result.dryRunMessages = [];
+                    result.dryRunMessages.push({ username, message: replyMessage, delayMinutes, isJackpot });
+                    result.replied++;
+                    result.details.push({ username, action: 'replied', reason: `dry-run: would schedule in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[twitter-pipeline] DRY RUN reply to @${username} in ${delayMinutes}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 80)}..."`);
+                } else {
+                    const sendAfter = new Date(Date.now() + delayMs).toISOString();
 
-                result.replied++;
-                result.details.push({ username, action: 'replied', reason: `scheduled in ${Math.round(delayMs / 60000)}min${isJackpot ? ' (jackpot)' : ''}` });
-                logger.info(`[twitter-pipeline] Scheduled reply to @${username} in ${Math.round(delayMs / 60000)}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 50)}..."`);
+                    scheduleDelayedReply({
+                        username,
+                        platform: 'twitter',
+                        replyMessage,
+                        sendAfter,
+                        context: {
+                            relationship,
+                            objective,
+                            isJackpot,
+                            theirMessage: lastTheirMessage?.text || lastMessage,
+                            displayName: rawUsername !== username ? rawUsername : undefined
+                        }
+                    });
+
+                    result.replied++;
+                    result.details.push({ username, action: 'replied', reason: `scheduled in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[twitter-pipeline] Scheduled reply to @${username} in ${delayMinutes}min (jackpot=${isJackpot}): "${replyMessage.slice(0, 50)}..."`);
+                }
 
                 // Rate limit delay between processing
                 if (result.replied < AUTO_REPLY_MAX_PER_RUN) {
@@ -643,15 +669,21 @@ export class TwitterDMPipeline {
 
         logger.info(`[twitter-pipeline] ${ready.length} delayed reply(ies) ready to send`);
 
+        // Note: replies to incoming DMs are NOT counted against the daily outreach limit.
+        // We cap at AUTO_REPLY_MAX_PER_RUN (5) per cycle to avoid spam bursts.
         for (const entry of ready) {
-            // Recheck daily limit before each send
-            if (getTodayTwitterDMCount() >= this.config.maxDMsPerDay) {
-                logger.info(`[twitter-pipeline] Daily limit reached — deferring ${ready.length - stats.sent - stats.failed} delayed reply(ies)`);
+            if (stats.sent >= AUTO_REPLY_MAX_PER_RUN) {
+                logger.info(`[twitter-pipeline] Max replies per run reached — deferring ${ready.length - stats.sent - stats.failed} delayed reply(ies)`);
                 break;
             }
 
             try {
-                const sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage);
+                // Try handle first, fall back to display name if thread not found
+                let sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage);
+                if (!sendResult.success && sendResult.error?.includes('No existing thread') && entry.context.displayName) {
+                    logger.info(`[twitter-pipeline] Thread not found by handle @${entry.username}, trying display name "${entry.context.displayName}"...`);
+                    sendResult = await this.dm.sendToExistingThread(entry.context.displayName, entry.replyMessage);
+                }
 
                 if (sendResult.success) {
                     markReplySent(entry.id);
@@ -697,6 +729,172 @@ export class TwitterDMPipeline {
         cleanupDelayedQueue();
 
         return stats;
+    }
+
+    // ── Catch up on missed replies (backfill) ──────────────────────────
+
+    async catchUpMissedReplies(options?: { dryRun?: boolean; maxConversations?: number }): Promise<DMAutoReplyResult> {
+        const result: DMAutoReplyResult = { processed: 0, replied: 0, skipped: 0, failed: 0, details: [] };
+        if (options?.dryRun) result.dryRunMessages = [];
+
+        let page;
+        try { page = await this.dm.ensurePage(); } catch (e) {
+            logger.warn(`[twitter-pipeline] Browser page not available — cannot catch up: ${formatError(e)}`);
+            return result;
+        }
+
+        const ourUsername = (process.env.TWITTER_BOT_USERNAME || '').toLowerCase();
+        const maxConvos = options?.maxConversations || 20;
+
+        // 1. Scrape full inbox
+        logger.info(`[twitter-pipeline] Catch-up: scanning inbox for missed replies...`);
+        let inbox: Array<{ username: string; lastMessage: string; lastMessageTime: string; unread: boolean }> = [];
+        try {
+            inbox = await this.dm.scrapeInbox(true);
+        } catch (e) {
+            logger.error(`[twitter-pipeline] Catch-up: failed to scrape inbox: ${formatError(e)}`);
+            return result;
+        }
+
+        logger.info(`[twitter-pipeline] Catch-up: found ${inbox.length} conversations, checking up to ${maxConvos}`);
+
+        let checked = 0;
+        for (const convo of inbox) {
+            if (checked >= maxConvos) break;
+            if (result.replied >= AUTO_REPLY_MAX_PER_RUN) break;
+
+            const displayName = convo.username;
+            const username = displayName.toLowerCase().replace('@', '');
+
+            if (username === ourUsername) continue;
+
+            // Quick filter: if last message starts with "You:" it's our turn — skip
+            const lastMsgLower = (convo.lastMessage || '').toLowerCase();
+            if (lastMsgLower.startsWith('you:') || lastMsgLower.startsWith('you sent')) continue;
+
+            // Bot filter on preview
+            const botCheck = isLikelyBot(convo.lastMessage, username);
+            if (botCheck.isBot) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `bot: ${botCheck.reason}` });
+                continue;
+            }
+
+            // Opt-out filter
+            if (OPT_OUT_KEYWORDS.some(k => lastMsgLower.includes(k))) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'opt-out detected' });
+                continue;
+            }
+
+            // Already pending
+            if (hasPendingReply(username, 'twitter')) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'reply already scheduled' });
+                continue;
+            }
+
+            // Deep-scrape this thread to verify it's actually our turn
+            checked++;
+            result.processed++;
+            try {
+                const messages = await this.dm.scrapeThread(username, 3);
+
+                // Verify last message is theirs
+                if (messages.length === 0 || messages[messages.length - 1].isOurs) {
+                    result.skipped++;
+                    result.details.push({ username, action: 'skipped', reason: 'already replied (their turn)' });
+                    continue;
+                }
+
+                // Re-check bot filter with full thread context
+                const lastTheirMessage = [...messages].reverse().find(m => !m.isOurs);
+                if (lastTheirMessage) {
+                    const threadBotCheck = isLikelyBot(lastTheirMessage.text, username);
+                    if (threadBotCheck.isBot) {
+                        result.skipped++;
+                        result.details.push({ username, action: 'skipped', reason: `bot: ${threadBotCheck.reason}` });
+                        continue;
+                    }
+                }
+
+                // Cooldown check
+                if (hasSentTwitterDMTo(username, AUTO_REPLY_COOLDOWN_HOURS)) {
+                    result.skipped++;
+                    result.details.push({ username, action: 'skipped', reason: `cooldown (${AUTO_REPLY_COOLDOWN_HOURS}h)` });
+                    continue;
+                }
+
+                // Load relationship & profile
+                const relationship = loadRelationship(username);
+                if (!this.ourProfile) {
+                    this.ourProfile = await scrapeOurTwitterProfile(page);
+                }
+
+                let theirProfile: ProfileInfo;
+                try {
+                    theirProfile = await scrapeTwitterProfile(page, username);
+                } catch (e) {
+                    logger.warn(`[twitter-pipeline] Catch-up: failed to scrape profile for @${username}, using minimal: ${formatError(e)}`);
+                    theirProfile = { username, fullName: displayName, bio: '', followerCount: 0, followingCount: 0, postCount: 0, isVerified: false };
+                }
+
+                const objective = getReplyObjective(relationship, lastTheirMessage?.text || convo.lastMessage);
+
+                // Jackpot check
+                const jackpotDecision = isJackpotReply(username, 'twitter');
+                const isJackpot = jackpotDecision.jackpot;
+
+                // Generate AI reply
+                const replyMessage = await generateDMMessage({
+                    ourProfile: this.ourProfile,
+                    theirProfile,
+                    conversationHistory: messages,
+                    relationship,
+                    objective,
+                    isJackpot
+                });
+
+                // Compute delay
+                const delayMs = computeReplyDelay(username, 'twitter', relationship.stage, isJackpot);
+                const delayMinutes = Math.round(delayMs / 60000);
+
+                if (options?.dryRun) {
+                    result.dryRunMessages!.push({ username, message: replyMessage, delayMinutes, isJackpot });
+                    result.replied++;
+                    result.details.push({ username, action: 'replied', reason: `dry-run: would schedule in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[twitter-pipeline] CATCH-UP DRY RUN @${username}: "${replyMessage.slice(0, 80)}..." (${delayMinutes}min)`);
+                } else {
+                    const sendAfter = new Date(Date.now() + delayMs).toISOString();
+                    scheduleDelayedReply({
+                        username,
+                        platform: 'twitter',
+                        replyMessage,
+                        sendAfter,
+                        context: {
+                            relationship,
+                            objective,
+                            isJackpot,
+                            theirMessage: lastTheirMessage?.text || convo.lastMessage,
+                            displayName: displayName !== username ? displayName : undefined
+                        }
+                    });
+                    result.replied++;
+                    result.details.push({ username, action: 'replied', reason: `catch-up: scheduled in ${delayMinutes}min${isJackpot ? ' (jackpot)' : ''}` });
+                    logger.info(`[twitter-pipeline] CATCH-UP scheduled @${username} in ${delayMinutes}min: "${replyMessage.slice(0, 50)}..."`);
+                }
+
+                await delay(5000);
+
+            } catch (e) {
+                result.failed++;
+                result.details.push({ username, action: 'failed', reason: formatError(e) });
+                logger.error(`[twitter-pipeline] Catch-up error for @${username}: ${formatError(e)}`);
+            }
+        }
+
+        logger.info(`[twitter-pipeline] Catch-up complete: ${result.replied} replied, ${result.skipped} skipped, ${result.failed} failed (checked ${checked} threads)`);
+        return result;
     }
 
     // ── Check for replies and update feedback loop ──────────────────
