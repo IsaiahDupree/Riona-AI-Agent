@@ -94,7 +94,7 @@ export class InstagramDM {
 
     // ── Send a DM to a user by searching their name ─────────────────
 
-    async sendDM(recipientName: string, message: string): Promise<DMSendResult> {
+    async sendDM(recipientName: string, message: string, options?: { skipTracking?: boolean }): Promise<DMSendResult> {
         if (!this.page) throw new Error('Page not initialized');
         const timestamp = new Date().toISOString();
 
@@ -146,8 +146,8 @@ export class InstagramDM {
                 verified
             };
 
-            if (sent) {
-                // Track the DM
+            if (sent && !options?.skipTracking) {
+                // Track the DM (skipped when caller handles tracking, e.g. pipeline)
                 trackDM({
                     recipientUsername: recipientName,
                     messageText: message,
@@ -171,7 +171,7 @@ export class InstagramDM {
 
     // ── Send DM to an existing conversation (by username) ───────────
 
-    async sendToExistingThread(username: string, message: string): Promise<DMSendResult> {
+    async sendToExistingThread(username: string, message: string, options?: { skipTracking?: boolean }): Promise<DMSendResult> {
         if (!this.page) throw new Error('Page not initialized');
         const timestamp = new Date().toISOString();
 
@@ -191,7 +191,7 @@ export class InstagramDM {
             await delay(3000);
             const verified = await this.verifyMessageSent(message);
 
-            if (sent) {
+            if (sent && !options?.skipTracking) {
                 trackDM({
                     recipientUsername: username,
                     messageText: message,

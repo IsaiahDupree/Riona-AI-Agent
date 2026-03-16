@@ -4,6 +4,9 @@
  * runs outreach pipeline, and updates feedback loop
  */
 
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { TwitterDM } from './client/Twitter-DM';
 import { checkForNewTwitterDMs, initializeTwitterWatcherState } from './client/Twitter-DM-Watcher';
 import { TwitterDMPipeline, loadConfig as loadPipelineConfig } from './client/Twitter-DM-Pipeline';

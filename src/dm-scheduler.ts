@@ -4,6 +4,9 @@
  * runs outreach pipeline, and updates feedback loop
  */
 
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { InstagramDM } from './client/Instagram-DM';
 import { startDMWatcher, checkForNewDMs } from './client/Instagram-DM-Watcher';
 import { DMPipeline, loadConfig, loadPendingSends, DMAutoReplyResult } from './client/Instagram-DM-Pipeline';

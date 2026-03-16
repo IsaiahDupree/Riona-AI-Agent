@@ -7,7 +7,11 @@ import { syncTwitterRelationshipToSupabase, syncTwitterFeedbackToSupabase } from
 import * as fs from 'fs';
 import * as path from 'path';
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+    if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    return _openai;
+}
 
 // ── Relationship Store ──────────────────────────────────────────────
 
@@ -235,7 +239,7 @@ Objective for this message: ${messageObjective}
 Generate the next message to send. Just the message text, nothing else.`;
 
     try {
-        const completion = await openai.chat.completions.create({
+        const completion = await getOpenAI().chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [
                 { role: 'system', content: systemPrompt },

@@ -919,10 +919,11 @@ export class DMPipeline {
 
             try {
                 // Try handle first, fall back to display name if thread not found
-                let sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage);
+                // skipTracking: pipeline handles its own tracking below
+                let sendResult = await this.dm.sendToExistingThread(entry.username, entry.replyMessage, { skipTracking: true });
                 if (!sendResult.success && sendResult.error?.includes('No existing thread') && entry.context.displayName) {
                     logger.info(`[pipeline] Thread not found by handle @${entry.username}, trying display name "${entry.context.displayName}"...`);
-                    sendResult = await this.dm.sendToExistingThread(entry.context.displayName, entry.replyMessage);
+                    sendResult = await this.dm.sendToExistingThread(entry.context.displayName, entry.replyMessage, { skipTracking: true });
                 }
 
                 if (sendResult.success) {
