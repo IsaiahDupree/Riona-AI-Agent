@@ -4,6 +4,7 @@ import { logger } from '../utils/logger';
 import { screenshotPath, formatError } from '../utils/errors';
 import { DMSendResult, DMMessage, ConversationPreview } from '../types/dm';
 import { trackDM, hasSentDMTo, createDMSession, saveDMSession } from '../tracking/dmTracker';
+import { sendInstagramDMByUsername } from '../utils/instagram-api';
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 const TIMEOUT = 60000;
@@ -15,7 +16,9 @@ export class InstagramDM {
     private page: Page | null = null;
 
     constructor(instagramAI?: InstagramAI) {
-        this.instagramAI = instagramAI || new InstagramAI();
+        this.instagramAI = instagramAI || new InstagramAI({
+            chromeProfile: process.env.INSTAGRAM_DM_CHROME_PROFILE || './chrome-profile-instagram-dm',
+        });
     }
 
     async initialize(): Promise<void> {
@@ -98,6 +101,10 @@ export class InstagramDM {
         if (!this.page) throw new Error('Page not initialized');
         const timestamp = new Date().toISOString();
 
+        // ── Try Graph API first (avoids browser automation lockouts) ──
+        const apiResult = await this.trySendViaAPI(recipientName, message, timestamp, options);
+        if (apiResult) return apiResult;
+
         try {
             // Navigate to inbox first
             await this.navigateToInbox();
@@ -175,6 +182,10 @@ export class InstagramDM {
         if (!this.page) throw new Error('Page not initialized');
         const timestamp = new Date().toISOString();
 
+        // ── Try Graph API first (avoids browser automation lockouts) ──
+        const apiResult = await this.trySendViaAPI(username, message, timestamp, options);
+        if (apiResult) return apiResult;
+
         try {
             // Navigate directly to the user's DM thread
             await this.navigateToInbox();
@@ -208,6 +219,57 @@ export class InstagramDM {
             const err = error instanceof Error ? error.message : String(error);
             logger.error('[dm] sendToExistingThread failed:', err);
             return { success: false, error: err, recipientUsername: username, messageText: message, timestamp, verified: false };
+        }
+    }
+
+    // ── Try sending via Instagram Graph API (preferred over browser) ──
+
+    private async trySendViaAPI(
+        username: string,
+        message: string,
+        timestamp: string,
+        options?: { skipTracking?: boolean }
+    ): Promise<DMSendResult | null> {
+        // Skip API if credentials aren't configured
+        if (!process.env.INSTAGRAM_ACCESS_TOKEN || !process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID) {
+            logger.debug('[dm] Graph API credentials not configured — using browser');
+            return null;
+        }
+
+        try {
+            logger.info(`[dm] Attempting Graph API send to @${username}...`);
+            const apiResult = await sendInstagramDMByUsername(username, message);
+
+            if (apiResult.success) {
+                logger.info(`[dm] Graph API send succeeded for @${username} (msgId=${apiResult.messageId})`);
+
+                if (!options?.skipTracking) {
+                    trackDM({
+                        recipientUsername: username,
+                        messageText: message,
+                        timestamp,
+                        direction: 'outbound',
+                        verified: true, // API sends are always verified
+                        sessionId: `api_${apiResult.messageId || Date.now()}`,
+                        conversationId: `dm_${username.toLowerCase()}`
+                    });
+                }
+
+                return {
+                    success: true,
+                    recipientUsername: username,
+                    messageText: message,
+                    timestamp,
+                    verified: true
+                };
+            }
+
+            // API failed (no IGSID, outside 24h window, etc.) — fall back to browser
+            logger.info(`[dm] Graph API unavailable for @${username}: ${apiResult.error} — falling back to browser`);
+            return null;
+        } catch (e) {
+            logger.warn(`[dm] Graph API error — falling back to browser: ${formatError(e)}`);
+            return null;
         }
     }
 

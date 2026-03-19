@@ -2,7 +2,7 @@
 import { ElementHandle, Page } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { delay } from '../utils/delay';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 // MongoClient removed — imported but never used in this module
 import * as cheerio from 'cheerio';
@@ -69,10 +69,7 @@ function computeQualityScores(caption: string, targetUsername: string, prefs: an
     }
 }
 
-// Configure OpenAI
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY || ''
-});
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // MongoDB setup
 // Storage setup
@@ -744,17 +741,16 @@ async function generateComment(caption: string): Promise<string | null> {
            - Follow/followback requests
            - "Check my profile" phrases`;
 
-        logger.info('Sending request to OpenAI', {
+        logger.info('Sending request to AI', {
             component: 'Instagram-Core',
-            event: 'openai_request_start'
+            event: 'ai_request_start'
         });
 
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
+        const comment = await chatCompletion({
             messages: [
                 {
                     role: "system",
-                    content: "You are a casual Instagram user who leaves simple, friendly comments. Keep comments natural and related to the post content."
+                    content: "You are a casual Instagram user who leaves simple, friendly comments. Keep comments natural and related to the post content. Reply with ONLY the comment text — no markdown, no headers, no formatting, no labels, no quotes."
                 },
                 {
                     role: "user",
@@ -765,12 +761,22 @@ async function generateComment(caption: string): Promise<string | null> {
             temperature: 0.7
         });
 
-        const comment = completion.choices[0]?.message?.content?.trim();
-
         if (!comment) {
-            logger.warn('OpenAI did not generate a comment', {
+            logger.warn('AI did not generate a comment', {
                 component: 'Instagram-Core',
-                event: 'openai_no_comment'
+                event: 'ai_no_comment'
+            });
+            return null;
+        }
+
+        // Strip markdown formatting, headers, quotes, and meta-labels the AI sometimes adds
+        const cleaned = stripMarkdownFromComment(comment);
+
+        if (!cleaned) {
+            logger.warn('Comment was entirely markdown/meta-text — discarding', {
+                component: 'Instagram-Core',
+                event: 'comment_markdown_stripped',
+                original: comment
             });
             return null;
         }
@@ -778,16 +784,17 @@ async function generateComment(caption: string): Promise<string | null> {
         logger.info('Generated comment from OpenAI', {
             component: 'Instagram-Core',
             event: 'comment_generation_success',
-            commentLength: comment.length
+            commentLength: cleaned.length,
+            wasStripped: cleaned !== comment
         });
 
         // Validate the generated comment
-        const isValid = await validateComment(comment);
+        const isValid = await validateComment(cleaned);
         if (!isValid) {
             logger.warn('Generated comment failed validation', {
                 component: 'Instagram-Core',
                 event: 'comment_validation_failed',
-                comment
+                comment: cleaned
             });
             return null;
         }
@@ -795,10 +802,10 @@ async function generateComment(caption: string): Promise<string | null> {
         logger.info('Comment passed validation', {
             component: 'Instagram-Core',
             event: 'comment_validation_success',
-            comment
+            comment: cleaned
         });
 
-        return comment;
+        return cleaned;
     } catch (error) {
         logger.error('Error generating comment:', {
             error: error instanceof Error ? error.message : String(error),
@@ -2549,6 +2556,36 @@ function extractHashtags(caption: string): string[] {
         });
         return [];
     }
+}
+
+/**
+ * Strip markdown formatting and meta-labels the AI sometimes wraps around comments.
+ * e.g. "# Instagram Comment", "**great post**", "> nice work", "```comment```"
+ */
+function stripMarkdownFromComment(raw: string): string {
+    let text = raw.trim();
+
+    // Remove markdown headers (# Header, ## Header, etc.)
+    text = text.replace(/^#{1,6}\s+/gm, '');
+
+    // Remove meta-labels like "Instagram Comment:", "Comment:", "Here's a comment:"
+    text = text.replace(/^(?:instagram\s+comment|twitter\s+comment|threads\s+comment|comment|here(?:'s| is) (?:a |my |the )?comment)\s*[:\-–—]\s*/gi, '');
+
+    // Remove bold/italic markdown
+    text = text.replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1');
+    text = text.replace(/_{1,3}([^_]+)_{1,3}/g, '$1');
+
+    // Remove blockquote markers
+    text = text.replace(/^>\s*/gm, '');
+
+    // Remove code blocks/backticks
+    text = text.replace(/```[\s\S]*?```/g, '');
+    text = text.replace(/`([^`]+)`/g, '$1');
+
+    // Remove wrapping quotes the AI sometimes adds
+    text = text.replace(/^["'](.+)["']$/s, '$1');
+
+    return text.trim();
 }
 
 async function validateComment(comment: string, guidelines: CommentGuidelines = DEFAULT_COMMENT_GUIDELINES): Promise<boolean> {
