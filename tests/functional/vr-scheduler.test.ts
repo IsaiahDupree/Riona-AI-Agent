@@ -146,7 +146,9 @@ describe('VR Scheduler', () => {
         it('should enforce daily comment cap per user', () => {
             const state = loadVRState(userDaily, 'twitter');
             state.commentsToday = 2;
-            state.lastCommentDate = new Date().toISOString().slice(0, 10);
+            // Use local date to match todayStr() in vr-scheduler
+            const d = new Date();
+            state.lastCommentDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
             state.nextThreshold = 1;
             state.counter = 0;
             saveVRState(state);

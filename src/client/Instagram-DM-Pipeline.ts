@@ -14,7 +14,7 @@ import {
     recordFeedback, getFeedbackStats, MessageFeedback, getReplyObjective
 } from './Instagram-DM-AI';
 import { scrapeConversationThread, checkForNewDMs, StoredConversation } from './Instagram-DM-Watcher';
-import { trackDM, hasSentDMTo, createDMSession, saveDMSession, getDMsForUser, getTodayDMCount } from '../tracking/dmTracker';
+import { trackDM, hasSentDMTo, hasContactedToday, createDMSession, saveDMSession, getDMsForUser, getTodayDMCount } from '../tracking/dmTracker';
 import { syncDMToSupabase } from '../db/supabaseDM';
 import { notifyDMSent, notifyDMApprovalNeeded, notifyDMAutoReply, notifyDMReplyReceived } from '../utils/telegram';
 import { logger } from '../utils/logger';
@@ -104,6 +104,62 @@ export function isLikelyBot(preview: string, username?: string): { isBot: boolea
     }
 
     return { isBot: false, reason: '' };
+}
+
+// ── Username Validation ─────────────────────────────────────────────
+
+/** Words that are Twitter/Instagram UI elements, not real usernames */
+const INVALID_USERNAMES = new Set([
+    'chat', 'search', 'all', 'requests', 'messages', 'compose', 'new message',
+    'home', 'explore', 'notifications', 'settings', 'primary', 'general',
+    'inbox', 'direct', 'unread', 'pinned', 'muted', 'active', 'online',
+    'typing', 'message', 'new', 'edit', 'you', 'sent', 'your note',
+]);
+
+/**
+ * Validate that a username looks like a real social media handle.
+ * Filters out UI chrome labels, empty strings, and impossible formats.
+ */
+export function isValidUsername(username: string): { valid: boolean; reason: string } {
+    if (!username || username.trim().length === 0) {
+        return { valid: false, reason: 'empty username' };
+    }
+
+    const clean = username.toLowerCase().replace(/^@/, '').trim();
+
+    if (clean.length === 0) {
+        return { valid: false, reason: 'empty after cleanup' };
+    }
+
+    // Known UI labels
+    if (INVALID_USERNAMES.has(clean)) {
+        return { valid: false, reason: `UI label: "${clean}"` };
+    }
+
+    // Twitter handles: 1-15 alphanumeric + underscores
+    // Instagram handles: 1-30 alphanumeric + underscores + periods
+    // Be permissive — allow both formats
+    if (clean.length > 30) {
+        return { valid: false, reason: 'username too long (>30 chars)' };
+    }
+
+    // Must contain at least one letter (pure numbers aren't usernames)
+    if (/^\d+$/.test(clean)) {
+        return { valid: false, reason: 'all-numeric username' };
+    }
+
+    // Reject if it looks like a time indicator (2h, 30m, 1d)
+    if (/^\d+[hmd]$/i.test(clean)) {
+        return { valid: false, reason: 'time indicator, not username' };
+    }
+
+    // Reject if it contains spaces (real handles don't have spaces)
+    // Exception: Instagram display names can have spaces, but handles can't
+    if (/\s/.test(clean) && clean.length < 5) {
+        return { valid: false, reason: 'short text with spaces — likely UI label' };
+    }
+
+    return { valid: true, reason: '' };
 }
 
 // ── Offer Catalog ───────────────────────────────────────────────────
@@ -554,6 +610,21 @@ export class DMPipeline {
                 continue;
             }
 
+            // GUARD: invalid username (UI labels like "chat", "search", etc.)
+            const usernameCheck = isValidUsername(username);
+            if (!usernameCheck.valid) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `invalid username: ${usernameCheck.reason}` });
+                continue;
+            }
+
+            // GUARD: already contacted today (sent DM or pending scheduled reply)
+            if (hasContactedToday(username)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'already contacted today' });
+                continue;
+            }
+
             // GUARD: per-user cooldown
             if (hasSentDMTo(username, AUTO_REPLY_COOLDOWN_HOURS)) {
                 result.skipped++;
@@ -745,6 +816,21 @@ export class DMPipeline {
 
             // Skip our own messages
             if (username === ourUsername) continue;
+
+            // GUARD: invalid username
+            const usernameCheck = isValidUsername(username);
+            if (!usernameCheck.valid) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `invalid username: ${usernameCheck.reason}` });
+                continue;
+            }
+
+            // GUARD: already contacted today
+            if (hasContactedToday(username)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'already contacted today' });
+                continue;
+            }
 
             // Quick filter: if last message starts with "You:" it's our turn — skip
             const lastMsgLower = (convo.lastMessage || '').toLowerCase();

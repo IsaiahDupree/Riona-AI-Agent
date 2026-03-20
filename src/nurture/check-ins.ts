@@ -9,12 +9,12 @@ import { loadNurtureProfile, saveNurtureProfile, getAllNurtureProfiles } from '.
 import { TIER_CONFIGS, getTierForMessage } from './tiers';
 import { getBestInterestForMessage } from './interests';
 import { canMessageOnPlatform, getCrossContext } from './cross-platform';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Check-in templates ──────────────────────────────────────────────
 
@@ -113,8 +113,7 @@ export async function generateCheckInMessage(
     ].filter(Boolean).join(' ');
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const message = (await chatCompletion({
             messages: [
                 { role: 'system', content: systemPrompt },
                 {
@@ -124,9 +123,7 @@ export async function generateCheckInMessage(
             ],
             max_tokens: 100,
             temperature: 0.85,
-        });
-
-        const message = completion.choices[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || '';
+        }))?.trim()?.replace(/^["']|["']$/g, '') || '';
         logger.info(`[check-ins] Generated ${type} check-in for @${username}: "${message.slice(0, 60)}..."`);
         return message;
     } catch (e) {

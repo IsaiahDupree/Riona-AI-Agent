@@ -3,18 +3,13 @@ import { ElementHandle, Page } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { formatError, withRetry, classifyError, sanitizeForPrompt } from '../utils/errors';
 import { delay } from '../utils/delay';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs';
 
 // Load environment variables
 dotenv.config();
-
-// Configure OpenAI
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY || ''
-});
 
 // ── Interfaces ───────────────────────────────────────────────────────
 
@@ -70,6 +65,112 @@ const DEFAULT_REPLY_GUIDELINES: ReplyGuidelines = {
 
 function getRandomDelay(min: number, max: number): number {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Safely type text into a contenteditable element with front-truncation protection.
+ *
+ * Twitter's contenteditable divs often swallow the first few keystrokes
+ * because the placeholder handler hasn't finished clearing by the time
+ * keyboard.type() fires. This function:
+ *  1. Clicks the element to focus it
+ *  2. Sends a throwaway space + backspace to "wake up" the input handler
+ *  3. Types the actual text
+ *  4. Verifies the text wasn't truncated at the front
+ *  5. Retries once if truncation is detected
+ */
+export async function safeType(
+    page: Page,
+    element: ElementHandle<Element>,
+    text: string,
+    options?: { charDelay?: number; label?: string }
+): Promise<{ success: boolean; truncated: boolean }> {
+    const charDelay = options?.charDelay ?? getRandomDelay(20, 50);
+    const label = options?.label ?? 'safeType';
+
+    // Step 1: Focus the element
+    await element.click();
+    await delay(300);
+
+    // Step 2: "Wake up" the input handler with a throwaway keystroke
+    // This clears the placeholder and ensures the input is ready for real text
+    await page.keyboard.press('Space');
+    await delay(100);
+    await page.keyboard.press('Backspace');
+    await delay(300);
+
+    // Step 3: Type the actual text
+    await page.keyboard.type(text, { delay: charDelay });
+    await delay(800);
+
+    // Step 4: Verify the text wasn't truncated at the front
+    const typedContent = await element.evaluate(
+        (el: Element) => {
+            if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value;
+            return (el as HTMLElement).innerText || el.textContent || '';
+        }
+    );
+    const typedTrimmed = typedContent.trim();
+    const expectedStart = text.slice(0, 20);
+
+    if (typedTrimmed.length === 0) {
+        // Text went somewhere else entirely (search box?) — retry with extra focus
+        logger.warn(`[${label}] Typed text not found in element — refocusing and retrying`);
+        await page.keyboard.press('Escape');
+        await delay(300);
+        await element.click();
+        await delay(500);
+        await element.click();
+        await delay(300);
+        await page.keyboard.press('Space');
+        await delay(100);
+        await page.keyboard.press('Backspace');
+        await delay(300);
+        await page.keyboard.type(text, { delay: charDelay + 10 });
+        await delay(800);
+        return { success: true, truncated: false }; // Best-effort
+    }
+
+    if (!typedTrimmed.startsWith(expectedStart)) {
+        // Front truncation detected — clear and retype
+        logger.warn(`[${label}] Front truncation detected: expected "${expectedStart}..." but got "${typedTrimmed.slice(0, 25)}...". Retrying.`);
+
+        // Select all and delete
+        await page.keyboard.down('Control');
+        await page.keyboard.press('a');
+        await page.keyboard.up('Control');
+        await delay(200);
+        await page.keyboard.press('Backspace');
+        await delay(500);
+
+        // Re-focus and retype with slightly slower delay
+        await element.click();
+        await delay(500);
+        await page.keyboard.press('Space');
+        await delay(100);
+        await page.keyboard.press('Backspace');
+        await delay(400);
+        await page.keyboard.type(text, { delay: charDelay + 15 });
+        await delay(800);
+
+        // Second verification
+        const retryContent = await element.evaluate(
+            (el: Element) => {
+                if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value;
+                return (el as HTMLElement).innerText || el.textContent || '';
+            }
+        );
+        const retryTrimmed = retryContent.trim();
+        if (!retryTrimmed.startsWith(expectedStart)) {
+            logger.error(`[${label}] Front truncation persists after retry: "${retryTrimmed.slice(0, 30)}..."`);
+            return { success: false, truncated: true };
+        }
+
+        logger.info(`[${label}] Front truncation fixed on retry`);
+        return { success: true, truncated: true };
+    }
+
+    return { success: true, truncated: false };
 }
 
 function extractHashtags(text: string): string[] {
@@ -271,8 +372,7 @@ Reply only with the comment text, nothing else.`;
 
     const reply = await withRetry(
         async () => {
-            const completion = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
+            const content = await chatCompletion({
                 messages: [
                     {
                         role: 'system',
@@ -284,9 +384,8 @@ Reply only with the comment text, nothing else.`;
                 temperature: 0.8
             });
 
-            const content = completion.choices[0]?.message?.content?.trim();
             if (!content) {
-                throw new Error('OpenAI returned empty reply');
+                throw new Error('AI returned empty reply');
             }
             return content;
         },
@@ -387,35 +486,92 @@ export async function postReply(
         await replyButton.click({ delay: getRandomDelay(30, 80) });
         await delay(2000);
 
-        // Wait for the reply modal / compose area to appear
-        const replyTextarea = await page.waitForSelector(
-            'div[data-testid="tweetTextarea_0"]',
-            { timeout: 8000 }
-        ).catch(() => null);
+        // Wait for the reply modal to appear — ONLY look inside modal/dialog
+        // to avoid accidentally typing in the compose box or search bar
+        const modalSelectors = [
+            'div[aria-modal="true"] div[data-testid="tweetTextarea_0"]',
+            'div[role="dialog"] div[data-testid="tweetTextarea_0"]',
+            'div[aria-modal="true"] div[role="textbox"][contenteditable="true"]',
+            'div[role="dialog"] div[role="textbox"][contenteditable="true"]',
+        ];
+
+        let replyTextarea: ElementHandle<Element> | null = null;
+        for (const sel of modalSelectors) {
+            replyTextarea = await page.waitForSelector(sel, { timeout: 5000 }).catch(() => null);
+            if (replyTextarea) {
+                logger.info(`Reply textarea found: ${sel}`, { component: 'Twitter-Core' });
+                break;
+            }
+        }
 
         if (!replyTextarea) {
-            // Fallback: try finding any contenteditable div in the reply modal
-            const fallbackTextarea = await page.$('div[role="textbox"][contenteditable="true"]');
-            if (!fallbackTextarea) {
-                return { success: false, error: 'Reply compose area not found after clicking reply' };
+            // No modal appeared — abort rather than risk typing in wrong place
+            // Try pressing Escape to close any partial modal, then bail
+            await page.keyboard.press('Escape');
+            return { success: false, error: 'Reply modal did not open — no modal textarea found' };
+        }
+
+        // Click the textarea to focus it
+        await replyTextarea.click();
+        await delay(500);
+
+        // Verify focus is INSIDE the modal, not on search box or compose bar
+        const focusCheck = await page.evaluate(() => {
+            const active = document.activeElement;
+            if (!active) return { ok: false, where: 'none' };
+
+            // Check if active element is inside a modal/dialog
+            const inModal = active.closest('[aria-modal="true"]') || active.closest('[role="dialog"]');
+            if (!inModal) return { ok: false, where: 'outside_modal' };
+
+            // Check it's not a search box
+            let el: Element | null = active;
+            while (el) {
+                const testId = el.getAttribute?.('data-testid') || '';
+                if (testId.toLowerCase().includes('search')) return { ok: false, where: 'search_box' };
+                el = el.parentElement;
             }
-            await fallbackTextarea.click();
-            await delay(500);
-            await page.keyboard.type(reply, { delay: getRandomDelay(20, 60) });
-        } else {
+            return { ok: true, where: 'modal_textarea' };
+        });
+
+        if (!focusCheck.ok) {
+            logger.warn(`Focus not on reply textarea: ${focusCheck.where} — retrying`, {
+                component: 'Twitter-Core', event: 'reply_focus_correction'
+            });
+            // Try clicking the textarea again, directly
             await replyTextarea.click();
             await delay(500);
 
-            // Type the reply with human-like delays
-            await page.keyboard.type(reply, { delay: getRandomDelay(20, 60) });
+            // Re-verify
+            const recheck = await page.evaluate(() => {
+                const active = document.activeElement;
+                const inModal = active?.closest('[aria-modal="true"]') || active?.closest('[role="dialog"]');
+                return !!inModal;
+            });
+            if (!recheck) {
+                await page.keyboard.press('Escape');
+                return { success: false, error: `Focus stuck on ${focusCheck.where} — cannot type reply safely` };
+            }
         }
 
-        await delay(1000);
+        // Type the reply with front-truncation protection
+        const typeResult = await safeType(page, replyTextarea, reply, { label: 'postReply' });
+        if (!typeResult.success) {
+            return { success: false, error: 'Reply text was truncated at front even after retry' };
+        }
 
-        // Click the tweet/reply submit button
-        const submitButton = await page.$('button[data-testid="tweetButton"]');
+        // Click submit — ONLY look inside the modal for the button
+        let submitButton = await page.$('div[aria-modal="true"] button[data-testid="tweetButton"]')
+            || await page.$('div[role="dialog"] button[data-testid="tweetButton"]');
         if (!submitButton) {
-            return { success: false, error: 'Reply submit button not found' };
+            // Fallback: any tweetButton on the page (but only if modal is still open)
+            const modalStillOpen = await page.$('div[aria-modal="true"], div[role="dialog"]');
+            if (modalStillOpen) {
+                submitButton = await page.$('button[data-testid="tweetButton"]');
+            }
+        }
+        if (!submitButton) {
+            return { success: false, error: 'Reply submit button not found in modal' };
         }
 
         await submitButton.click({ delay: getRandomDelay(30, 80) });
@@ -1092,17 +1248,15 @@ export async function postTweet(
             return { success: false, error: 'Tweet compose textarea not found' };
         }
 
-        // Ensure input is focused before typing — prevents front truncation
-        await textInput.click();
-        await delay(500);
-
-        // If this is a quote tweet, paste the URL first, then the text
-        if (options.quoteTweetUrl) {
-            await page.keyboard.type(options.text + '\n' + options.quoteTweetUrl, { delay: getRandomDelay(15, 40) });
-        } else {
-            await page.keyboard.type(options.text, { delay: getRandomDelay(15, 40) });
+        // Type with front-truncation protection
+        const tweetText = options.quoteTweetUrl
+            ? options.text + '\n' + options.quoteTweetUrl
+            : options.text;
+        const typeResult = await safeType(page, textInput, tweetText, { label: 'postTweet' });
+        if (!typeResult.success) {
+            return { success: false, error: 'Tweet text was truncated at front even after retry' };
         }
-        await delay(1000);
+        await delay(500);
 
         // Attach media if provided
         if (options.mediaPath) {
@@ -1285,11 +1439,12 @@ export async function quoteTweet(
             return { success: false, error: 'Quote tweet compose area not found' };
         }
 
-        // Type the commentary
-        await quoteInput.click();
+        // Type the commentary with front-truncation protection
+        const quoteTypeResult = await safeType(page, quoteInput, commentary, { label: 'quoteTweet' });
+        if (!quoteTypeResult.success) {
+            return { success: false, error: 'Quote tweet text was truncated at front even after retry' };
+        }
         await delay(500);
-        await page.keyboard.type(commentary, { delay: getRandomDelay(15, 40) });
-        await delay(1000);
 
         // Post it
         const postButton = await page.$('button[data-testid="tweetButton"]');
@@ -1373,9 +1528,10 @@ export async function postThread(
             return { success: false, error: 'Compose textarea not found for thread' };
         }
 
-        await firstInput.click();
-        await delay(500);
-        await page.keyboard.type(tweets[0].text, { delay: getRandomDelay(15, 40) });
+        const firstTypeResult = await safeType(page, firstInput, tweets[0].text, { label: 'postThread[0]' });
+        if (!firstTypeResult.success) {
+            return { success: false, error: 'Thread first tweet text was truncated at front' };
+        }
         await delay(500);
 
         // Attach media to first tweet if provided
@@ -1416,11 +1572,11 @@ export async function postThread(
             // Find the new textarea (it will be tweetTextarea_N where N is the index)
             const newTextarea = await page.$(`div[data-testid="tweetTextarea_${i}"]`);
             if (newTextarea) {
-                await newTextarea.click();
-                await delay(300);
+                await safeType(page, newTextarea, tweets[i].text, { label: `postThread[${i}]` });
+            } else {
+                // Fallback: type into whatever has focus
+                await page.keyboard.type(tweets[i].text, { delay: getRandomDelay(15, 40) });
             }
-
-            await page.keyboard.type(tweets[i].text, { delay: getRandomDelay(15, 40) });
             await delay(500);
 
             if (tweets[i].mediaPath) {

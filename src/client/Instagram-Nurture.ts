@@ -9,8 +9,8 @@ import { Page, ElementHandle } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { delay } from '../utils/delay';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { chatCompletion } from '../utils/ai';
 import { postComment } from './Instagram-Core';
 import {
     recordInteractionAndDecide, recordBanditPull, updateHealth,
@@ -24,7 +24,7 @@ import { hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/co
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -92,8 +92,7 @@ Rules:
 Reply with ONLY the comment text.`;
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const content = await chatCompletion({
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt },
@@ -102,7 +101,7 @@ Reply with ONLY the comment text.`;
             temperature: 0.85,
         });
 
-        return completion.choices[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || '';
+        return content?.trim()?.replace(/^["']|["']$/g, '') || '';
     } catch (e) {
         logger.error(`[ig-nurture] AI generation failed: ${formatError(e)}`);
         return '';

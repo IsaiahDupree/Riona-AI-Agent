@@ -149,160 +149,7 @@ function tryScheduledRun() {
     });
 }
 
-// ── DM processing (runs independently of reply daily target) ──────
-let dmWatcherInitialized = false;
-
-async function runDMTasks(page: import('puppeteer').Page, runNumber: number) {
-    try {
-        const { TwitterDM } = await import('./client/Twitter-DM');
-        const { checkForNewTwitterDMs, initializeTwitterWatcherState } = await import('./client/Twitter-DM-Watcher');
-        const { TwitterDMPipeline, loadConfig: loadDMConfig } = await import('./client/Twitter-DM-Pipeline');
-        const { getTodayTwitterDMCount, cleanupOldTwitterDMs } = await import('./tracking/twitterDMTracker');
-        const { getTodayDMLimit } = await import('./config/dm-limits');
-        const { notifyNewDM } = await import('./utils/telegram');
-
-        const dm = TwitterDM.fromPage(page);
-        const dmConfig = loadDMConfig();
-        dmConfig.autoApprove = process.env.TWITTER_DM_AUTO_APPROVE === 'true';
-        dmConfig.maxDMsPerDay = getTodayDMLimit();
-        const dmPipeline = new TwitterDMPipeline(dm, dmConfig);
-
-        // Initialize watcher state on first run + one-time catch-up
-        if (!dmWatcherInitialized) {
-            try {
-                await initializeTwitterWatcherState(dm);
-                dmWatcherInitialized = true;
-                logger.info('[twitter-scheduler] DM watcher state initialized');
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM watcher init failed (non-fatal): ${formatError(e)}`);
-            }
-
-            // One-time catch-up: reply to missed incoming DMs
-            try {
-                const catchUpResult = await dmPipeline.catchUpMissedReplies();
-                if (catchUpResult.replied > 0) {
-                    logger.info(`[twitter-scheduler] DM catch-up: scheduled ${catchUpResult.replied} reply(ies)`);
-                }
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM catch-up failed (non-fatal): ${formatError(e)}`);
-            }
-        }
-
-        // Process any delayed replies that are ready (VI schedule)
-        try {
-            const delayedResult = await dmPipeline.processDelayedReplies();
-            if (delayedResult.sent > 0) {
-                logger.info(`[twitter-scheduler] DM: Sent ${delayedResult.sent} delayed reply(ies)`);
-            }
-        } catch (e) {
-            logger.warn(`[twitter-scheduler] DM delayed reply error (non-fatal): ${formatError(e)}`);
-        }
-
-        // Check for new incoming DMs
-        const detected = await checkForNewTwitterDMs(dm);
-        if (detected.newMessages.length > 0) {
-            logger.info(`[twitter-scheduler] DM: ${detected.newMessages.length} new message(s) (DOM: ${detected.unreadFromDOM}, state: ${detected.detectedByState})`);
-            for (const msg of detected.newMessages) {
-                logger.info(`[twitter-scheduler] DM from: ${msg.from} — "${msg.preview.slice(0, 50)}"`);
-                await notifyNewDM(msg.from, msg.preview, 'Twitter').catch(() => {});
-            }
-
-            // Auto-reply to new DMs (schedules via VI delays)
-            try {
-                const replyResult = await dmPipeline.processDMAutoReplies();
-                if (replyResult.replied > 0) {
-                    logger.info(`[twitter-scheduler] DM: Scheduled ${replyResult.replied} reply(ies) via VI delay`);
-                }
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM auto-reply error (non-fatal): ${formatError(e)}`);
-            }
-        }
-
-        // Pipeline tasks (every 3rd run — outreach, feedback, tiers)
-        if (runNumber % 3 === 0) {
-            // Process approved sends
-            try {
-                const approvedResults = await dmPipeline.processApprovedSends();
-                if (approvedResults.length > 0) {
-                    const sent = approvedResults.filter((r: any) => r.status === 'sent').length;
-                    logger.info(`[twitter-scheduler] DM: ${sent} approved send(s) processed`);
-                }
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM approved sends error (non-fatal): ${formatError(e)}`);
-            }
-
-            // Check replies and update feedback
-            try {
-                const repliesFound = await dmPipeline.checkRepliesAndUpdateFeedback();
-                if (repliesFound > 0) {
-                    logger.info(`[twitter-scheduler] DM: ${repliesFound} new reply feedback(s)`);
-                }
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM feedback error (non-fatal): ${formatError(e)}`);
-            }
-
-            // Tier evaluation
-            try {
-                const { runTierEvaluation } = await import('./nurture/tiers');
-                const { promoted, demoted } = runTierEvaluation('twitter');
-                if (promoted.length > 0) logger.info(`[twitter-scheduler] DM tier promotions: ${promoted.join(', ')}`);
-                if (demoted.length > 0) logger.info(`[twitter-scheduler] DM tier demotions: ${demoted.join(', ')}`);
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM tier eval error (non-fatal): ${formatError(e)}`);
-            }
-
-            // Outreach to queued targets (if under daily limit)
-            const todayDMCount = getTodayTwitterDMCount();
-            const maxDMsPerDay = dmConfig.maxDMsPerDay;
-            if (todayDMCount < maxDMsPerDay) {
-                const hour = new Date().getHours();
-                if (hour >= 9 && hour < 21) {
-                    const { collectNicheProspects } = await import('./client/Twitter-AI');
-                    const TARGETS_FILE = path.join(process.cwd(), 'logs', 'tracking', 'twitter-dm', 'outreach_targets.json');
-                    let targets = safeReadJSON<string[]>(TARGETS_FILE, [], 'twitter_outreach_targets');
-
-                    if (targets.length > 0) {
-                        const remaining = maxDMsPerDay - todayDMCount;
-                        const batch = targets.slice(0, Math.min(3, remaining));
-                        logger.info(`[twitter-scheduler] DM outreach: ${batch.length} targets`);
-                        try {
-                            const stats = await dmPipeline.runBatchOutreach(batch);
-                            logger.info(`[twitter-scheduler] DM outreach: ${stats.sent} sent, ${stats.skipped} skipped, ${stats.failed} failed`);
-                        } catch (outreachErr) {
-                            logger.warn(`[twitter-scheduler] DM outreach error (non-fatal): ${formatError(outreachErr)}`);
-                        }
-                        const remainingTargets = targets.filter(t => !batch.includes(t));
-                        safeWriteJSON(TARGETS_FILE, remainingTargets, 'twitter_outreach_targets');
-                    }
-                }
-            }
-
-            // Proactive check-ins for warm contacts
-            try {
-                const { processDueCheckIns } = await import('./nurture/check-ins');
-                const checkInsSent = await processDueCheckIns('twitter', async (username, message) => {
-                    try {
-                        const stats = await dmPipeline.runBatchOutreach([username]);
-                        return stats.sent > 0;
-                    } catch { return false; }
-                }, 3);
-                if (checkInsSent > 0) {
-                    logger.info(`[twitter-scheduler] DM: ${checkInsSent} proactive check-in(s) sent`);
-                }
-            } catch (e) {
-                logger.warn(`[twitter-scheduler] DM check-ins error (non-fatal): ${formatError(e)}`);
-            }
-
-            // DM cleanup (every 3rd run, lightweight)
-            try { cleanupOldTwitterDMs(90); } catch (_) {}
-        }
-
-        // Navigate back to home so subsequent scheduler tasks work
-        await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    } catch (dmErr) {
-        logger.warn(`[twitter-scheduler] DM processing failed (non-fatal): ${formatError(dmErr)}`);
-    }
-}
+// DM tasks are handled by twitter-dm-scheduler.ts (separate process + separate Chrome profile)
 
 async function scheduledRun() {
     if (!acquireLock()) {
@@ -315,23 +162,6 @@ async function scheduledRun() {
         const effectiveCount = Math.max(counter.count, trackerCount);
 
         if (effectiveCount >= DAILY_TARGET) {
-            // Daily target reached, but still run DM tasks if within active hours
-            if (isWithinActiveHours()) {
-                let tempAI: any = null;
-                try {
-                    const { TwitterAI: TwitterAIClass } = await import('./client/Twitter');
-                    tempAI = new TwitterAIClass();
-                    await tempAI.initialize();
-                    const page = tempAI.getPage();
-                    if (page) {
-                        await runDMTasks(page, counter.runs + 1);
-                    }
-                } catch (e) {
-                    logger.debug(`[twitter-scheduler] DM-only run failed (non-fatal): ${formatError(e)}`);
-                } finally {
-                    if (tempAI) try { await tempAI.close(); } catch (_) {}
-                }
-            }
             logger.info(`[twitter-scheduler] Daily target reached (${effectiveCount}/${DAILY_TARGET}). Skipping until tomorrow.`);
             return;
         }
@@ -443,15 +273,15 @@ async function scheduledRun() {
                         logger.debug(`[twitter-scheduler] Badge read failed (non-fatal): ${formatError(badgeErr)}`);
                     }
 
-                    // ── DM Watcher + Auto-Reply (merged from twitter-dm-scheduler) ──
-                    await runDMTasks(page, runNumber);
+                    // DMs handled by separate twitter-dm-scheduler process
 
                     const { shouldPostContent } = await import('./strategy/twitter-content-calendar');
                     const { postStrategicContent } = await import('./client/Twitter-AI');
                     const { getBestPostingHours } = await import('./client/Twitter-Content-Analytics');
 
                     const lastPostData = safeReadJSON<{ run: number; postsToday?: number; lastPostDate?: string }>(LAST_POST_RUN_FILE, { run: 0, postsToday: 0 }, 'last_post_run');
-                    const lastPostRun = lastPostData.run;
+                    // Reset lastPostRun to 0 on a new day so gap calculation works correctly
+                    const lastPostRun = (lastPostData.lastPostDate === todayStr()) ? lastPostData.run : 0;
                     const maxPerDay = parseInt(process.env.TWITTER_TWEETS_PER_DAY || '12', 10);
                     const postsToday = (lastPostData.lastPostDate === todayStr()) ? (lastPostData.postsToday || 0) : 0;
 
@@ -643,20 +473,14 @@ async function scheduledRun() {
                         }
                     }
 
-                    // ── Periodic VR snapshot sync + bulk DM sync (every 20th run) ──
+                    // ── Periodic VR snapshot sync (every 20th run) ──
+                    // DM bulk sync handled by twitter-dm-scheduler
                     if (runNumber % 20 === 0) {
                         try {
                             const { syncAllVRSnapshots } = await import('./db/supabaseNurture');
                             await syncAllVRSnapshots();
                         } catch (snapErr) {
                             logger.debug(`[twitter-scheduler] VR snapshot sync failed (non-fatal): ${formatError(snapErr)}`);
-                        }
-                        try {
-                            const { bulkSyncTwitterToSupabase } = await import('./db/supabaseTwitterDM');
-                            const syncResult = await bulkSyncTwitterToSupabase();
-                            logger.info(`[twitter-scheduler] Twitter DM bulk sync: ${syncResult.conversations} contacts, ${syncResult.messages} msgs`);
-                        } catch (syncErr) {
-                            logger.debug(`[twitter-scheduler] Twitter DM bulk sync failed (non-fatal): ${formatError(syncErr)}`);
                         }
                     }
                 }

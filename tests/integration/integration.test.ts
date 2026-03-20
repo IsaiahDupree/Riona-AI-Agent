@@ -51,10 +51,10 @@ describe('Integration Tests', () => {
         });
     });
 
-    describe('OpenAI Integration', () => {
-        it('should generate a comment using OpenAI if configured', async () => {
-            if (!process.env.OPENAI_API_KEY) {
-                console.log('Skipping: OpenAI API key not configured');
+    describe('AI Integration', () => {
+        it('should generate a comment using AI if configured', async () => {
+            if (!(process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_API_KEY)) {
+                console.log('Skipping: Anthropic API key not configured');
                 return;
             }
 

@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import { logger } from '../utils/logger';
 import { formatError, sanitizeForPrompt } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, DMContext } from '../types/dm';
@@ -6,8 +6,6 @@ import { getLearningContextForAI, recordTimingStat } from './Instagram-DM-Analyt
 import { syncFeedbackToSupabase, syncRelationshipToSupabase } from '../db/supabaseDM';
 import * as fs from 'fs';
 import * as path from 'path';
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ── Relationship Store ──────────────────────────────────────────────
 
@@ -238,8 +236,7 @@ Objective for this message: ${messageObjective}
 Generate the next message to send. Just the message text, nothing else.`;
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const message = await chatCompletion({
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt }
@@ -248,8 +245,7 @@ Generate the next message to send. Just the message text, nothing else.`;
             temperature: isJackpot ? 0.9 : 0.8
         });
 
-        const message = completion.choices[0]?.message?.content?.trim();
-        if (!message) throw new Error('OpenAI returned empty response');
+        if (!message) throw new Error('AI returned empty response');
 
         // Clean up — remove surrounding quotes if present
         const cleaned = message.replace(/^["']|["']$/g, '').trim();

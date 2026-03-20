@@ -43,6 +43,35 @@ export function hasSentDMTo(username: string, withinHours = 24): TrackedDM | nul
     ) || null;
 }
 
+/**
+ * Check if we've already contacted a user today (sent DMs OR have pending scheduled replies).
+ * This is the unified dedup check that prevents double-sends from separate code paths.
+ */
+export function hasContactedToday(username: string): boolean {
+    if (!username) return false;
+    const lower = username.toLowerCase();
+
+    // Check sent DMs today
+    const dms = loadDMs();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const cutoff = todayStart.toISOString();
+    const sentToday = dms.some(d =>
+        d.recipientUsername.toLowerCase() === lower &&
+        d.direction === 'outbound' &&
+        d.timestamp >= cutoff
+    );
+    if (sentToday) return true;
+
+    // Check pending delayed replies
+    try {
+        const { hasPendingReply } = require('../nurture/vi-delays');
+        if (hasPendingReply(username, 'instagram')) return true;
+    } catch (_) { /* vi-delays not available */ }
+
+    return false;
+}
+
 export function trackDM(dm: TrackedDM) {
     const dms = loadDMs();
     dms.push(dm);

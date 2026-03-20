@@ -9,8 +9,8 @@ import { Page, ElementHandle } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { delay } from '../utils/delay';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { chatCompletion } from '../utils/ai';
 import {
     extractTweetMetadata, postReply, likeTweet, extractTweetUrl,
     TweetMetadata,
@@ -27,7 +27,7 @@ import { hasRepliedToTweet, trackReply, TrackedReply } from '../tracking/twitter
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -96,8 +96,7 @@ Rules:
 Reply with ONLY the comment text.`;
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const content = await chatCompletion({
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt },
@@ -106,8 +105,7 @@ Reply with ONLY the comment text.`;
             temperature: 0.85,
         });
 
-        const comment = completion.choices[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || '';
-        return comment;
+        return content?.trim()?.replace(/^["']|["']$/g, '') || '';
     } catch (e) {
         logger.error(`[twitter-nurture] AI generation failed: ${formatError(e)}`);
         return '';

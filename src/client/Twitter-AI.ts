@@ -7,7 +7,7 @@ import { delay } from '../utils/delay';
 import * as path from 'path';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import {
     extractTweetMetadata, generateReply, validateReply,
     postReply, likeTweet, hasAlreadyReplied, hasAlreadyLiked,
@@ -1441,7 +1441,7 @@ export async function runTwitter(externalTrace?: any): Promise<void> {
 
 // ── OpenAI instance for content generation ───────────────────────────
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── AI-Powered Original Tweet Generation ─────────────────────────────
 
@@ -1501,8 +1501,7 @@ Reply with ONLY the tweet text, nothing else.`;
         ? `${brandContext} You write tweets that are insightful, concise, and drive engagement.`
         : `You are a knowledgeable voice in the ${niche} space on Twitter/X. You write tweets that are insightful, concise, and drive engagement. Your tone is confident but approachable.`;
 
-    const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+    const content = await chatCompletion({
         messages: [
             { role: 'system', content: systemContent },
             { role: 'user', content: prompt }
@@ -1511,9 +1510,8 @@ Reply with ONLY the tweet text, nothing else.`;
         temperature: 0.9
     });
 
-    const content = completion.choices[0]?.message?.content?.trim() || '';
     // Strip surrounding quotes if present
-    return content.replace(/^["']|["']$/g, '');
+    return (content || '').replace(/^["']|["']$/g, '');
 }
 
 // ── AI-Powered Thread Generation ─────────────────────────────────────
@@ -1545,8 +1543,7 @@ Reply with each tweet on a new line, numbered.`;
         ? `${brandContext} You write viral Twitter threads that educate, inspire, and drive discussion.`
         : `You are a thought leader in ${niche} who writes viral Twitter threads. Your threads educate, inspire, and drive discussion.`;
 
-    const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+    const raw = await chatCompletion({
         messages: [
             {
                 role: 'system',
@@ -1556,9 +1553,7 @@ Reply with each tweet on a new line, numbered.`;
         ],
         max_tokens: 600,
         temperature: 0.85
-    });
-
-    const raw = completion.choices[0]?.message?.content?.trim() || '';
+    }) || '';
     // Parse numbered tweets: "1/ ...", "2/ ...", etc.
     const tweets = raw.split(/\n+/)
         .map(line => line.replace(/^\d+[\/\.]\s*/, '').trim())
@@ -1901,8 +1896,7 @@ Rules:
 
 Reply with ONLY the commentary text.`;
 
-    const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+    const commentary = (await chatCompletion({
         messages: [
             {
                 role: 'system',
@@ -1912,9 +1906,7 @@ Reply with ONLY the commentary text.`;
         ],
         max_tokens: 80,
         temperature: 0.85
-    });
-
-    const commentary = completion.choices[0]?.message?.content?.trim()?.replace(/^["']|["']$/g, '') || '';
+    }) || '').replace(/^["']|["']$/g, '');
 
     if (!commentary) {
         return { success: false, error: 'Failed to generate quote tweet commentary' };

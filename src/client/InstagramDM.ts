@@ -9,8 +9,8 @@
 import { Page, ElementHandle } from 'puppeteer';
 import { logger } from '../utils/logger';
 import { delay } from '../utils/delay';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { chatCompletion } from '../utils/ai';
 import { pushStep } from '../trace/runtime';
 import { StorageInterface } from '../db/interfaces';
 import { SupabaseStorage } from '../db/supabase';
@@ -18,10 +18,7 @@ import { SupabaseStorage } from '../db/supabase';
 // Load environment variables
 dotenv.config();
 
-// Configure OpenAI
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY || ''
-});
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // DM Processing configuration
 const DM_TIMEOUT_MS = parseInt(process.env.DM_TIMEOUT_MS || '30000', 10);
@@ -528,8 +525,7 @@ ${conversationHistory}
 
 Generate a natural, friendly response to continue this conversation. Just provide the response text, no quotes or prefixes.`;
 
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
+        const response = await chatCompletion({
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userPrompt }
@@ -538,10 +534,8 @@ Generate a natural, friendly response to continue this conversation. Just provid
             temperature: 0.8
         });
 
-        const response = completion.choices[0]?.message?.content?.trim();
-
         if (!response) {
-            logger.warn('OpenAI did not generate a response', {
+            logger.warn('AI did not generate a response', {
                 component: 'InstagramDM',
                 event: 'no_response_generated'
             });

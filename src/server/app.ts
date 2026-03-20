@@ -1,11 +1,17 @@
 import express, { Request, Response, NextFunction } from 'express';
+import http from 'http';
 import { connectDB, isDBConnected } from '../config/db';
 import { initializeDatabase } from '../config/initDb';
 import { traceRouter } from './traceRoutes';
 import { hitlRouter } from '../hitl/routes';
 import { dmRouter } from './dmRoutes';
+import { systemRouter } from './systemRoutes';
+import { serviceRouter } from './serviceRoutes';
+import { browserRouter } from './browserRoutes';
+import { actionRouter } from './actionRoutes';
+import { opsRouter } from './opsRoutes';
 
-export async function startServer() {
+export async function startServer(): Promise<http.Server> {
   let dbAvailable = false;
 
   try {
@@ -32,6 +38,11 @@ export async function startServer() {
   app.use('/api/trace', traceRouter);
   app.use('/api/hitl', hitlRouter);
   app.use('/api/dm', dmRouter);
+  app.use('/api/system', systemRouter);
+  app.use('/api/services', serviceRouter);
+  app.use('/api/browsers', browserRouter);
+  app.use('/api/actions', actionRouter);
+  app.use('/api/ops', opsRouter);
 
   // Global error handler — catches unhandled route errors
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
@@ -40,10 +51,10 @@ export async function startServer() {
   });
 
   const port = Number(process.env.PORT || 3000);
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<http.Server>((resolve, reject) => {
     const server = app.listen(port, () => {
       console.log(`[server] listening on http://localhost:${port}${dbAvailable ? '' : ' (no DB)'}`);
-      resolve();
+      resolve(server);
     });
     server.on('error', (err) => {
       console.error(`[server] Failed to listen on port ${port}:`, err);

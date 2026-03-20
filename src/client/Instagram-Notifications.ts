@@ -7,9 +7,9 @@
  */
 
 import { Page } from 'puppeteer';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { logger } from '../utils/logger';
+import { chatCompletion } from '../utils/ai';
 import { formatError, withRetry, safeReadJSON, safeWriteJSON } from '../utils/errors';
 import { delay } from '../utils/delay';
 import { updateHealth, loadVRState, recordBanditReward } from '../nurture/vr-scheduler';
@@ -21,7 +21,7 @@ import * as fs from 'fs';
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -322,8 +322,7 @@ Reply only with the comment text, nothing else.`;
 
     const reply = await withRetry(
         async () => {
-            const completion = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
+            const content = await chatCompletion({
                 messages: [
                     {
                         role: 'system',
@@ -334,7 +333,6 @@ Reply only with the comment text, nothing else.`;
                 max_tokens: 60,
                 temperature: 0.85,
             });
-            const content = completion.choices[0]?.message?.content?.trim();
             if (!content) throw new Error('Empty reply');
             return content;
         },

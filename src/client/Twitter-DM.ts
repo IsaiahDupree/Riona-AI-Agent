@@ -1,12 +1,18 @@
 import { Page, ElementHandle } from 'puppeteer';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { logger } from '../utils/logger';
 import { screenshotPath, formatError } from '../utils/errors';
+import { safeType } from './Twitter-Core';
 import { DMSendResult, DMMessage, ConversationPreview } from '../types/dm';
 import * as path from 'path';
 import * as fs from 'fs';
 
+puppeteer.use(StealthPlugin());
+
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 const TIMEOUT = 60000;
+// Separate profile from main Twitter bot — each process gets its own Chrome session
 const TWITTER_DM_PROFILE = path.join(process.cwd(), process.env.TWITTER_DM_CHROME_PROFILE || 'chrome-profile-twitter-dm');
 
 // ── Twitter/X DM Automation ─────────────────────────────────────────
@@ -34,9 +40,10 @@ export class TwitterDM {
         if (!fs.existsSync(TWITTER_DM_PROFILE)) {
             fs.mkdirSync(TWITTER_DM_PROFILE, { recursive: true });
         }
-        const puppeteer = await import('puppeteer');
-        this.browser = await puppeteer.default.launch({
+
+        this.browser = await puppeteer.launch({
             headless: false,
+            executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -61,13 +68,21 @@ export class TwitterDM {
         if (!this.page) return;
 
         await this.page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: TIMEOUT });
-        await delay(2000);
+        await delay(3000);
 
         const currentUrl = this.page.url();
+        logger.info(`[twitter-dm] Session check URL: ${currentUrl}`);
+
         if (!currentUrl.includes('/login') && !currentUrl.includes('/i/flow/login')) {
             logger.info('[twitter-dm] Session valid (via browser profile)');
             return;
         }
+
+        // Take screenshot to see what page we're on
+        try {
+            await this.page.screenshot({ path: path.join(process.cwd(), 'debug-twitter-login-check.png') });
+            logger.info('[twitter-dm] Screenshot saved: debug-twitter-login-check.png');
+        } catch (e) { /* ignore */ }
 
         // Need to log in
         const username = process.env.TWITTER_BOT_USERNAME;
@@ -78,44 +93,82 @@ export class TwitterDM {
 
         logger.info('[twitter-dm] Session expired, logging in...');
         await this.page.goto('https://x.com/i/flow/login', { waitUntil: 'networkidle2', timeout: TIMEOUT });
+        await delay(3000);
 
-        // Username
-        await this.page.waitForSelector('input[autocomplete="username"], input[name="text"]', { timeout: TIMEOUT });
-        await delay(1000);
-        const usernameInput = await this.page.$('input[autocomplete="username"]') || await this.page.$('input[name="text"]');
+        // Step 1: Username — try multiple selectors for the "Phone, email, or username" field
+        const usernameSelectors = [
+            'input[autocomplete="username"]',
+            'input[name="text"]',
+            'input[autocomplete="on"]',
+            'input[type="text"]',
+        ];
+        let usernameInput = null;
+        for (const sel of usernameSelectors) {
+            try {
+                await this.page.waitForSelector(sel, { timeout: 10000 });
+                usernameInput = await this.page.$(sel);
+                if (usernameInput) {
+                    logger.info(`[twitter-dm] Found username input: ${sel}`);
+                    break;
+                }
+            } catch { continue; }
+        }
         if (!usernameInput) throw new Error('[twitter-dm] Username input not found');
+
+        await usernameInput.click();
+        await delay(500);
         await usernameInput.type(username, { delay: 50 });
+        await delay(1000);
 
         // Click Next
-        const nextBtn = await this.page.evaluateHandle(() => {
+        await this.page.evaluate(() => {
             const buttons = document.querySelectorAll('button, [role="button"]');
             for (const btn of buttons) {
-                if ((btn.textContent || '').trim().toLowerCase() === 'next') return btn;
+                if ((btn.textContent || '').trim().toLowerCase() === 'next') {
+                    (btn as HTMLElement).click();
+                    return;
+                }
             }
-            return null;
         });
-        if (nextBtn) {
-            await (nextBtn as ElementHandle<Element>).click();
-            await delay(2000);
-        }
+        await delay(3000);
 
-        // Handle verification step (unusual login)
+        // Handle verification step (unusual login — asks for phone or email)
         const verificationInput = await this.page.$('input[data-testid="ocfEnterTextTextInput"]');
         if (verificationInput) {
-            const verificationValue = process.env.TWITTER_BOT_EMAIL || process.env.TWITTER_BOT_PHONE || '';
+            const verificationValue = process.env.TWITTER_BOT_PHONE || process.env.TWITTER_BOT_EMAIL || '';
+            logger.info(`[twitter-dm] Verification step detected, entering: ${verificationValue ? verificationValue.slice(0, 4) + '...' : 'NONE'}`);
             if (verificationValue) {
                 await verificationInput.type(verificationValue, { delay: 50 });
                 const verifyNext = await this.page.$('[data-testid="ocfEnterTextNextButton"]');
-                if (verifyNext) { await verifyNext.click(); await delay(2000); }
+                if (verifyNext) { await verifyNext.click(); await delay(3000); }
             } else {
-                logger.warn('[twitter-dm] Verification step but no TWITTER_BOT_EMAIL/PHONE set');
+                logger.warn('[twitter-dm] Verification step but no TWITTER_BOT_PHONE/EMAIL set');
             }
         }
 
-        // Password
-        await this.page.waitForSelector('input[name="password"], input[type="password"]', { timeout: TIMEOUT });
-        const passwordInput = await this.page.$('input[name="password"]') || await this.page.$('input[type="password"]');
+        // Step 2: Password — wait for it to appear
+        let passwordInput = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            passwordInput = await this.page.$('input[name="password"]') || await this.page.$('input[type="password"]');
+            if (passwordInput) break;
+            await delay(2000);
+            // Take debug screenshot if password field not found
+            if (attempt === 1) {
+                try {
+                    await this.page.screenshot({ path: path.join(process.cwd(), 'debug-twitter-dm-password.png') });
+                    logger.info('[twitter-dm] Debug screenshot: debug-twitter-dm-password.png');
+                } catch { /* ignore */ }
+            }
+        }
+        if (!passwordInput) {
+            // One more try with explicit wait
+            await this.page.waitForSelector('input[name="password"], input[type="password"]', { timeout: 15000 });
+            passwordInput = await this.page.$('input[name="password"]') || await this.page.$('input[type="password"]');
+        }
         if (!passwordInput) throw new Error('[twitter-dm] Password input not found');
+
+        await passwordInput.click();
+        await delay(500);
         await passwordInput.type(password, { delay: 50 });
 
         // Click Log in
@@ -1555,42 +1608,18 @@ export class TwitterDM {
             return false;
         }
 
-        // Focus the input reliably — Twitter's DM input can swallow early keystrokes
+        // Clear any existing text in the input
         await msgInput.click();
         await delay(300);
-        // Triple-click to select any existing text, then clear it
         await msgInput.click({ clickCount: 3 });
         await delay(200);
         await this.page.keyboard.press('Backspace');
         await delay(300);
-        // Click again to ensure cursor is properly positioned
-        await msgInput.click();
-        await delay(500);
 
-        // Type the message
-        await this.page.keyboard.type(message, { delay: 40 });
-        await delay(1000);
-
-        // Verify the typed text wasn't truncated at the front
-        const typedText = await msgInput.evaluate(el => {
-            if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value;
-            return (el as HTMLElement).innerText || el.textContent || '';
-        });
-        const typedTrimmed = typedText.trim();
-        const expectedStart = message.slice(0, 15);
-        if (typedTrimmed.length > 0 && !typedTrimmed.startsWith(expectedStart)) {
-            logger.warn(`[twitter-dm] Front truncation detected! Expected "${expectedStart}..." but got "${typedTrimmed.slice(0, 20)}...". Retrying...`);
-            // Clear and retype
-            await this.page.keyboard.down('Control');
-            await this.page.keyboard.press('a');
-            await this.page.keyboard.up('Control');
-            await delay(200);
-            await this.page.keyboard.press('Backspace');
-            await delay(500);
-            await msgInput.click();
-            await delay(500);
-            await this.page.keyboard.type(message, { delay: 50 });
-            await delay(1000);
+        // Type with front-truncation protection
+        const typeResult = await safeType(this.page, msgInput, message, { charDelay: 40, label: 'twitter-dm' });
+        if (!typeResult.success) {
+            logger.error('[twitter-dm] Message text truncated at front even after retry');
         }
 
         // Find and click the Send button

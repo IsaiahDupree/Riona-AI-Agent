@@ -21,7 +21,7 @@ export interface DelayedReplyEntry {
     replyMessage: string;
     sendAfter: string;       // ISO timestamp — when to actually send
     createdAt: string;
-    status: 'pending' | 'sent' | 'failed';
+    status: 'pending' | 'sending' | 'sent' | 'failed';
     error?: string;
     context: {
         relationship: RelationshipInfo;
@@ -120,7 +120,7 @@ function saveQueue(queue: DelayedReplyEntry[]): void {
 export function hasPendingReply(username: string, platform: 'twitter' | 'instagram'): boolean {
     const queue = loadQueue();
     return queue.some(e =>
-        e.status === 'pending' &&
+        (e.status === 'pending' || e.status === 'sending') &&
         e.username.toLowerCase() === username.toLowerCase() &&
         e.platform === platform
     );
@@ -149,15 +149,28 @@ export function scheduleDelayedReply(entry: Omit<DelayedReplyEntry, 'id' | 'crea
 
 /**
  * Get replies whose sendAfter timestamp has passed and are still pending.
+ * Atomically marks them as "sending" to prevent concurrent pipeline/watcher
+ * loops from picking up the same entries. If the send fails, call
+ * markReplyFailed() to reset. If it succeeds, call markReplySent().
  */
 export function getReadyReplies(platform?: 'twitter' | 'instagram'): DelayedReplyEntry[] {
     const queue = loadQueue();
     const now = Date.now();
-    return queue.filter(e =>
+    const ready = queue.filter(e =>
         e.status === 'pending' &&
         new Date(e.sendAfter).getTime() <= now &&
         (!platform || e.platform === platform)
     );
+
+    // Atomically claim: mark as "sending" so no other loop picks them up
+    if (ready.length > 0) {
+        for (const entry of ready) {
+            entry.status = 'sending';
+        }
+        saveQueue(queue);
+    }
+
+    return ready;
 }
 
 /**

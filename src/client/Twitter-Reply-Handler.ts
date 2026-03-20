@@ -11,12 +11,13 @@
  * Does NOT count toward cold DM/reply limits — these are relationship responses.
  */
 
-import { Page } from 'puppeteer';
-import OpenAI from 'openai';
+import { ElementHandle, Page } from 'puppeteer';
 import dotenv from 'dotenv';
+import { chatCompletion } from '../utils/ai';
 import { logger } from '../utils/logger';
 import { formatError, withRetry } from '../utils/errors';
 import { delay } from '../utils/delay';
+import { safeType } from './Twitter-Core';
 import {
     getUnactionedReplies, markNotificationActioned,
     DetectedNotification,
@@ -27,8 +28,6 @@ import { profileExists } from '../nurture/store';
 import { getBrandPromptContext } from '../strategy/twitter-brand';
 
 dotenv.config();
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -91,8 +90,7 @@ Reply only with the response text, nothing else.`;
 
     const reply = await withRetry(
         async () => {
-            const completion = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
+            const content = await chatCompletion({
                 messages: [
                     {
                         role: 'system',
@@ -103,8 +101,7 @@ Reply only with the response text, nothing else.`;
                 max_tokens: 80,
                 temperature: 0.85,
             });
-            const content = completion.choices[0]?.message?.content?.trim();
-            if (!content) throw new Error('OpenAI returned empty reply');
+            if (!content) throw new Error('AI returned empty reply');
             return content;
         },
         { maxRetries: 2, baseDelay: 1000, label: 'reply-to-reply-generation' },
@@ -183,7 +180,6 @@ async function extractTweetContext(page: Page, notification: DetectedNotificatio
 async function postReplyToTweet(page: Page, replyText: string): Promise<{ success: boolean; error?: string }> {
     try {
         // We should be on the tweet page already — find the reply compose area
-        // Click the reply button on the tweet we want to reply to
         const replyButton = await page.$('button[data-testid="reply"]');
         if (!replyButton) {
             // Try the inline reply box (sometimes present on tweet detail pages)
@@ -191,36 +187,44 @@ async function postReplyToTweet(page: Page, replyText: string): Promise<{ succes
             if (!inlineReply) {
                 return { success: false, error: 'No reply button or textarea found' };
             }
-            await inlineReply.click();
-            await delay(500);
-            await page.keyboard.type(replyText, { delay: Math.floor(Math.random() * 40) + 20 });
+            const typeResult = await safeType(page, inlineReply, replyText, { label: 'replyToTweet-inline' });
+            if (!typeResult.success) {
+                return { success: false, error: 'Reply text truncated at front' };
+            }
         } else {
             await replyButton.click();
             await delay(2000);
 
-            // Wait for compose area
-            const textarea = await page.waitForSelector(
-                'div[data-testid="tweetTextarea_0"]',
+            // Wait for compose area — prefer modal-scoped selector
+            let textarea = await page.waitForSelector(
+                'div[aria-modal="true"] div[data-testid="tweetTextarea_0"], div[role="dialog"] div[data-testid="tweetTextarea_0"]',
                 { timeout: 8000 },
             ).catch(() => null);
 
             if (!textarea) {
-                const fallback = await page.$('div[role="textbox"][contenteditable="true"]');
+                textarea = await page.$('div[data-testid="tweetTextarea_0"]');
+            }
+
+            if (!textarea) {
+                const fallback = await page.$('div[role="dialog"] div[role="textbox"][contenteditable="true"]')
+                    || await page.$('div[role="textbox"][contenteditable="true"]');
                 if (!fallback) return { success: false, error: 'Reply compose area not found' };
-                await fallback.click();
-                await delay(500);
-                await page.keyboard.type(replyText, { delay: Math.floor(Math.random() * 40) + 20 });
-            } else {
-                await textarea.click();
-                await delay(500);
-                await page.keyboard.type(replyText, { delay: Math.floor(Math.random() * 40) + 20 });
+                textarea = fallback;
+            }
+
+            const typeResult = await safeType(page, textarea, replyText, { label: 'replyToTweet-modal' });
+            if (!typeResult.success) {
+                return { success: false, error: 'Reply text truncated at front' };
             }
         }
 
         await delay(1000);
 
-        // Click send
-        const sendButton = await page.$('button[data-testid="tweetButton"]');
+        // Click send — prefer modal-scoped button
+        let sendButton = await page.$('div[aria-modal="true"] button[data-testid="tweetButton"], div[role="dialog"] button[data-testid="tweetButton"]');
+        if (!sendButton) {
+            sendButton = await page.$('button[data-testid="tweetButton"]');
+        }
         if (!sendButton) {
             return { success: false, error: 'Send button not found' };
         }

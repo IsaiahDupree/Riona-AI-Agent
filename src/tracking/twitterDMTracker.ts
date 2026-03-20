@@ -43,6 +43,35 @@ export function hasSentTwitterDMTo(username: string, withinHours = 24): TrackedD
     ) || null;
 }
 
+/**
+ * Check if we've already contacted a user today (sent DMs OR have pending scheduled replies).
+ * Unified dedup check that prevents double-sends from outreach + auto-reply paths.
+ */
+export function hasContactedTwitterToday(username: string): boolean {
+    if (!username) return false;
+    const lower = username.toLowerCase();
+
+    // Check sent DMs today
+    const dms = loadDMs();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const cutoff = todayStart.toISOString();
+    const sentToday = dms.some(d =>
+        d.recipientUsername.toLowerCase() === lower &&
+        d.direction === 'outbound' &&
+        d.timestamp >= cutoff
+    );
+    if (sentToday) return true;
+
+    // Check pending delayed replies
+    try {
+        const { hasPendingReply } = require('../nurture/vi-delays');
+        if (hasPendingReply(username, 'twitter')) return true;
+    } catch (_) { /* vi-delays not available */ }
+
+    return false;
+}
+
 export function trackTwitterDM(dm: TrackedDM) {
     const dms = loadDMs();
     dms.push(dm);

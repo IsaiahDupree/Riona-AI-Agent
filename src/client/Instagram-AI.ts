@@ -5,7 +5,7 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 // AdblockerPlugin removed — imported but never used (commented out at line 48)
 import puppeteer from 'puppeteer-extra';
 import dotenv from 'dotenv';
-import { OpenAI } from 'openai';
+// OpenAI removed — AI generation handled by Instagram-Core via shared Anthropic wrapper
 import * as path from 'path';
 import * as fs from 'fs';
 import { delay } from '../utils/delay';
@@ -172,10 +172,12 @@ export class InstagramAI {
     private isLoggedIn: boolean = false;
     private lastBatchTime: Date | null = null;
     private readonly cookiesPath: string;
+    private readonly chromeProfilePath: string;
 
-    constructor() {
+    constructor(options?: { chromeProfile?: string }) {
         this.setupLogging();
         this.cookiesPath = path.join(process.cwd(), 'cookies.json');
+        this.chromeProfilePath = options?.chromeProfile || process.env.INSTAGRAM_CHROME_PROFILE || './chrome-profile';
     }
 
     private setupLogging() {
@@ -291,11 +293,12 @@ export class InstagramAI {
 
     async initialize(): Promise<void> {
         try {
-            // Initialize browser with stealth mode
+            // Initialize browser with stealth mode and persistent profile
             this.browser = await puppeteer.launch({
                 headless: false,  // Keep browser visible
                 defaultViewport: null,  // Use default viewport
                 executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                userDataDir: this.chromeProfilePath,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -311,8 +314,9 @@ export class InstagramAI {
                 ]
             });
 
-            // Create new page with stealth
-            this.page = await this.browser.newPage();
+            // Use the default page from the profile (avoids blank tab)
+            const pages = await this.browser.pages();
+            this.page = pages[0] || await this.browser.newPage();
             // Apply default timeouts for this page/session
             const page = this.page;
             if (page) {
@@ -334,32 +338,27 @@ export class InstagramAI {
         if (!this.page) return;
 
         try {
-            if (fs.existsSync(this.cookiesPath)) {
-                const cookiesString = fs.readFileSync(this.cookiesPath, 'utf8');
-                const cookies = JSON.parse(cookiesString);
-                await this.page.setCookie(...cookies);
-                logger.info('Cookies loaded successfully');
+            // With userDataDir, the browser may already have a valid session.
+            // Navigate to Instagram and check if we're logged in.
+            await this.page.goto('https://www.instagram.com/', { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT_MS });
+            await this.delay(2000);
 
-                // Verify cookies are still valid
-                await this.page.goto('https://www.instagram.com/', { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT_MS });
-                const loginButton = await this.page.$('button[type="submit"]');
-                if (loginButton) {
-                    logger.info('Cookies expired, logging in again');
-                    await this.login();
-                } else {
-                    logger.info('Cookies are valid');
-                    this.isLoggedIn = true;
-                    // Dismiss any dialogs that appear after cookie login
-                    await this.delay(2000);
-                    await this.dismissDialog('Turn on Notifications');
-                    await this.dismissDialog('Save Your Login Info');
-                }
-            } else {
-                logger.info('No cookies found, performing fresh login');
+            const loginButton = await this.page.$('button[type="submit"]') ||
+                                await this.page.$('input[type="submit"]') ||
+                                await this.page.$('input[name="email"]') ||
+                                await this.page.$('input[name="username"]');
+
+            if (loginButton) {
+                logger.info('No active session in profile, logging in...');
                 await this.login();
+            } else {
+                logger.info('Profile session is valid — already logged in');
+                this.isLoggedIn = true;
+                await this.dismissDialog('Turn on Notifications');
+                await this.dismissDialog('Save Your Login Info');
             }
         } catch (error) {
-            logger.error('Error loading cookies:', error);
+            logger.error('Error checking session:', error);
             await this.login();
         }
     }
@@ -389,14 +388,42 @@ export class InstagramAI {
                 logger.info('No cookie dialog found');
             }
 
-            // Fill in login form
-            await this.page.waitForSelector('input[name="username"]', { timeout: LOGIN_TIMEOUT_MS });
-            await this.page.type('input[name="username"]', username, { delay: 50 });
-            await this.page.type('input[name="password"]', password, { delay: 50 });
+            // Fill in login form (IG uses name="email" or name="username", and name="pass" or name="password")
+            const usernameInput = await this.page.waitForSelector(
+                'input[name="username"], input[name="email"]',
+                { timeout: LOGIN_TIMEOUT_MS }
+            );
+            if (!usernameInput) throw new Error('Username input not found');
+            await usernameInput.click();
+            await this.delay(300);
+            await usernameInput.type(username, { delay: 50 });
 
-            // Click login button
-            await this.page.waitForSelector('button[type="submit"]', { timeout: LOGIN_TIMEOUT_MS });
-            await this.page.click('button[type="submit"]');
+            const passwordInput = await this.page.$('input[name="password"]') ||
+                                  await this.page.$('input[name="pass"]');
+            if (!passwordInput) throw new Error('Password input not found');
+            await passwordInput.click();
+            await this.delay(300);
+            await passwordInput.type(password, { delay: 50 });
+
+            await this.delay(500);
+
+            // Submit: try visible button first, then evaluate click on input, then Enter key
+            const submitButton = await this.page.$('button[type="submit"]');
+            if (submitButton) {
+                await submitButton.click();
+            } else {
+                // Use evaluate to click hidden input[type="submit"] or just press Enter
+                const clicked = await this.page.evaluate(() => {
+                    const submit = document.querySelector('input[type="submit"]') as HTMLInputElement;
+                    if (submit) { submit.click(); return true; }
+                    const form = document.querySelector('form');
+                    if (form) { form.submit(); return true; }
+                    return false;
+                });
+                if (!clicked) {
+                    await this.page.keyboard.press('Enter');
+                }
+            }
 
             // Wait for navigation
             await this.page.waitForNavigation({ waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT_MS });
@@ -408,10 +435,63 @@ export class InstagramAI {
                 throw new Error(`Login failed: ${errorText}`);
             }
 
-            // Save new cookies
-            const cookies = await this.page.cookies();
-            fs.writeFileSync(this.cookiesPath, JSON.stringify(cookies));
-            logger.info('Login successful, cookies saved');
+            // Handle 2FA / verification challenges
+            const pageText = await this.page.evaluate(() => document.body?.innerText || '');
+            const isVerificationPage = pageText.includes('confirm it') || pageText.includes('Confirm') ||
+                pageText.includes('verification') || pageText.includes('security code') ||
+                pageText.includes('Check your text') || pageText.includes('Enter the code') ||
+                pageText.includes('two-factor') || pageText.includes('Choose a way');
+
+            if (isVerificationPage) {
+                logger.info('Verification challenge detected: ' + pageText.slice(0, 100));
+
+                // If "Choose a way to confirm" page, click Continue to trigger SMS
+                const hasChoosePage = pageText.includes('Choose a way') || pageText.includes('confirm it');
+                if (hasChoosePage) {
+                    const allButtons = await this.page.$$('button, div[role="button"]');
+                    for (const btn of allButtons) {
+                        const btnText = await btn.evaluate(el => el.textContent?.trim() || '');
+                        if (btnText.toLowerCase().includes('continue') || btnText.toLowerCase().includes('send')) {
+                            await btn.click();
+                            logger.info(`Clicked "${btnText}" to trigger verification code`);
+                            await this.delay(3000);
+                            break;
+                        }
+                    }
+                }
+
+                // Now wait for user to complete verification (SMS code, phone approval, etc.)
+                // The browser window is visible — user can type the code manually
+                logger.info('[login] Waiting for user to complete verification in browser window (up to 120s)...');
+                const verificationTimeout = 120000;
+                const startTime = Date.now();
+                let verified = false;
+                while (Date.now() - startTime < verificationTimeout) {
+                    await this.delay(5000);
+                    const currentUrl = this.page.url();
+                    const currentText = await this.page.evaluate(() => document.body?.innerText || '');
+                    // Check if we've moved past the verification page
+                    const stillOnVerification = currentText.includes('confirm it') ||
+                        currentText.includes('security code') || currentText.includes('Check your text') ||
+                        currentText.includes('Enter the code') || currentText.includes('Choose a way') ||
+                        currentUrl.includes('challenge');
+                    const stillOnLogin = currentUrl.includes('/accounts/login');
+                    if (!stillOnVerification && !stillOnLogin) {
+                        verified = true;
+                        break;
+                    }
+                    const elapsed = Math.round((Date.now() - startTime) / 1000);
+                    logger.info(`[login] Still waiting for verification... (${elapsed}s) URL: ${currentUrl.slice(0, 60)}`);
+                }
+
+                if (!verified) {
+                    throw new Error('Verification challenge timed out — enter the code in the browser window and retry');
+                }
+                logger.info('Verification completed successfully');
+            }
+
+            // Session is persisted via Chrome profile (userDataDir)
+            logger.info('Login successful, session saved in profile');
             this.isLoggedIn = true;
 
             // Handle "Save Login Info" dialog if it appears

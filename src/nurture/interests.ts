@@ -6,12 +6,12 @@ import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { InterestProfile, InterestEntry, InterestMatchScore } from '../types/nurture';
 import { loadNurtureProfile, saveNurtureProfile } from './store';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Our interests (from env or defaults) ────────────────────────────
 
@@ -75,8 +75,7 @@ export async function extractInterestsWithAI(texts: string[]): Promise<InterestE
 
     const sample = texts.slice(0, 15).join('\n---\n');
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const raw = await chatCompletion({
             messages: [
                 {
                     role: 'system',
@@ -89,9 +88,7 @@ export async function extractInterestsWithAI(texts: string[]): Promise<InterestE
             ],
             max_tokens: 100,
             temperature: 0.3,
-        });
-
-        const raw = completion.choices[0]?.message?.content?.trim() || '[]';
+        }) || '[]';
         const parsed = JSON.parse(raw);
         const now = new Date().toISOString();
 

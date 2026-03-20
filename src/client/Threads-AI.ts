@@ -10,7 +10,7 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 // AdblockerPlugin removed — was imported but never used
 import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
-import { OpenAI } from 'openai';
+import { chatCompletion } from '../utils/ai';
 import * as path from 'path';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
@@ -81,7 +81,7 @@ async function saveThreadsPost(record: ThreadsPostRecord): Promise<void> {
 // Stealth plugins
 puppeteer.use(StealthPlugin());
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 const THREADS_TIMEOUT = parseInt(process.env.THREADS_TIMEOUT_MS || '30000', 10);
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
@@ -412,8 +412,7 @@ async function generateThreadsComment(postText: string): Promise<string | null> 
     try {
         if (!postText || postText.length < 5) return null;
 
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        let comment = await chatCompletion({
             messages: [
                 {
                     role: 'system',
@@ -428,7 +427,6 @@ async function generateThreadsComment(postText: string): Promise<string | null> 
             temperature: 0.7
         });
 
-        let comment = completion.choices[0]?.message?.content?.trim();
         if (!comment) return null;
 
         // Clean up

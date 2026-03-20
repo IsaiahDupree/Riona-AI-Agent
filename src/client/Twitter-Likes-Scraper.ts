@@ -11,12 +11,12 @@ import { formatError, safeReadJSON, safeWriteJSON } from '../utils/errors';
 import { delay } from '../utils/delay';
 import * as path from 'path';
 import * as fs from 'fs';
-import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { chatCompletion } from '../utils/ai';
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -207,8 +207,7 @@ export async function analyzeLikedContent(
     logger.info(`[likes-scraper] Analyzing ${sampled.length} liked tweets for topics...`);
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
+        const raw = await chatCompletion({
             messages: [
                 {
                     role: 'system',
@@ -233,9 +232,7 @@ Return ONLY valid JSON:
             ],
             max_tokens: 800,
             temperature: 0.4,
-        });
-
-        const raw = completion.choices[0]?.message?.content?.trim() || '{}';
+        }) || '{}';
         // Strip markdown code blocks if present
         const cleaned = raw.replace(/^```json?\n?/i, '').replace(/\n?```$/i, '').trim();
         const parsed = JSON.parse(cleaned);

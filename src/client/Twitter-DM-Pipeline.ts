@@ -13,7 +13,7 @@ import {
     updateWarmth, recordFeedback, getFeedbackStats, MessageFeedback, getReplyObjective
 } from './Twitter-DM-AI';
 import {
-    trackTwitterDM, hasSentTwitterDMTo, createTwitterDMSession, saveTwitterDMSession,
+    trackTwitterDM, hasSentTwitterDMTo, hasContactedTwitterToday, createTwitterDMSession, saveTwitterDMSession,
     getTwitterDMsForUser, getTodayTwitterDMCount
 } from '../tracking/twitterDMTracker';
 import { notifyDMSent, notifyDMApprovalNeeded, notifyDMAutoReply, notifyDMReplyReceived } from '../utils/telegram';
@@ -23,7 +23,7 @@ import { formatError } from '../utils/errors';
 import { ProfileInfo, RelationshipInfo, DMMessage, TrackedDM } from '../types/dm';
 import { isJackpotReply, computeOfferReadiness } from '../nurture/vr-scheduler';
 import { computeReplyDelay, scheduleDelayedReply, getReadyReplies, markReplySent, markReplyFailed, cleanupDelayedQueue, hasPendingReply } from '../nurture/vi-delays';
-import { isLikelyBot } from './Instagram-DM-Pipeline';
+import { isLikelyBot, isValidUsername } from './Instagram-DM-Pipeline';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -515,6 +515,21 @@ export class TwitterDMPipeline {
                 continue;
             }
 
+            // GUARD: invalid username (UI labels like "chat", "search", etc.)
+            const usernameCheck = isValidUsername(username);
+            if (!usernameCheck.valid) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `invalid username: ${usernameCheck.reason}` });
+                continue;
+            }
+
+            // GUARD: already contacted today (sent DM or pending scheduled reply)
+            if (hasContactedTwitterToday(username)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'already contacted today' });
+                continue;
+            }
+
             // GUARD: per-user cooldown
             if (hasSentTwitterDMTo(username, AUTO_REPLY_COOLDOWN_HOURS)) {
                 result.skipped++;
@@ -767,6 +782,21 @@ export class TwitterDMPipeline {
             const username = displayName.toLowerCase().replace('@', '');
 
             if (username === ourUsername) continue;
+
+            // GUARD: invalid username
+            const usernameCheck = isValidUsername(username);
+            if (!usernameCheck.valid) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: `invalid username: ${usernameCheck.reason}` });
+                continue;
+            }
+
+            // GUARD: already contacted today
+            if (hasContactedTwitterToday(username)) {
+                result.skipped++;
+                result.details.push({ username, action: 'skipped', reason: 'already contacted today' });
+                continue;
+            }
 
             // Quick filter: if last message starts with "You:" it's our turn — skip
             const lastMsgLower = (convo.lastMessage || '').toLowerCase();

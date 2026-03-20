@@ -1,29 +1,11 @@
-import { OpenAI } from 'openai';
+import { chatCompletion } from '../utils/ai';
 import logger from "../config/logger";
 import { InstagramCommentSchema } from "./schema";
 
 export async function runAgent(prompt: string): Promise<InstagramCommentSchema> {
-    const openaiApiKey = process.env.OPENAI_API_KEY;
-
-    if (!openaiApiKey) {
-        logger.error("No OpenAI API key found in environment variables.");
-        return {
-            comment: "Error: No API key available",
-            sentiment: "neutral",
-            relevance: 0,
-            emojis: [],
-            hashtags: []
-        };
-    }
-
     try {
-        const openai = new OpenAI({
-            apiKey: openaiApiKey,
-        });
-
-        logger.info("Generating content with OpenAI...");
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
+        logger.info("Generating content with Claude...");
+        const raw = await chatCompletion({
             messages: [
                 {
                     role: "system",
@@ -34,20 +16,20 @@ export async function runAgent(prompt: string): Promise<InstagramCommentSchema> 
                         "relevance": number (0-10),
                         "emojis": string[],
                         "hashtags": string[]
-                    }`
+                    }
+                    Reply with ONLY valid JSON, no other text.`
                 },
                 {
                     role: "user",
                     content: prompt
                 }
             ],
-            response_format: { type: "json_object" },
             temperature: 0.7,
             max_tokens: 150
         });
 
-        if (!completion.choices[0]?.message?.content) {
-            logger.error("No response received from OpenAI");
+        if (!raw) {
+            logger.error("No response received from Claude");
             return {
                 comment: "Error: No response from AI",
                 sentiment: "neutral",
@@ -57,12 +39,13 @@ export async function runAgent(prompt: string): Promise<InstagramCommentSchema> 
             };
         }
 
-        const response = JSON.parse(completion.choices[0].message.content);
+        const cleaned = raw.replace(/^```json?\n?/i, '').replace(/\n?```$/i, '').trim();
+        const response = JSON.parse(cleaned);
         logger.info("Content generated successfully");
         return response;
 
     } catch (error) {
-        logger.error("Error generating content with OpenAI:", error);
+        logger.error("Error generating content with Claude:", error);
         return {
             comment: "Error: Failed to generate comment",
             sentiment: "neutral",

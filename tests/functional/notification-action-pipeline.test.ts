@@ -260,34 +260,41 @@ describe('Notification Action Pipeline', () => {
         });
 
         it('should increase health when contact replies to our comment', () => {
-            const before = loadVRState(testUser, 'twitter');
-            const beforeHealth = before.health;
+            // Reset to known value to avoid accumulated state
+            const state = loadVRState(testUser, 'twitter');
+            state.health = 0.60;
+            state.healthHistory = [];
+            saveVRState(state);
 
             updateHealth(testUser, 'twitter', 'reply_received');
 
             const after = loadVRState(testUser, 'twitter');
-            expect(after.health).toBeGreaterThan(beforeHealth);
+            expect(after.health).toBeGreaterThan(0.60);
             expect(after.consecutiveIgnored).toBe(0); // Reset on positive engagement
         });
 
         it('should increase health when contact likes our content', () => {
-            const before = loadVRState(testUser, 'twitter');
-            const beforeHealth = before.health;
+            const state = loadVRState(testUser, 'twitter');
+            state.health = 0.60;
+            state.healthHistory = [];
+            saveVRState(state);
 
             updateHealth(testUser, 'twitter', 'like_received');
 
             const after = loadVRState(testUser, 'twitter');
-            expect(after.health).toBeGreaterThan(beforeHealth);
+            expect(after.health).toBeGreaterThan(0.60);
         });
 
         it('should increase health when they engage our content (RT/quote)', () => {
-            const before = loadVRState(testUser, 'twitter');
-            const beforeHealth = before.health;
+            const state = loadVRState(testUser, 'twitter');
+            state.health = 0.60;
+            state.healthHistory = [];
+            saveVRState(state);
 
             updateHealth(testUser, 'twitter', 'they_engaged_our_content');
 
             const after = loadVRState(testUser, 'twitter');
-            expect(after.health).toBeGreaterThan(beforeHealth);
+            expect(after.health).toBeGreaterThan(0.60);
         });
 
         it('should decrease health on comment_ignored', () => {

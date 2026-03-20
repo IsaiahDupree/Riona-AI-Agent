@@ -6,12 +6,12 @@ import { logger } from '../utils/logger';
 import { formatError } from '../utils/errors';
 import { ConversationDepthMetrics } from '../types/nurture';
 import { loadNurtureProfile, saveNurtureProfile } from './store';
-import OpenAI from 'openai';
+import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
+// OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
 // ── Analyze conversation depth ──────────────────────────────────────
 
@@ -85,8 +85,7 @@ async function analyzeWithAI(texts: string[], username: string): Promise<{
 }> {
     const sample = texts.slice(-20).join('\n---\n'); // last 20 messages max
 
-    const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+    const raw = await chatCompletion({
         messages: [
             {
                 role: 'system',
@@ -107,9 +106,7 @@ Reply ONLY with valid JSON like: {"topicVariety": 5, "disclosureLevel": 40}`,
         ],
         max_tokens: 50,
         temperature: 0.3,
-    });
-
-    const raw = completion.choices[0]?.message?.content?.trim() || '{}';
+    }) || '{}';
     try {
         const parsed = JSON.parse(raw);
         return {

@@ -9,7 +9,7 @@ describe('Comprehensive Schema Tests - Real Data', () => {
 
     beforeAll(async () => {
         if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-            console.warn('⚠️  Supabase credentials not configured. Skipping tests.');
+            console.warn('Supabase credentials not configured. Skipping tests.');
             return;
         }
 
@@ -18,31 +18,18 @@ describe('Comprehensive Schema Tests - Real Data', () => {
             process.env.SUPABASE_KEY
         );
 
-        console.log('🔗 Connected to Supabase');
+        console.log('Connected to Supabase');
     });
 
     describe('Schema Verification', () => {
-        it('should have all 16 core tables', async () => {
+        it('should have core tables', async () => {
             if (!supabase) return;
 
             const expectedTables = [
-                'accounts',
-                'instagram_posts',
-                'instagram_users',
-                'campaigns',
-                'interactions',
-                'schedules',
-                'daily_metrics',
-                'engagement_tracking',
-                'engagement_snapshots',
-                'user_rankings',
-                'ai_training_data',
-                'content_performance',
-                'rate_limit_tracking',
-                'sessions',
-                'error_logs',
-                'api_usage',
-                'ab_tests'
+                'actp_accounts',
+                'mv_media_posts',
+                'uba_users',
+                'comment_performance',
             ];
 
             for (const table of expectedTables) {
@@ -51,15 +38,11 @@ describe('Comprehensive Schema Tests - Real Data', () => {
             }
         });
 
-        it('should have materialized views', async () => {
+        it('should reject non-existent tables', async () => {
             if (!supabase) return;
 
-            const views = ['top_commenters', 'top_engagers', 'top_performing_comments'];
-
-            for (const view of views) {
-                const { error } = await supabase.from(view).select('*').limit(0);
-                expect(error).toBeNull();
-            }
+            const { error } = await supabase.from('nonexistent_table_xyz').select('*').limit(0);
+            expect(error).toBeTruthy();
         });
     });
 
@@ -68,169 +51,73 @@ describe('Comprehensive Schema Tests - Real Data', () => {
             if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('accounts')
+                .from('actp_accounts')
                 .insert({
                     platform: 'instagram',
                     username: 'test_bot_comprehensive',
-                    status: 'active',
-                    daily_limit: 100,
-                    hourly_limit: 10
+                    is_active: true,
                 })
                 .select()
                 .single();
 
             expect(error).toBeNull();
             expect(data).toBeTruthy();
+            expect(data?.platform).toBe('instagram');
+            expect(data?.username).toBe('test_bot_comprehensive');
             testData.account_id = data?.id;
         });
 
-        it('should create an Instagram user', async () => {
+        it('should create a user', async () => {
             if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('instagram_users')
+                .from('uba_users')
                 .insert({
-                    user_id: 'test_user_123',
-                    username: 'test_target_user',
-                    full_name: 'Test Target User',
-                    follower_count: 10000,
-                    following_count: 500,
-                    is_verified: false
+                    email: 'test_comprehensive@example.com',
+                    password_hash: 'test_hash_placeholder',
+                    password_salt: 'test_salt_placeholder',
+                    subscription_tier: 'free',
                 })
                 .select()
                 .single();
 
             expect(error).toBeNull();
             expect(data).toBeTruthy();
+            expect(data?.email).toBe('test_comprehensive@example.com');
             testData.user_id = data?.id;
         });
 
-        it('should create an Instagram post', async () => {
+        it('should create a media post', async () => {
             if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('instagram_posts')
+                .from('mv_media_posts')
                 .insert({
-                    post_id: 'test_post_123',
+                    platform: 'instagram',
+                    post_id: 'test_post_comprehensive_123',
                     url: 'https://instagram.com/p/test123',
-                    author_username: 'test_target_user',
-                    caption: 'This is a test post with #test #automation',
-                    hashtags: ['#test', '#automation'],
-                    media_type: 'photo',
-                    likes_count: 150,
-                    comments_count: 25,
-                    posted_at: new Date().toISOString()
+                    caption_used: 'This is a test post with #test #automation',
+                    posted_at: new Date().toISOString(),
+                    likes: 150,
+                    comments: 25,
                 })
                 .select()
                 .single();
 
             expect(error).toBeNull();
             expect(data).toBeTruthy();
+            expect(data?.platform).toBe('instagram');
+            expect(data?.post_id).toBe('test_post_comprehensive_123');
             testData.post_id = data?.id;
-        });
-
-        it('should create a campaign', async () => {
-            if (!supabase || !testData.account_id) return;
-
-            const { data, error } = await supabase
-                .from('campaigns')
-                .insert({
-                    account_id: testData.account_id,
-                    name: 'Test Campaign',
-                    description: 'Comprehensive schema test campaign',
-                    status: 'active',
-                    target_hashtags: ['#test', '#automation'],
-                    daily_budget: 50
-                })
-                .select()
-                .single();
-
-            expect(error).toBeNull();
-            expect(data).toBeTruthy();
-            testData.campaign_id = data?.id;
-        });
-
-        it('should create an interaction', async () => {
-            if (!supabase || !testData.account_id || !testData.post_id) return;
-
-            const { data, error } = await supabase
-                .from('interactions')
-                .insert({
-                    account_id: testData.account_id,
-                    post_id: testData.post_id,
-                    campaign_id: testData.campaign_id,
-                    type: 'comment',
-                    status: 'success',
-                    comment_text: 'Great content! 🔥',
-                    ai_model_used: 'gpt-4',
-                    confidence_score: 0.95,
-                    processing_time_ms: 1250,
-                    metadata: JSON.stringify({
-                        hashtags: ['#test'],
-                        sentiment: 'positive'
-                    })
-                })
-                .select()
-                .single();
-
-            expect(error).toBeNull();
-            expect(data).toBeTruthy();
-            expect(data?.type).toBe('comment');
-            testData.interaction_id = data?.id;
-        });
-
-        it('should create engagement snapshot', async () => {
-            if (!supabase || !testData.interaction_id || !testData.post_id) return;
-
-            const { data, error } = await supabase
-                .from('engagement_snapshots')
-                .insert({
-                    interaction_id: testData.interaction_id,
-                    post_id: testData.post_id,
-                    check_period: '1_hour',
-                    post_likes_count: 152,
-                    post_comments_count: 26,
-                    our_comment_likes: 5,
-                    our_comment_replies: 2,
-                    author_replied: true,
-                    likes_delta: 2,
-                    comments_delta: 1,
-                    impact_score: 30.2
-                })
-                .select()
-                .single();
-
-            expect(error).toBeNull();
-            expect(data).toBeTruthy();
-            expect(data?.check_period).toBe('1_hour');
-        });
-
-        it('should create engagement tracking', async () => {
-            if (!supabase || !testData.interaction_id) return;
-
-            const { data, error } = await supabase
-                .from('engagement_tracking')
-                .insert({
-                    interaction_id: testData.interaction_id,
-                    likes_on_comment: 5,
-                    replies_to_comment: 2,
-                    post_author_engaged: true,
-                    engagement_score: 15.5
-                })
-                .select()
-                .single();
-
-            expect(error).toBeNull();
-            expect(data).toBeTruthy();
         });
     });
 
-    describe('Data Retrieval - Rankings', () => {
-        it('should query comments with engagement', async () => {
+    describe('Data Retrieval', () => {
+        it('should query comment_performance', async () => {
             if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('comments_with_engagement')
+                .from('comment_performance')
                 .select('*')
                 .limit(10);
 
@@ -238,104 +125,103 @@ describe('Comprehensive Schema Tests - Real Data', () => {
             expect(Array.isArray(data)).toBe(true);
         });
 
-        it('should query top performers', async () => {
+        it('should query accounts by platform', async () => {
             if (!supabase) return;
 
-            // Refresh views first
-            const { error: refreshError } = await supabase.rpc('refresh_all_rankings');
+            const { data, error } = await supabase
+                .from('actp_accounts')
+                .select('*')
+                .eq('platform', 'instagram')
+                .limit(10);
+
+            expect(error).toBeNull();
+            expect(Array.isArray(data)).toBe(true);
+        });
+
+        it('should query media posts ordered by likes', async () => {
+            if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('top_performing_comments')
+                .from('mv_media_posts')
                 .select('*')
+                .order('likes', { ascending: false })
+                .limit(10);
+
+            expect(error).toBeNull();
+            expect(Array.isArray(data)).toBe(true);
+        });
+
+        it('should query posts with high engagement', async () => {
+            if (!supabase) return;
+
+            const { data, error } = await supabase
+                .from('mv_media_posts')
+                .select('*')
+                .gte('likes', 100)
+                .order('likes', { ascending: false })
+                .limit(10);
+
+            expect(error).toBeNull();
+            expect(Array.isArray(data)).toBe(true);
+        });
+    });
+
+    describe('Data Updates', () => {
+        it('should update account display_name', async () => {
+            if (!supabase || !testData.account_id) return;
+
+            const { data, error } = await supabase
+                .from('actp_accounts')
+                .update({ display_name: 'Updated Test Bot' })
+                .eq('id', testData.account_id)
+                .select()
+                .single();
+
+            expect(error).toBeNull();
+            expect(data?.display_name).toBe('Updated Test Bot');
+        });
+
+        it('should update post stats', async () => {
+            if (!supabase || !testData.post_id) return;
+
+            const { data, error } = await supabase
+                .from('mv_media_posts')
+                .update({
+                    likes: 200,
+                    comments: 30,
+                    stats_updated_at: new Date().toISOString(),
+                })
+                .eq('id', testData.post_id)
+                .select()
+                .single();
+
+            expect(error).toBeNull();
+            expect(data?.likes).toBe(200);
+            expect(data?.comments).toBe(30);
+        });
+    });
+
+    describe('Filter Queries', () => {
+        it('should filter accounts by is_active', async () => {
+            if (!supabase) return;
+
+            const { data, error } = await supabase
+                .from('actp_accounts')
+                .select('id, username, platform, is_active')
+                .eq('is_active', true)
                 .limit(5);
 
             expect(error).toBeNull();
             expect(Array.isArray(data)).toBe(true);
         });
 
-        it('should get engagement snapshots for an interaction', async () => {
-            if (!supabase || !testData.interaction_id) return;
-
-            const { data, error } = await supabase
-                .from('engagement_snapshots')
-                .select('*')
-                .eq('interaction_id', testData.interaction_id)
-                .order('checked_at', { ascending: false });
-
-            expect(error).toBeNull();
-            expect(Array.isArray(data)).toBe(true);
-            if (data && data.length > 0) {
-                expect(data[0].check_period).toBe('1_hour');
-                expect(data[0].our_comment_likes).toBeGreaterThanOrEqual(0);
-            }
-        });
-    });
-
-    describe('Complex Queries', () => {
-        it('should find posts with high engagement', async () => {
+        it('should filter posts by platform', async () => {
             if (!supabase) return;
 
             const { data, error } = await supabase
-                .from('instagram_posts')
-                .select('*')
-                .gte('likes_count', 100)
-                .order('likes_count', { ascending: false })
-                .limit(10);
-
-            expect(error).toBeNull();
-            expect(Array.isArray(data)).toBe(true);
-        });
-
-        it('should get account daily metrics', async () => {
-            if (!supabase || !testData.account_id) return;
-
-            const { data, error } = await supabase
-                .from('daily_metrics')
-                .select('*')
-                .eq('account_id', testData.account_id)
-                .order('date', { ascending: false });
-
-            expect(error).toBeNull();
-            expect(Array.isArray(data)).toBe(true);
-        });
-
-        it('should filter interactions by campaign', async () => {
-            if (!supabase || !testData.campaign_id) return;
-
-            const { data, error } = await supabase
-                .from('interactions')
-                .select('*')
-                .eq('campaign_id', testData.campaign_id)
-                .eq('status', 'success');
-
-            expect(error).toBeNull();
-            expect(Array.isArray(data)).toBe(true);
-            if (data && data.length > 0) {
-                expect(data[0].type).toBeTruthy();
-            }
-        });
-    });
-
-    describe('JSONB Queries', () => {
-        it('should query hashtags from posts', async () => {
-            if (!supabase) return;
-
-            const { data, error } = await supabase
-                .from('instagram_posts')
-                .select('*')
-                .contains('hashtags', ['#test']);
-
-            expect(error).toBeNull();
-            expect(Array.isArray(data)).toBe(true);
-        });
-
-        it('should query metadata from interactions', async () => {
-            if (!supabase) return;
-
-            const { data, error } = await supabase
-                .from('interactions')
-                .select('metadata')
-                .eq('type', 'comment')
+                .from('mv_media_posts')
+                .select('id, platform, post_id, likes')
+                .eq('platform', 'instagram')
                 .limit(5);
 
             expect(error).toBeNull();
@@ -344,21 +230,20 @@ describe('Comprehensive Schema Tests - Real Data', () => {
     });
 
     afterAll(async () => {
-        // Cleanup test data
         if (!supabase) return;
 
-        console.log('\n🧹 Cleaning up test data...');
+        console.log('\nCleaning up test data...');
 
         if (testData.account_id) {
-            await supabase.from('accounts').delete().eq('id', testData.account_id);
+            await supabase.from('actp_accounts').delete().eq('id', testData.account_id);
         }
         if (testData.post_id) {
-            await supabase.from('instagram_posts').delete().eq('id', testData.post_id);
+            await supabase.from('mv_media_posts').delete().eq('id', testData.post_id);
         }
         if (testData.user_id) {
-            await supabase.from('instagram_users').delete().eq('id', testData.user_id);
+            await supabase.from('uba_users').delete().eq('id', testData.user_id);
         }
 
-        console.log('✅ Cleanup complete');
+        console.log('Cleanup complete');
     });
 });

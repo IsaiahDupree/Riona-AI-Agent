@@ -42,6 +42,7 @@
     "test:supabase": "tsc && node build/db/test-supabase.js",
     "test:schema": "jest tests/integration/comprehensive-schema.test.ts",
     "migrate:supabase": "tsc && node build/db/migrate.js",
+    "start:unified": "node build/unified.js",
     "health": "curl http://localhost:3000/health || echo 'Server not running'"
   },
   "keywords": [],
@@ -49,8 +50,10 @@
   "license": "ISC",
   "description": "Riona-AI-Agent is an AI-powered automation tool designed to interact with various social media platforms.",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@google/generative-ai": "^0.21.0",
     "@supabase/supabase-js": "^2.78.0",
+    "@types/ws": "^8.18.1",
     "axios": "^1.7.9",
     "chalk": "^4.1.2",
     "cheerio": "^1.0.0",
@@ -86,6 +89,7 @@
     "user-agents": "^1.1.100",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.18.3",
     "youtube-transcript": "^1.2.1"
   },
   "devDependencies": {

@@ -21,6 +21,16 @@ export class InstagramDM {
         });
     }
 
+    /**
+     * Create an InstagramDM instance that wraps an existing Puppeteer Page.
+     * Used when sharing a browser session from the browser pool.
+     */
+    static fromPage(page: Page): InstagramDM {
+        const dm = new InstagramDM();
+        dm.page = page;
+        return dm;
+    }
+
     async initialize(): Promise<void> {
         await this.instagramAI.initialize();
         this.page = this.instagramAI.getPage()!;
