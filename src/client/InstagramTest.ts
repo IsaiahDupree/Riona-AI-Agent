@@ -8,7 +8,7 @@ import { Instagram_cookiesExist, loadCookies, saveCookies } from "../utils";
 import dotenv from 'dotenv';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Add stealth plugin to puppeteer
 puppeteer.use(StealthPlugin());

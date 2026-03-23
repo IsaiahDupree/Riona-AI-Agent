@@ -20,7 +20,7 @@ import {
 } from './InstagramDM';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Setup stealth
 puppeteer.use(StealthPlugin());

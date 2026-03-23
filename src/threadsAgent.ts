@@ -21,7 +21,7 @@ import path from 'path';
 import fs from 'fs';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Add stealth plugin to puppeteer
 puppeteer.use(StealthPlugin());

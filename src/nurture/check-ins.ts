@@ -12,7 +12,7 @@ import { canMessageOnPlatform, getCrossContext } from './cross-platform';
 import { chatCompletion } from '../utils/ai';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 

@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 async function applyMigrations() {
     const url = process.env.SUPABASE_URL;

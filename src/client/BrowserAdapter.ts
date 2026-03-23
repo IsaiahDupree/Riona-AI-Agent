@@ -14,7 +14,7 @@ import dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // Setup puppeteer stealth
 puppeteer.use(StealthPlugin());

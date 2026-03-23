@@ -5,7 +5,7 @@
  */
 
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ override: true });
 
 import { InstagramDM } from './client/Instagram-DM';
 import { startDMWatcher, checkForNewDMs } from './client/Instagram-DM-Watcher';

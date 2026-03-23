@@ -21,15 +21,19 @@ export class SupabaseStorage implements StorageInterface {
         }
         try {
             this.client = createClient(this.url, this.key);
-            // Simple health check
-            const { error } = await this.client.from('interactions').select('count', { count: 'exact', head: true });
-            if (error) throw error;
+            // Simple health check — just verify we can reach the DB
+            const { data, error } = await this.client.from('interactions').select('id').limit(1);
+            if (error) {
+                logger.error(`Supabase health check failed: ${error.message} (code: ${error.code})`);
+                throw error;
+            }
             logger.info('Connected to Supabase');
 
             // Get or create default account
             await this.ensureDefaultAccount();
-        } catch (error) {
-            logger.error('Failed to connect to Supabase:', error);
+        } catch (error: any) {
+            const msg = error?.message || error?.code || JSON.stringify(error) || 'Unknown error';
+            logger.error(`Failed to connect to Supabase: ${msg}`);
             throw error;
         }
     }
@@ -45,13 +49,17 @@ export class SupabaseStorage implements StorageInterface {
         try {
             const username = process.env.INSTAGRAM_BOT_USERNAME || 'default_bot';
 
-            // Try to find existing account
+            // Try to find existing account (use maybeSingle to avoid error on no rows)
             const { data: existing, error: findError } = await this.client
                 .from('accounts')
                 .select('id')
                 .eq('platform', 'instagram')
                 .eq('username', username)
-                .single();
+                .maybeSingle();
+
+            if (findError) {
+                logger.warn(`Account lookup error: ${findError.message}`);
+            }
 
             if (existing) {
                 this.accountId = existing.id;

@@ -20,7 +20,7 @@ import { hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/co
 import { formatError, sanitizeForPrompt } from '../utils/errors';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Human-in-the-loop review mode gate (env fallback)
 const HITL_MODE = String(process.env.INSTAGRAM_HITL ?? process.env.HITL_REQUIRE_REVIEW ?? '').toLowerCase();

@@ -20,7 +20,7 @@ import {
     SessionLog, TrackedComment, hasCommentedOnPost, trackComment
 } from '../tracking/threadsTracker';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // ── Supabase client for saving Threads posts ────────────────────────
 let supabase: SupabaseClient | null = null;

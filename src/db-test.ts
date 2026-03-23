@@ -1,7 +1,7 @@
 import mongoose from 'mongoose'
 import dotenv from 'dotenv'
 
-dotenv.config()
+dotenv.config({ override: true })
 
 async function testDatabaseConnection(): Promise<void> {
   try {

@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // ── Configuration (from .env) ──────────────────────────────────────
 const DAILY_TARGET    = parseInt(process.env.TWITTER_DAILY_TARGET || '500', 10);

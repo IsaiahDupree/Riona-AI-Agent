@@ -2,7 +2,7 @@ import { SupabaseStorage } from './supabase';
 import { logger } from '../utils/logger';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 async function testSupabase() {
     logger.info('Testing Supabase connection...');

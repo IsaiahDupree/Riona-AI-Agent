@@ -5,7 +5,7 @@ import path from "path";
 import fs from "fs";
 import mime from "mime-types";  
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const apiKey = process.env.GEMINI_API_KEY_41;
 if (!apiKey) {

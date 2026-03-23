@@ -2,7 +2,7 @@ import dotenv from 'dotenv'
 import { startBasicServer } from './server/basic-app'
 
 // Load environment variables
-dotenv.config()
+dotenv.config({ override: true })
 
 console.log('🤖 Starting Riona Instagram AI Agent - Basic Mode')
 console.log('📝 Environment:', process.env.NODE_ENV || 'development')

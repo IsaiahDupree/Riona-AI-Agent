@@ -13,7 +13,7 @@ import { logger } from '../utils/logger';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 async function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));

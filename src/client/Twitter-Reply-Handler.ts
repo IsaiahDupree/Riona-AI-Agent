@@ -27,7 +27,7 @@ import { updateHealth, loadVRState, recordBanditReward } from '../nurture/vr-sch
 import { profileExists } from '../nurture/store';
 import { getBrandPromptContext } from '../strategy/twitter-brand';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // ── Config ──────────────────────────────────────────────────────────
 

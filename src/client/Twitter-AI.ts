@@ -26,7 +26,7 @@ import { startRun, pushStep, finishRun } from '../trace/runtime';
 import { saveTrace } from '../trace/store';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Set up plugins
 puppeteer.use(StealthPlugin());

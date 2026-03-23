@@ -13,7 +13,7 @@ const app = express();
 try {
     // Initialize environment variables first
     logger.info('Loading environment variables...');
-    dotenv.config();
+    dotenv.config({ override: true });
     logger.info('Environment variables loaded successfully');
 
     // Set up process-level error handlers

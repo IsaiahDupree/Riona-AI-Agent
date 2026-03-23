@@ -48,7 +48,7 @@ import {
 } from './InstagramDM';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // Set up plugins
 puppeteer.use(StealthPlugin());
@@ -810,6 +810,11 @@ export async function runSingleBatch(username: string, trace?: any, keepOpen?: b
     let commentsPosted = 0;
 
     try {
+        // Initialize Supabase storage (non-blocking)
+        try { await initStorage(); } catch (e) {
+            logger.warn('Storage init failed in runSingleBatch — continuing without persistent storage');
+        }
+
         if (trace) pushStep(trace, { name: 'init_browser', status: 'ok' });
         await instagramAI.initialize();
 
@@ -926,6 +931,11 @@ export async function runNicheBatch(
     const hashtag = niche.replace(/^#/, '').replace(/\s+/g, '').toLowerCase();
 
     try {
+        // Initialize Supabase storage (non-blocking)
+        try { await initStorage(); } catch (e) {
+            logger.warn('Storage init failed in runNicheBatch — continuing without persistent storage');
+        }
+
         await instagramAI.initialize();
         if (!instagramAI.getPage()) throw new Error('Page not initialized');
         let page = instagramAI.getPage()!;

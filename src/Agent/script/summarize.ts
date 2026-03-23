@@ -3,7 +3,7 @@ import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import logger from "../../config/logger";
 
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ override: true });
 
 
 const geminiApiKeys = [

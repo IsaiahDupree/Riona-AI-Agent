@@ -29,7 +29,7 @@ import {
 } from './InstagramDM';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 const LOGIN_TIMEOUT_MS = parseInt(process.env.INSTAGRAM_TIMEOUT_MS || '30000', 10);
 

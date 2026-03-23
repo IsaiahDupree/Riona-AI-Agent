@@ -16,7 +16,7 @@ import dotenv from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 interface ConversationData {
     tab: string;

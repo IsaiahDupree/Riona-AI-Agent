@@ -7,7 +7,7 @@
  */
 
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ override: true });
 
 import { ServiceOrchestrator, RunFunction } from './services/ServiceOrchestrator';
 import { serviceRegistry } from './services/ServiceRegistry';

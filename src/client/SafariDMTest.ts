@@ -16,7 +16,7 @@ import SafariController, { ConversationInfo, MessageInfo, NoteInfo } from './Saf
 import { logger } from '../utils/logger';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 async function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));

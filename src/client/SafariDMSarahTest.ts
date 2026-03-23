@@ -13,7 +13,7 @@ import SafariController, { ConversationInfo, MessageInfo } from './SafariControl
 import { logger } from '../utils/logger';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 async function delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));

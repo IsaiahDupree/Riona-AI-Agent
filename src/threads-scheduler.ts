@@ -12,7 +12,7 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // ── Configuration ──────────────────────────────────────────────────
 const DAILY_TARGET    = parseInt(process.env.THREADS_DAILY_TARGET || '200', 10);

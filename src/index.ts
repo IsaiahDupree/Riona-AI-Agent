@@ -8,7 +8,7 @@ import { startServer } from './server/app';
 async function main() {
     try {
         // Load environment variables
-        dotenv.config();
+        dotenv.config({ override: true });
 
         // Check if .env file exists
         const envPath = path.join(process.cwd(), '.env');

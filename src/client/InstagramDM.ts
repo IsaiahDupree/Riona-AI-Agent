@@ -16,7 +16,7 @@ import { StorageInterface } from '../db/interfaces';
 import { SupabaseStorage } from '../db/supabase';
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ override: true });
 
 // OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 

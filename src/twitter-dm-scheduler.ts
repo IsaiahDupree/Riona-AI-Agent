@@ -5,7 +5,7 @@
  */
 
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ override: true });
 
 import { TwitterDM } from './client/Twitter-DM';
 import { checkForNewTwitterDMs, initializeTwitterWatcherState } from './client/Twitter-DM-Watcher';

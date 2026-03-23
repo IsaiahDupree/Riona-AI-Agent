@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 

@@ -2,7 +2,7 @@ import { runNicheBatch } from './client/Instagram-AI';
 import { logger } from './utils/logger';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const args = process.argv.slice(2);
 const niche = args[0];

@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import dotenv from 'dotenv';
 import { chatCompletion } from '../utils/ai';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 

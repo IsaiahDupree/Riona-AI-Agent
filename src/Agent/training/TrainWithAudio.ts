@@ -3,7 +3,7 @@ import { FileState, GoogleAIFileManager } from "@google/generative-ai/server";
 import dotenv from "dotenv";
 import fs from "fs";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const apiKey = process.env.GEMINI_API_KEY_41 as string;
 if (!apiKey) {

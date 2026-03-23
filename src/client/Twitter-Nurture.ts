@@ -25,7 +25,7 @@ import { getTierForMessage } from '../nurture/tiers';
 import { getBestInterestForMessage } from '../nurture/interests';
 import { hasRepliedToTweet, trackReply, TrackedReply } from '../tracking/twitterTracker';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 

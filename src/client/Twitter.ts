@@ -13,7 +13,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // Stealth plugin (idempotent — puppeteer-extra deduplicates)
 puppeteer.use(StealthPlugin());

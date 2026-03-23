@@ -19,7 +19,7 @@ import { hasCommentedOnPost, recentCommentOnUser, trackComment } from '../tracki
 import * as path from 'path';
 import * as fs from 'fs';
 
-dotenv.config();
+dotenv.config({ override: true });
 
 // OpenAI replaced by shared Anthropic wrapper (chatCompletion)
 
