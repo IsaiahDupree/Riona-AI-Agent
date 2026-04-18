@@ -7,7 +7,7 @@ project_id = "Riona_v3"
 [api]
 enabled = true
 # Port to use for the API URL.
-port = 54321
+port = 54521
 # Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
 # endpoints. `public` and `graphql_public` schemas are included by default.
 schemas = ["public", "graphql_public"]
@@ -25,7 +25,7 @@ enabled = false
 # Port to use for the local database URL.
 port = 54322
 # Port used by db diff command to initialize the shadow database.
-shadow_port = 54320
+shadow_port = 54520
 # The database major version to use. This has to be the same as your remote database's. Run `SHOW
 # server_version;` on the remote database to check.
 major_version = 15
@@ -33,7 +33,7 @@ major_version = 15
 [db.pooler]
 enabled = false
 # Port to use for the local connection pooler.
-port = 54329
+port = 54529
 # Specifies when a server connection can be reused by other clients.
 # Configure one of the supported pooler modes: `transaction`, `session`.
 pool_mode = "transaction"
@@ -67,7 +67,7 @@ enabled = true
 [studio]
 enabled = true
 # Port to use for Supabase Studio.
-port = 54323
+port = 54523
 # External URL of the API server that frontend connects to.
 api_url = "http://127.0.0.1"
 # OpenAI API Key to use for Supabase AI in the Supabase Studio.
@@ -81,7 +81,7 @@ enabled = true
 port = 54324
 # Uncomment to expose additional ports for testing user applications that send emails.
 # smtp_port = 54325
-# pop3_port = 54326
+# pop3_port = 54524
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
 
@@ -281,7 +281,7 @@ enabled = true
 # Use `oneshot` for hot reload, or `per_worker` for load testing.
 policy = "oneshot"
 # Port to attach the Chrome inspector for debugging edge functions.
-inspector_port = 8083
+inspector_port = 8283
 # The Deno major version to use.
 deno_version = 1
 
@@ -290,7 +290,7 @@ deno_version = 1
 
 [analytics]
 enabled = true
-port = 54327
+port = 54527
 # Configure one of the supported backends: `postgres`, `bigquery`.
 backend = "postgres"
 

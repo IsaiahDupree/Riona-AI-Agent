@@ -25,7 +25,12 @@ export async function startServer() {
     res.json({
       status: 'ok',
       db: isDBConnected() ? 'connected' : 'disconnected',
-      uptime: process.uptime()
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      environment: {
+        nodeVersion: process.version,
+        platform: process.platform,
+      }
     });
   });
 

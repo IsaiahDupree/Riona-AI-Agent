@@ -27,6 +27,9 @@ export interface BrowserConfig {
     userDataDir?: string;
     proxy?: string;
     slowMo?: number;
+    /** Connect to an already-running Chrome via CDP instead of launching a new one.
+     *  e.g. 'http://localhost:9222' — used to attach to our chrome-automation-profiles. */
+    cdpUrl?: string;
 }
 
 export interface UnifiedPage {
@@ -181,7 +184,35 @@ function wrapPlaywrightPage(page: PlaywrightPage, browserType: BrowserType): Uni
  * Launch a browser with the specified configuration
  */
 async function launchBrowser(config: BrowserConfig): Promise<UnifiedBrowser> {
-    const { browserType, headless, userDataDir, proxy, slowMo } = config;
+    const { browserType, headless, userDataDir, proxy, slowMo, cdpUrl } = config;
+
+    // CDP connect mode — attach to an already-running Chrome profile
+    // (our chrome-automation-profiles launched by chrome-launcher.sh)
+    const effectiveCdpUrl = cdpUrl || process.env.CHROME_CDP_URL;
+    if (browserType === 'chrome' && effectiveCdpUrl) {
+        logger.info(`Connecting to existing Chrome via CDP`, {
+            component: 'BrowserAdapter',
+            event: 'cdp_connect',
+            cdpUrl: effectiveCdpUrl
+        });
+        // puppeteer-extra connect is not supported; use puppeteer-core directly
+        const { default: puppeteerCore } = await import('puppeteer-core');
+        const browser = await puppeteerCore.connect({
+            browserURL: effectiveCdpUrl,
+            defaultViewport: null,
+        }) as unknown as PuppeteerBrowser;
+        logger.info('CDP connection established', { cdpUrl: effectiveCdpUrl });
+        return {
+            newPage: async () => {
+                // Reuse existing platform tab if available, else open new one
+                const pages = await (browser as any).pages();
+                const page = pages.length > 0 ? pages[pages.length - 1] : await (browser as any).newPage();
+                return wrapPuppeteerPage(page as PuppeteerPage);
+            },
+            close: async () => { /* don't close the shared Chrome */ },
+            browserType: 'chrome'
+        };
+    }
 
     logger.info(`Launching ${browserType} browser`, {
         component: 'BrowserAdapter',
