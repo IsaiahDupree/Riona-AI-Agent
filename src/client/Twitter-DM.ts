@@ -50,7 +50,8 @@ export class TwitterDM {
                 '--disable-blink-features=AutomationControlled',
                 '--window-size=1280,900'
             ],
-            userDataDir: TWITTER_DM_PROFILE
+            userDataDir: TWITTER_DM_PROFILE,
+            protocolTimeout: 180_000,
         });
         const pages = await this.browser.pages();
         this.page = pages[0] || await this.browser.newPage();
@@ -1006,16 +1007,36 @@ export class TwitterDM {
             await delay(1500);
         }
 
-        // Extract messages
+        // Extract messages — try multiple selector strategies for current X DM UI
         const messages = await this.page.evaluate((ourUsername: string) => {
             const results: any[] = [];
-            const msgElements = document.querySelectorAll('div[data-testid="messageEntry"], div[data-testid="tweetText"], div[role="row"]');
+            const scroller = document.querySelector('[data-testid="DmScrollerContainer"]');
+            const container = scroller || document;
+
+            // Strategy 1: tweetText inside DM scroller (current X UI)
+            // Strategy 2: messageEntry (legacy)
+            // Strategy 3: conversation cell divs with text content
+            const msgElements = container.querySelectorAll(
+                '[data-testid="tweetText"], ' +
+                '[data-testid="messageEntry"], ' +
+                '[data-testid="dmMessageText"], ' +
+                'div[dir="auto"][class*="message"]'
+            );
+
+            const seen = new Set<string>();
             for (const msg of msgElements) {
                 const text = (msg as HTMLElement).innerText?.trim();
-                if (!text) continue;
-                // On Twitter, our own messages are typically right-aligned with a blue background
-                const isOurs = (msg as HTMLElement).querySelector('div[style*="flex-end"]') !== null
-                    || (msg as HTMLElement).closest('[data-testid="DMSentMessage"]') !== null;
+                if (!text || text.length < 1) continue;
+                // Deduplicate by text content (same message can match multiple selectors)
+                if (seen.has(text)) continue;
+                seen.add(text);
+
+                // Check if this is our sent message
+                const isOurs =
+                    (msg as HTMLElement).closest('[data-testid="DMSentMessage"]') !== null
+                    || (msg as HTMLElement).closest('div[class*="self"]') !== null
+                    || (msg as HTMLElement).closest('div[style*="flex-end"]') !== null;
+
                 results.push({
                     sender: isOurs ? ourUsername : 'them',
                     text,
@@ -1023,6 +1044,26 @@ export class TwitterDM {
                     isOurs
                 });
             }
+
+            // Fallback: if no messages found via selectors, scan all text nodes in scroller
+            if (results.length === 0 && scroller) {
+                const allDivs = scroller.querySelectorAll('div[dir="auto"]');
+                for (const div of allDivs) {
+                    const text = (div as HTMLElement).innerText?.trim();
+                    if (!text || text.length < 2) continue;
+                    // Skip UI elements (timestamps, read receipts, etc.)
+                    if (/^\d{1,2}:\d{2}/.test(text) || text === 'Seen' || text === 'Sent') continue;
+                    if (seen.has(text)) continue;
+                    seen.add(text);
+                    results.push({
+                        sender: 'unknown',
+                        text,
+                        timestamp: '',
+                        isOurs: false
+                    });
+                }
+            }
+
             return results;
         }, process.env.TWITTER_BOT_USERNAME || 'unknown');
 
@@ -1336,12 +1377,15 @@ export class TwitterDM {
         // On /i/chat/ page, the search bar is a styled element, may need to click first
         const searchSelectors = [
             '[data-testid="dm-search-bar"] input',
-            'input[placeholder="Search"]',
-            'input[placeholder="Search Direct Messages"]',
-            'input[aria-label="Search"]',
-            'input[aria-label*="Search"]',
+            'input[data-testid="DmSearchInput"]',
             'input[data-testid="SearchBox_Search_Input"]',
             'input[data-testid="DmActivitySearch"]',
+            'input[placeholder="Search"]',
+            'input[placeholder="Search Direct Messages"]',
+            'input[placeholder*="message"]',
+            'input[aria-label="Search"]',
+            'input[aria-label*="Search"]',
+            'input[aria-label*="search"]',
         ];
 
         let searchBar: ElementHandle<Element> | null = null;
@@ -1374,7 +1418,7 @@ export class TwitterDM {
                 return false;
             });
             if (activated) {
-                await delay(1500); // Twitter needs time to expand the search input
+                await delay(2500); // X needs time to expand the search input after activation
                 // Now look for the input that appeared
                 for (const sel of searchSelectors) {
                     searchBar = await this.page.$(sel);
@@ -1383,11 +1427,13 @@ export class TwitterDM {
                         break;
                     }
                 }
-                // Try generic input anywhere in dm-inbox-panel or page
+                // Try generic input scoped to DM panel only (avoid matching unrelated inputs)
                 if (!searchBar) {
                     searchBar = await this.page.$('[data-testid="dm-inbox-panel"] input')
-                        || await this.page.$('input[type="text"]')
-                        || await this.page.$('input[type="search"]');
+                        || await this.page.$('[data-testid="dm-inbox-panel"] input[type="text"]')
+                        || await this.page.$('[data-testid="dm-inbox-panel"] input[type="search"]')
+                        || await this.page.$('aside input[type="text"]')
+                        || await this.page.$('aside input[type="search"]');
                     if (searchBar) logger.info('[twitter-dm] Found search bar via generic input after activation');
                 }
             }

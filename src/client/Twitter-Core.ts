@@ -4,6 +4,7 @@ import { logger } from '../utils/logger';
 import { formatError, withRetry, classifyError, sanitizeForPrompt } from '../utils/errors';
 import { delay } from '../utils/delay';
 import { chatCompletion } from '../utils/ai';
+import { getBrandPromptContext } from '../strategy/twitter-brand';
 import dotenv from 'dotenv';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -354,33 +355,37 @@ export async function generateReply(
     const cleanText = sanitizeForPrompt(tweetText, 500);
     const cleanAuthor = sanitizeForPrompt(author, 50);
 
-    const prompt = `Generate a reply to this tweet by @${cleanAuthor}: "${cleanText}"
+    const prompt = `Reply to this tweet by @${cleanAuthor}: "${cleanText}"
+
+Your reply must ADD VALUE for everyone reading the thread. Pick ONE approach:
+- Share a specific tool, framework, or resource that's relevant
+- Add a concrete example, stat, or case study that builds on their point
+- Offer a non-obvious perspective or contrarian take that makes people think
+- Ask a sharp follow-up question that deepens the conversation
 
 Rules:
 1. Length: ${guidelines.minLength}-${guidelines.maxLength} characters
-2. Sound natural and conversational — write like a real person on Twitter
-3. Add value: share an insight, ask a thoughtful question, or agree with substance
-4. Do NOT use generic filler like "Great post!", "Love this!", "So true!"
-5. Do NOT ask the author to follow you or check your profile
-6. Maximum ${guidelines.maxEmojis} emojis (fewer is better)
-7. Match the tone of the original tweet (casual, professional, humorous, etc.)
-8. Keep it concise — Twitter rewards brevity
-9. Do NOT start with "I" if possible
-10. Do NOT use hashtags in the reply
+2. Be specific — name tools, techniques, companies, stats
+3. Match the tone (casual, technical, humorous)
+4. Maximum ${guidelines.maxEmojis} emojis (fewer is better)
+5. No generic filler ("Great point!", "So true!", "Love this!")
+6. No hashtags, no self-promotion, no follow requests
+7. Don't start with "I" if possible
 
 Reply only with the comment text, nothing else.`;
 
     const reply = await withRetry(
         async () => {
+            const brandContext = getBrandPromptContext();
             const content = await chatCompletion({
                 messages: [
                     {
                         role: 'system',
-                        content: 'You are a knowledgeable Twitter user who writes concise, thoughtful replies. Your replies are genuine, add to the conversation, and never feel spammy or generic.'
+                        content: `${brandContext} You reply on Twitter/X as yourself. Write concise, thoughtful replies that showcase your expertise. Share a specific insight, name a tool or technique, or add a perspective that makes people want to follow you. Never use generic filler. Never say "I think" or "in my opinion" — just state it directly.`
                     },
                     { role: 'user', content: prompt }
                 ],
-                max_tokens: 100,
+                max_tokens: 150,
                 temperature: 0.8
             });
 
@@ -1198,6 +1203,37 @@ export interface PostTweetResult {
 }
 
 /**
+ * Fallback: navigate to the bot's profile and scrape the most recent tweet URL.
+ * Used when we can't capture the URL directly after posting.
+ */
+export async function scrapeLatestTweetUrl(page: Page): Promise<string | undefined> {
+    try {
+        const botUsername = process.env.TWITTER_BOT_USERNAME;
+        if (!botUsername) return undefined;
+
+        await page.goto(`https://x.com/${botUsername}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await delay(3000);
+
+        const url = await page.evaluate(() => {
+            const firstTweet = document.querySelector('article[data-testid="tweet"]');
+            if (!firstTweet) return null;
+            const link = firstTweet.querySelector('a[href*="/status/"]');
+            if (!link) return null;
+            const href = link.getAttribute('href') || '';
+            return href.startsWith('http') ? href : `https://x.com${href}`;
+        });
+
+        if (url) {
+            logger.info(`[Twitter-Core] Captured tweet URL via profile fallback: ${url}`);
+        }
+        return url || undefined;
+    } catch (err) {
+        logger.debug(`[Twitter-Core] Profile URL fallback failed: ${formatError(err)}`);
+        return undefined;
+    }
+}
+
+/**
  * Compose and post an original tweet.
  */
 export async function postTweet(
@@ -1324,6 +1360,11 @@ export async function postTweet(
             }
         } catch (urlErr) {
             logger.debug(`[Twitter-Core] Could not capture tweet URL (non-fatal): ${formatError(urlErr)}`);
+        }
+
+        // Fallback: navigate to profile and scrape the most recent tweet URL
+        if (!tweetUrl) {
+            tweetUrl = await scrapeLatestTweetUrl(page);
         }
 
         // Verify posted text wasn't clipped (check first/last chars visible on page)
@@ -1455,12 +1496,23 @@ export async function quoteTweet(
         await postButton.click({ delay: getRandomDelay(30, 80) });
         await delay(4000);
 
+        // Capture the quote tweet URL
+        let tweetUrl: string | undefined;
+        const currentUrl = page.url();
+        if (currentUrl.includes('/status/')) {
+            tweetUrl = currentUrl;
+        }
+        if (!tweetUrl) {
+            tweetUrl = await scrapeLatestTweetUrl(page);
+        }
+
         logger.info('[Twitter-Core] Quote tweet posted successfully', {
             component: 'Twitter-Core',
-            event: 'quote_tweet_success'
+            event: 'quote_tweet_success',
+            tweetUrl: tweetUrl || 'unknown'
         });
 
-        return { success: true };
+        return { success: true, tweetUrl };
     } catch (error) {
         logger.error('[Twitter-Core] Quote tweet failed', {
             component: 'Twitter-Core',
@@ -1596,13 +1648,24 @@ export async function postThread(
         await postButton.click({ delay: getRandomDelay(30, 80) });
         await delay(5000);
 
+        // Capture the thread URL (first tweet in the thread)
+        let tweetUrl: string | undefined;
+        const currentUrl = page.url();
+        if (currentUrl.includes('/status/')) {
+            tweetUrl = currentUrl;
+        }
+        if (!tweetUrl) {
+            tweetUrl = await scrapeLatestTweetUrl(page);
+        }
+
         logger.info(`[Twitter-Core] Thread posted successfully (${tweets.length} tweets)`, {
             component: 'Twitter-Core',
             event: 'post_thread_success',
-            tweetCount: tweets.length
+            tweetCount: tweets.length,
+            tweetUrl: tweetUrl || 'unknown'
         });
 
-        return { success: true };
+        return { success: true, tweetUrl };
     } catch (error) {
         logger.error('[Twitter-Core] Thread posting failed', {
             component: 'Twitter-Core',

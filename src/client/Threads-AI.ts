@@ -406,7 +406,113 @@ export class ThreadsAI {
     }
 }
 
-// ── Comment Generation (Threads-specific prompt) ───────────────────
+// ── Topic Relevance Filter ─────────────────────────────────────────
+
+const TECH_KEYWORDS = [
+    // AI & ML
+    'ai', 'artificial intelligence', 'machine learning', 'ml', 'llm', 'gpt',
+    'claude', 'openai', 'anthropic', 'gemini', 'deep learning', 'neural',
+    'transformer', 'diffusion', 'stable diffusion', 'midjourney',
+    'chatbot', 'copilot', 'generative ai', 'computer vision', 'nlp',
+    // Programming & Dev
+    'coding', 'programming', 'developer', 'software', 'engineering',
+    'python', 'javascript', 'typescript', 'rust', 'golang', 'java', 'c++',
+    'swift', 'kotlin', 'ruby', 'php', 'scala', 'elixir',
+    'frontend', 'backend', 'fullstack', 'full-stack', 'full stack',
+    'web dev', 'web development', 'mobile dev', 'mobile app',
+    'app developer', 'app development',
+    // Frameworks & Tools
+    'api', 'saas', 'startup', 'tech', 'automation', 'devops', 'cicd', 'ci/cd',
+    'react', 'nextjs', 'next.js', 'vue', 'angular', 'svelte',
+    'node', 'django', 'flask', 'spring boot', 'laravel',
+    'tailwind', 'webpack', 'vite',
+    // Cloud & Infra
+    'cloud', 'aws', 'azure', 'gcp', 'docker', 'kubernetes',
+    'terraform', 'ansible', 'jenkins', 'gitlab', 'vercel', 'netlify',
+    'serverless', 'microservice', 'infrastructure',
+    // Data
+    'data science', 'data analyst', 'data engineering', 'analytics',
+    'algorithm', 'open source', 'dataset', 'big data', 'etl', 'pipeline',
+    'database', 'sql', 'nosql', 'mongodb', 'postgresql', 'redis',
+    'github', 'vscode', 'linux', 'terminal', 'command line',
+    // Crypto & Web3
+    'crypto', 'blockchain', 'web3', 'defi', 'smart contract', 'solidity',
+    // Security & Networking
+    'cybersecurity', 'infosec', 'security', 'encryption', 'firewall',
+    'ssl', 'tls', 'vpn', 'ipsec', 'ssh', 'https',
+    'penetration testing', 'pentest', 'vulnerability', 'malware',
+    'networking', 'dns', 'tcp', 'http', 'protocol',
+    // Hardware & Systems
+    'robotics', 'quantum', 'iot', 'internet of things', 'embedded',
+    'compute', 'gpu', 'nvidia', 'chip', 'semiconductor', 'cpu', 'amd', 'intel',
+    'raspberry pi', 'arduino', '3d print',
+    // Platforms & OS
+    'ios', 'android', 'macos', 'windows', 'ubuntu',
+    'iphone', 'ipad', 'apple watch', 'pixel', 'samsung',
+    'app store', 'play store', 'my app', 'an app', 'the app', 'your app',
+    'built an app', 'launched an app', 'shipping an app', 'native app', 'web app',
+    'chrome extension', 'browser extension',
+    // Remote / hiring
+    'remote work', 'remote job', 'work from home', 'hiring', 'tech hiring',
+    // AI tooling
+    'rag', 'fine-tuning', 'fine tuning', 'prompt engineering', 'agent', 'agentic',
+    'langchain', 'vector database', 'embeddings',
+    // Product & Startup
+    'no-code', 'low-code', 'indie hacker', 'build in public',
+    'product hunt', 'yc', 'y combinator', 'venture', 'funding',
+    'saas', 'b2b', 'mrr', 'arr', 'bootstrapped',
+    // Career & Industry
+    'tech job', 'software engineer', 'dev job', 'tech interview',
+    'leetcode', 'system design', 'roadmap',
+];
+
+const POLITICAL_KEYWORDS = [
+    'democrat', 'republican', 'trump', 'biden', 'harris', 'maga',
+    'liberal', 'conservative', 'left-wing', 'right-wing', 'woke',
+    'abortion', 'gun control', 'immigration policy', 'border wall',
+    'congress', 'senate vote', 'impeach', 'partisan',
+    'election fraud', 'stolen election', 'political party',
+    'socialism', 'communism', 'fascism', 'marxism',
+    'fox news', 'msnbc', 'cnn politics', 'capitol',
+    'supreme court ruling', 'roe v wade', 'second amendment',
+    'red state', 'blue state', 'swing state', 'ballot',
+    'political', 'politician', 'legislation', 'lobby'
+];
+
+// Short keywords (<=3 chars) need word-boundary matching to avoid false positives
+// e.g. "ai" matching "available", "ml" matching "html"
+const SHORT_KW_THRESHOLD = 3;
+
+function matchesKeyword(text: string, keyword: string): boolean {
+    if (keyword.length <= SHORT_KW_THRESHOLD) {
+        // Use word-boundary regex for short keywords
+        const regex = new RegExp(`\\b${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        return regex.test(text);
+    }
+    return text.includes(keyword);
+}
+
+export function isRelevantTechPost(postText: string): { relevant: boolean; reason: string } {
+    const lower = postText.toLowerCase();
+
+    // Check for political content first — reject immediately
+    for (const kw of POLITICAL_KEYWORDS) {
+        if (matchesKeyword(lower, kw)) {
+            return { relevant: false, reason: `political_keyword:${kw}` };
+        }
+    }
+
+    // Check for tech relevance
+    for (const kw of TECH_KEYWORDS) {
+        if (matchesKeyword(lower, kw)) {
+            return { relevant: true, reason: `tech_keyword:${kw}` };
+        }
+    }
+
+    return { relevant: false, reason: 'no_tech_keywords' };
+}
+
+// ── Comment Generation (Tech-focused, Isaiah's voice) ──────────────
 
 async function generateThreadsComment(postText: string): Promise<string | null> {
     try {
@@ -416,23 +522,65 @@ async function generateThreadsComment(postText: string): Promise<string | null> 
             messages: [
                 {
                     role: 'system',
-                    content: 'You are a thoughtful Threads user who leaves brief, meaningful replies. Keep replies concise (under 150 chars), natural, and engaging. Use 1-2 emojis max. No hashtags, no "check my profile" spam, no generic filler.'
+                    content: `You are Isaiah, a developer and tech enthusiast who comments on Threads. You reply as yourself — never explain your reasoning or thought process, never say "I think", "I believe", "in my opinion", "let me explain", "here's why", or anything meta. Just speak directly.
+
+Your comment must ADD VALUE for anyone reading the thread. Pick ONE approach:
+- Name a specific tool, library, or technique that's relevant
+- Share a concrete example, stat, or real experience that builds on their point
+- Offer a non-obvious take or contrarian perspective that makes people think
+- Ask a sharp follow-up question that deepens the discussion
+
+Rules:
+- ONLY comment on tech, AI, software, startups, and related niche topics
+- Be specific — name tools, frameworks, companies, stats, version numbers
+- Keep it under 280 characters, natural and conversational
+- Use 0-2 emojis max
+- No hashtags, no self-promotion, no generic filler like "great post" or "love this"
+- Sound like a knowledgeable person contributing, not a fan or a bot
+- Match the energy — casual for casual, technical for technical`
                 },
                 {
                     role: 'user',
-                    content: `Write a natural reply to this Threads post:\n\n"${postText.slice(0, 500)}"\n\nReply:`
+                    content: await (async () => {
+                        let learning = '';
+                        try {
+                            const { getEngagementSummary } = await import('../tracking/commentTracker');
+                            const summary = getEngagementSummary(7);
+                            if (summary.totalChecked >= 5 && summary.topPerformers.length > 0) {
+                                const examples = summary.topPerformers.slice(0, 2)
+                                    .filter(c => c.platform === 'threads')
+                                    .map(c => `"${c.commentText.slice(0, 80)}"`)
+                                    .join(', ');
+                                if (examples) learning = `\nYour best-performing comments recently: ${examples}. Match that style.\n`;
+                            }
+                        } catch (_) { /* no learnings */ }
+                        return `Reply to this tech post as Isaiah:${learning}\n\n"${postText.slice(0, 500)}"\n\nReply:`;
+                    })()
                 }
             ],
-            max_tokens: 60,
-            temperature: 0.7
+            max_tokens: 120,
+            temperature: 0.8
         });
 
         if (!comment) return null;
 
         // Clean up
         comment = comment.replace(/^["']|["']$/g, '').replace(/["*`#]/g, '').trim();
-        if (comment.length > 150) comment = comment.slice(0, 147) + '...';
+        if (comment.length > 280) comment = comment.slice(0, 277) + '...';
         if (comment.length < 3) return null;
+
+        // Reject meta-commentary (AI explaining itself instead of commenting)
+        const metaPhrases = [
+            'i appreciate the post', 'i should clarify', 'this isn\'t really',
+            'not really a tech', 'not a tech topic', 'i focus on',
+            'as isaiah', 'outside my', 'not in my niche', 'i can\'t comment',
+            'i don\'t see', 'no context', 'not provided', 'i apologize',
+        ];
+        const lowerComment = comment.toLowerCase();
+        if (metaPhrases.some(p => lowerComment.includes(p))) {
+            logger.warn(`[threads] Rejected meta-commentary: "${comment.slice(0, 60)}..."`);
+            return null;
+        }
 
         logger.info(`[threads] Generated comment: "${comment}"`);
         return comment;
@@ -778,14 +926,44 @@ export async function runThreadsBatch(
 
         let page = threadsAI.getPage()!;
 
-        logger.info(`[threads] Starting feed batch, target: ${targetPosts} posts`);
+        // Custom feed URL (e.g. a tech-focused Threads group) or fallback to search
+        const CUSTOM_FEED_URL = process.env.THREADS_CUSTOM_FEED_URL || 'https://www.threads.com/custom_feed/18115229170663013';
 
-        // Navigate to feed
-        await page.goto('https://www.threads.net/', {
+        // Fallback search topics if custom feed fails
+        const TECH_SEARCH_TOPICS = [
+            'artificial intelligence', 'machine learning', 'software engineering',
+            'AI agents', 'startup tech', 'web development', 'LLM',
+            'developer tools', 'open source', 'coding', 'python programming',
+            'cloud computing', 'cybersecurity', 'data science', 'devops',
+            'react nextjs', 'automation', 'GPT Claude', 'indie hacker',
+            'build in public', 'saas', 'tech startup'
+        ];
+
+        // Try custom feed first, fall back to search
+        let feedSource = 'custom_feed';
+        logger.info(`[threads] Starting tech-focused batch, target: ${targetPosts} posts`);
+        logger.info(`[threads] Navigating to custom feed: ${CUSTOM_FEED_URL}`);
+
+        await page.goto(CUSTOM_FEED_URL, {
             waitUntil: 'domcontentloaded', timeout: THREADS_TIMEOUT
         });
-        await delay(3000);
+        await delay(4000);
         await dismissPopups(page);
+
+        // Check if the custom feed loaded posts — if not, fall back to search
+        const initialPosts = await findFeedPosts(page);
+        if (initialPosts.length === 0) {
+            const searchTopic = TECH_SEARCH_TOPICS[Math.floor(Math.random() * TECH_SEARCH_TOPICS.length)];
+            const searchUrl = `https://www.threads.net/search?q=${encodeURIComponent(searchTopic)}&serp_type=default`;
+            feedSource = `search:${searchTopic}`;
+            logger.info(`[threads] Custom feed empty, falling back to search: "${searchTopic}"`);
+            await page.goto(searchUrl, {
+                waitUntil: 'domcontentloaded', timeout: THREADS_TIMEOUT
+            });
+            await delay(4000);
+            await dismissPopups(page);
+        }
+        logger.info(`[threads] Feed source: ${feedSource}`);
 
         // Collect post URLs by scrolling the feed
         let postUrls: string[] = [];
@@ -942,6 +1120,22 @@ export async function runThreadsBatch(
                     });
                     continue;
                 }
+
+                // Topic filter: only engage with tech/AI posts, skip political content
+                const relevance = isRelevantTechPost(meta.postText);
+                if (!relevance.relevant) {
+                    logger.info(`[threads] SKIP (not tech) @${postAuthor} — ${relevance.reason}: "${meta.postText.slice(0, 60)}..."`);
+                    session.postsSkippedOther++;
+                    await saveThreadsPost({
+                        post_url: postUrl, author_username: postAuthor,
+                        post_text: meta.postText, hashtags, our_comment: null,
+                        comment_verified: false, liked: false,
+                        skipped: true, skip_reason: `topic_filter:${relevance.reason}`,
+                        session_id: session.sessionId, metadata: {}
+                    });
+                    continue;
+                }
+                logger.info(`[threads] Topic match: ${relevance.reason}`);
 
                 // Skip own posts
                 const botUser = (process.env.INSTAGRAM_BOT_USERNAME || process.env.THREADS_BOT_USERNAME || '').toLowerCase().replace(/[@/]/g, '');

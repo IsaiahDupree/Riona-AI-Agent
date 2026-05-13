@@ -1,13 +1,15 @@
 /**
- * Shared AI client — wraps Anthropic Claude API via OAuth.
+ * Shared AI client — wraps Anthropic Claude API via OAuth with OpenAI fallback.
  *
- * Auth chain (no API key fallback):
- *   1. OAuth from Claude Code credentials (~/.claude/.credentials.json)
- *   2. ANTHROPIC_AUTH_TOKEN env var (Bearer token)
+ * Auth chain:
+ *   1. Claude via OAuth (primary — Claude Code credentials)
+ *   2. Claude via ANTHROPIC_AUTH_TOKEN env var
+ *   3. OpenAI via OPENAI_API_KEY env var (fallback when Claude fails)
  *
  * OAuth tokens auto-refresh when expiring within 5 minutes.
  */
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { logger } from './logger';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -36,13 +38,23 @@ const REFRESH_MARGIN_MS = 5 * 60 * 1000; // refresh 5 min before expiry
 
 const ANTHROPIC_AUTH_TOKEN = process.env.ANTHROPIC_AUTH_TOKEN || '';
 
-// Default model
+// Default models
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+const OPENAI_FALLBACK_MODEL = 'gpt-4o-mini';
 
 // ── Client cache ─────────────────────────────────────────────────────
 
 let _client: Anthropic | null = null;
 let _cachedToken: string = '';
+let _openaiClient: OpenAI | null = null;
+
+function getOpenAIClient(): OpenAI | null {
+    if (_openaiClient) return _openaiClient;
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return null;
+    _openaiClient = new OpenAI({ apiKey });
+    return _openaiClient;
+}
 
 function makeOAuthClient(authToken: string): Anthropic {
     return new Anthropic({
@@ -187,45 +199,79 @@ export interface AIChatOptions {
 
 // ── Chat completion ──────────────────────────────────────────────────
 
-/**
- * Generate a chat completion using Claude via OAuth.
- * Accepts the same message format as OpenAI for easy migration.
- */
-export async function chatCompletion(options: AIChatOptions): Promise<string> {
-    const client = await getClientAsync();
-    const model = options.model || DEFAULT_MODEL;
-    const maxTokens = options.max_tokens || 150;
-    const temperature = options.temperature ?? 0.8;
+// ── OpenAI fallback completion ───────────────────────────────────────
 
-    // Separate system message from conversation messages
-    const systemMessages = options.messages.filter(m => m.role === 'system');
-    const conversationMessages = options.messages.filter(m => m.role !== 'system');
+async function openAICompletion(options: AIChatOptions): Promise<string> {
+    const client = getOpenAIClient();
+    if (!client) throw new Error('No OpenAI API key available for fallback');
 
-    // Claude requires alternating user/assistant messages starting with user
-    const claudeMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
-    for (const msg of conversationMessages) {
-        claudeMessages.push({
-            role: msg.role === 'assistant' ? 'assistant' : 'user',
-            content: msg.content,
-        });
-    }
-
-    // Ensure we start with a user message
-    if (claudeMessages.length === 0 || claudeMessages[0].role !== 'user') {
-        claudeMessages.unshift({ role: 'user', content: 'Please respond.' });
-    }
-
-    const response = await client.messages.create({
-        model,
-        max_tokens: maxTokens,
-        temperature,
-        system: systemMessages.map(m => m.content).join('\n\n') || undefined,
-        messages: claudeMessages,
+    const response = await client.chat.completions.create({
+        model: OPENAI_FALLBACK_MODEL,
+        messages: options.messages.map(m => ({
+            role: m.role,
+            content: m.content,
+        })),
+        max_tokens: options.max_tokens || 150,
+        temperature: options.temperature ?? 0.8,
     });
 
-    // Extract text from response
-    const textBlock = response.content.find(b => b.type === 'text');
-    return textBlock?.text || '';
+    return response.choices[0]?.message?.content?.trim() || '';
 }
 
-export { getClient, getClientAsync, DEFAULT_MODEL };
+// ── Chat completion (Claude primary, OpenAI fallback) ───────────────
+
+/**
+ * Generate a chat completion. Tries Claude first, falls back to OpenAI
+ * if Claude fails (OAuth expired, rate limit, network error).
+ */
+export async function chatCompletion(options: AIChatOptions): Promise<string> {
+    // ── Try Claude first ────────────────────────────────────────────
+    try {
+        const client = await getClientAsync();
+        const model = options.model || DEFAULT_MODEL;
+        const maxTokens = options.max_tokens || 150;
+        const temperature = options.temperature ?? 0.8;
+
+        const systemMessages = options.messages.filter(m => m.role === 'system');
+        const conversationMessages = options.messages.filter(m => m.role !== 'system');
+
+        const claudeMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+        for (const msg of conversationMessages) {
+            claudeMessages.push({
+                role: msg.role === 'assistant' ? 'assistant' : 'user',
+                content: msg.content,
+            });
+        }
+
+        if (claudeMessages.length === 0 || claudeMessages[0].role !== 'user') {
+            claudeMessages.unshift({ role: 'user', content: 'Please respond.' });
+        }
+
+        const response = await client.messages.create({
+            model,
+            max_tokens: maxTokens,
+            temperature,
+            system: systemMessages.map(m => m.content).join('\n\n') || undefined,
+            messages: claudeMessages,
+        });
+
+        const textBlock = response.content.find(b => b.type === 'text');
+        return textBlock?.text || '';
+    } catch (claudeError) {
+        // ── Fall back to OpenAI ─────────────────────────────────────
+        const errMsg = (claudeError as Error).message || String(claudeError);
+        logger.warn(`[ai] Claude failed: ${errMsg} — falling back to OpenAI`);
+
+        try {
+            const result = await openAICompletion(options);
+            logger.info(`[ai] OpenAI fallback succeeded`);
+            return result;
+        } catch (openaiError) {
+            logger.error(`[ai] OpenAI fallback also failed: ${(openaiError as Error).message}`);
+            // Re-throw the original Claude error since both failed
+            throw claudeError;
+        }
+    }
+}
+
+export { getClient, getClientAsync, DEFAULT_MODEL, OPENAI_FALLBACK_MODEL };

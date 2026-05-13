@@ -240,8 +240,9 @@ export function matchOffer(
     const offers = loadOffers().filter(o => o.active);
     const bio = (theirProfile.bio || '').toLowerCase();
 
-    // Check offer readiness if VR state is available
-    if (username && platform) {
+    // Check offer readiness — skip for cold outreach (new contacts have no history to score)
+    const coldStages = ['cold_outreach', 'initial_contact'];
+    if (username && platform && !coldStages.includes(relationship.stage)) {
         try {
             const readiness = computeOfferReadiness(username, platform);
             if (readiness.score < 0.45) {

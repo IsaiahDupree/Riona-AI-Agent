@@ -319,6 +319,14 @@ export async function processReplyNotifications(
                 continue;
             }
 
+            // Skip if we couldn't find our original tweet text — AI will hallucinate
+            if (!context.ourOriginalText || context.ourOriginalText.length < 5) {
+                logger.warn(`[reply-handler] Missing original tweet context for @${fromUsername}, skipping`);
+                result.skipped++;
+                result.details.push({ username: fromUsername, action: 'skipped', reason: 'missing_original_context' });
+                continue;
+            }
+
             // 2. Generate reply
             const replyText = await generateReplyToReply(
                 context.theirReplyText,
@@ -331,6 +339,20 @@ export async function processReplyNotifications(
                 logger.warn(`[reply-handler] Generated reply too short for @${fromUsername}`);
                 result.failed++;
                 result.details.push({ username: fromUsername, action: 'failed', reason: 'generation_failed' });
+                continue;
+            }
+
+            // Guard: reject replies that contain meta-commentary about missing context
+            const metaPhrases = [
+                "i don't see", "i can't see", "no context", "not provided",
+                "context provided", "original tweet", "not visible", "can't find",
+                "don't have access", "no original"
+            ];
+            const replyLower = replyText.toLowerCase();
+            if (metaPhrases.some(p => replyLower.includes(p))) {
+                logger.warn(`[reply-handler] Rejected meta-commentary reply for @${fromUsername}: "${replyText.slice(0, 60)}..."`);
+                result.failed++;
+                result.details.push({ username: fromUsername, action: 'failed', reason: 'meta_commentary_detected' });
                 continue;
             }
 

@@ -2,6 +2,7 @@ import { logger } from './utils/logger';
 import { notifyRunComplete, notifyDailyTargetReached, notifyError, notifyStartup, notifyContentPosted, notifyNurtureActivity, notifyContentAnalysis } from './utils/telegram';
 import { getTodayReplyCount, getTodayVerifiedCount, getDailyStats, cleanupOldReplies } from './tracking/twitterTracker';
 import { safeReadJSON, safeWriteJSON, formatError } from './utils/errors';
+import { selectWeightedNiche, recordNicheRun } from './tracking/nichePerformance';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
@@ -225,7 +226,7 @@ async function scheduledRun() {
         }
 
         const isNicheRun = allSearchTerms.length > 0 && NICHE_FREQUENCY > 0 && runNumber % NICHE_FREQUENCY === 0;
-        const currentNiche = isNicheRun ? allSearchTerms[nicheIndex % allSearchTerms.length] : null;
+        const currentNiche = isNicheRun ? selectWeightedNiche(allSearchTerms, 'twitter') : null;
 
         logger.info(`[twitter-scheduler] ── Starting run #${runNumber} ${isNicheRun ? `[NICHE: ${currentNiche}]` : '[FEED]'} ──────────────────────`);
         logger.info(`[twitter-scheduler] Today: ${effectiveCount}/${DAILY_TARGET} replies | ${remaining} remaining`);
@@ -247,6 +248,9 @@ async function scheduledRun() {
             session = nicheResult.session;
             twitterAI = nicheResult.twitterAI;
             nicheIndex++;
+
+            // Record niche performance for weighted selection
+            recordNicheRun(currentNiche, 'twitter', session.repliesPosted, session.repliesVerified);
         } else {
             const result = await runTwitterBatch(BOT_USERNAME);
             repliesPosted = result.commentsPosted;

@@ -98,6 +98,7 @@ export class TwitterAI {
                 defaultViewport: null,
                 executablePath: CHROME_PATH,
                 userDataDir: TWITTER_PROFILE,
+                protocolTimeout: 180_000,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',

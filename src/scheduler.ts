@@ -259,17 +259,67 @@ async function scheduledRun() {
                         );
                     }
 
-                    // IG comment reply automation disabled — focus on DM responses instead
-                    // const replyResult = await processIGReplyNotifications(page, 5);
-                    // if (replyResult.replied > 0) {
-                    //     logger.info(
-                    //         `[scheduler] IG Reply handler: ${replyResult.replied} replies sent, ` +
-                    //         `${replyResult.skipped} skipped, ${replyResult.failed} failed`
-                    //     );
-                    // }
+                    // IG comment reply automation — respond when people reply to our comments
+                    const replyResult = await processIGReplyNotifications(page, 5);
+                    if (replyResult.replied > 0) {
+                        logger.info(
+                            `[scheduler] IG Reply handler: ${replyResult.replied} replies sent, ` +
+                            `${replyResult.skipped} skipped, ${replyResult.failed} failed`
+                        );
+                    }
                 }
             } catch (notifErr) {
                 logger.warn(`[scheduler] IG notification check failed (non-fatal): ${formatError(notifErr)}`);
+            }
+        }
+
+        // ── Comment engagement check-backs (every 6th run) ────────────
+        if (instagramAI && runNumber % 6 === 0) {
+            try {
+                const page = instagramAI.getPage();
+                if (page) {
+                    const { getCommentsNeedingCheckBack, updateCommentEngagement } = await import('./tracking/commentTracker');
+                    const dueComments = getCommentsNeedingCheckBack('instagram');
+                    const checkLimit = Math.min(dueComments.length, 5); // max 5 per run
+
+                    if (checkLimit > 0) {
+                        logger.info(`[scheduler] Checking engagement on ${checkLimit}/${dueComments.length} comments`);
+                        for (const comment of dueComments.slice(0, checkLimit)) {
+                            try {
+                                await page.goto(comment.postUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+                                await new Promise(r => setTimeout(r, 3000));
+
+                                // Look for our comment and count engagement on it
+                                const engagement = await page.evaluate((commentText: string) => {
+                                    const comments = document.querySelectorAll('ul li, div[role="button"]');
+                                    for (const el of comments) {
+                                        const text = (el as HTMLElement).innerText || '';
+                                        if (text.includes(commentText.slice(0, 30))) {
+                                            // Count likes (heart icon count near our comment)
+                                            const likeEl = el.querySelector('button[aria-label*="like"], span[class*="like"]');
+                                            const likeCount = likeEl ? parseInt(likeEl.textContent?.replace(/\D/g, '') || '0') : 0;
+                                            // Count replies (nested comments under ours)
+                                            const replyEls = el.querySelectorAll('ul li, div[role="button"]');
+                                            return { likes: likeCount, replies: Math.max(0, replyEls.length - 1) };
+                                        }
+                                    }
+                                    return { likes: 0, replies: 0 };
+                                }, comment.commentText);
+
+                                updateCommentEngagement(comment.postUrl, {
+                                    checkedAt: new Date().toISOString(),
+                                    likes: engagement.likes,
+                                    replies: engagement.replies,
+                                    followedBack: false, // TODO: check follower list
+                                });
+                            } catch (e) {
+                                logger.debug(`[scheduler] Engagement check failed for ${comment.postUrl}: ${formatError(e)}`);
+                            }
+                        }
+                    }
+                }
+            } catch (engErr) {
+                logger.debug(`[scheduler] Engagement check-back phase failed: ${formatError(engErr)}`);
             }
         }
 

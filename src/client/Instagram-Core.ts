@@ -18,6 +18,7 @@ import { StorageInterface } from '../db/interfaces';
 import { SupabaseStorage } from '../db/supabase';
 import { hasCommentedOnPost, trackComment, TrackedComment } from '../tracking/commentTracker';
 import { formatError, sanitizeForPrompt } from '../utils/errors';
+import { getBrandPromptContext } from '../strategy/twitter-brand';
 
 // Load environment variables
 dotenv.config({ override: true });
@@ -729,36 +730,54 @@ async function generateComment(caption: string): Promise<string | null> {
 
         const cleanCaption = sanitizeForPrompt(caption, 500);
 
-        const prompt = `Generate a simple Instagram comment for this post: "${cleanCaption}"\n\nFollow these basic rules:
-        1. Length: 3-300 characters
-        2. Style: Casual and friendly
-        3. Content: Should relate to the post content
-        4. Optional elements:
-           - Emojis (0-6)
-           - Punctuation marks (up to 10)
-           - Capitalized words (up to 8)
-        5. Avoid:
-           - Follow/followback requests
-           - "Check my profile" phrases`;
+        // Inject engagement learnings if available
+        let learningContext = '';
+        try {
+            const { getEngagementSummary } = await import('../tracking/commentTracker');
+            const summary = getEngagementSummary(7);
+            if (summary.totalChecked >= 5 && summary.topPerformers.length > 0) {
+                const topExamples = summary.topPerformers.slice(0, 3)
+                    .map(c => `"${c.commentText.slice(0, 80)}" (${c.engagement?.likes || 0} likes)`)
+                    .join('\n');
+                learningContext = `\n\nYour top-performing comments recently:\n${topExamples}\nAim for a similar style and specificity level.\n`;
+            }
+        } catch (_) { /* no learnings yet */ }
+
+        const prompt = `Comment on this Instagram post: "${cleanCaption}"
+${learningContext}
+Your comment must ADD VALUE to anyone reading the post. Pick ONE of these approaches:
+- Share a specific tool, technique, or resource related to the topic
+- Add a real-world example or case study that expands on the post
+- Share a contrarian or non-obvious take that makes people think
+- Ask a sharp, specific question that sparks discussion
+
+Rules:
+1. Length: 20-300 characters
+2. Sound like a knowledgeable person contributing to the conversation, not a fan
+3. Be specific — name names (tools, frameworks, people, companies)
+4. 0-2 emojis max
+5. No "Great post!", "Love this!", or generic praise
+6. No follow requests or self-promotion`;
 
         logger.info('Sending request to AI', {
             component: 'Instagram-Core',
             event: 'ai_request_start'
         });
 
+        const brandContext = getBrandPromptContext();
         const comment = await chatCompletion({
             messages: [
                 {
                     role: "system",
-                    content: "You are a casual Instagram user who leaves simple, friendly comments. Keep comments natural and related to the post content. Reply with ONLY the comment text — no markdown, no headers, no formatting, no labels, no quotes."
+                    content: `${brandContext} You comment on Instagram as yourself — a real person with expertise. Share specific insights, name a tool/technique/example when relevant, and sound like someone worth following. Never explain your reasoning meta-style ("I think", "in my opinion"). Just speak directly. Reply with ONLY the comment text — no markdown, no headers, no formatting, no labels, no quotes.`
                 },
                 {
                     role: "user",
                     content: prompt
                 }
             ],
-            max_tokens: 60,
-            temperature: 0.7
+            max_tokens: 150,
+            temperature: 0.8
         });
 
         if (!comment) {

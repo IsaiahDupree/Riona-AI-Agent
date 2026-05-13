@@ -229,6 +229,7 @@ class BrowserPoolImpl {
                 headless: false,
                 executablePath: CHROME_PATH,
                 userDataDir: profileDir,
+                protocolTimeout: 180_000,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',

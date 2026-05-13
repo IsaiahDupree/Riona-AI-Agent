@@ -692,13 +692,19 @@ export class InstagramDM {
         await delay(2000); // Wait for search results
 
         // Click the first matching result
-        // Instagram shows search results as clickable items with username/name text
+        // Instagram's search results render as various element types depending on UI version
         const resultClicked = await this.page.evaluate((name: string) => {
             const nameLower = name.toLowerCase();
-            // Look for clickable items in the dialog
             const dialog = document.querySelector('[role="dialog"]');
             const container = dialog || document;
-            const items = container.querySelectorAll('div[role="button"], button, label');
+
+            // Broad selector: covers current and legacy IG UI variants
+            const items = container.querySelectorAll(
+                'div[role="button"], button, label, ' +
+                'div[role="listitem"], div[role="option"], ' +
+                'a[role="link"], a, ' +
+                'div[tabindex="0"], div[tabindex="-1"]'
+            );
             for (const item of items) {
                 const text = (item as HTMLElement).innerText?.toLowerCase() || '';
                 if (text.includes(nameLower)) {
@@ -707,9 +713,9 @@ export class InstagramDM {
                 }
             }
             // Also try checkbox/radio inputs in the results
-            const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+            const checkboxes = container.querySelectorAll('input[type="checkbox"], input[type="radio"]');
             for (const cb of checkboxes) {
-                const parent = cb.closest('div[role="button"], label, div');
+                const parent = cb.closest('div[role="button"], label, div[role="listitem"], div');
                 if (parent) {
                     const text = (parent as HTMLElement).innerText?.toLowerCase() || '';
                     if (text.includes(nameLower)) {

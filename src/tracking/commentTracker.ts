@@ -5,6 +5,13 @@ import { safeReadJSON, safeWriteJSON } from '../utils/errors';
 
 // ── Types ─────────────────────────────────────────────────────────────
 
+export interface CommentEngagement {
+    checkedAt: string;         // ISO 8601 — when we checked back
+    likes: number;             // likes on our comment
+    replies: number;           // replies to our comment
+    followedBack: boolean;     // did the post author follow us?
+}
+
 export interface TrackedComment {
     postUrl: string;           // permalink (e.g. https://instagram.com/p/ABC123/)
     postUsername: string;       // who posted it
@@ -14,6 +21,8 @@ export interface TrackedComment {
     sessionId: string;         // which scheduler run
     captionSnippet: string;    // first 100 chars of caption
     liked: boolean;            // did we also like?
+    platform?: 'instagram' | 'threads';  // which platform
+    engagement?: CommentEngagement;       // 24h check-back results
 }
 
 export interface SessionLog {
@@ -155,6 +164,86 @@ export function cleanupOldComments(daysToKeep = 30) {
         saveComments(filtered);
         logger.info(`[tracker] Cleaned up ${comments.length - filtered.length} old comments`);
     }
+}
+
+// ── Comment Engagement Check-backs ──────────────────────────────────
+
+/**
+ * Get comments that are due for a 24h engagement check-back.
+ * Returns comments posted 22-48h ago that haven't been checked yet.
+ */
+export function getCommentsNeedingCheckBack(platform?: 'instagram' | 'threads'): TrackedComment[] {
+    const comments = loadComments();
+    const now = Date.now();
+    const minAge = 22 * 60 * 60 * 1000;  // 22h (slight buffer before 24h)
+    const maxAge = 48 * 60 * 60 * 1000;  // 48h (don't bother after 2 days)
+
+    return comments.filter(c => {
+        if (c.engagement) return false; // already checked
+        if (!c.verified) return false;  // unverified comments may not exist
+        const age = now - new Date(c.timestamp).getTime();
+        if (age < minAge || age > maxAge) return false;
+        if (platform && c.platform && c.platform !== platform) return false;
+        return true;
+    });
+}
+
+/**
+ * Record engagement results for a comment.
+ */
+export function updateCommentEngagement(postUrl: string, engagement: CommentEngagement): void {
+    const comments = loadComments();
+    const normalize = (url: string) => url.replace(/\/$/, '').split('?')[0].toLowerCase();
+    const target = normalize(postUrl);
+    const comment = comments.find(c => normalize(c.postUrl) === target);
+    if (comment) {
+        comment.engagement = engagement;
+        saveComments(comments);
+        logger.info(
+            `[tracker] Engagement check-back for @${comment.postUsername}: ` +
+            `${engagement.likes}L/${engagement.replies}R` +
+            (engagement.followedBack ? ' +FOLLOW' : '')
+        );
+    }
+}
+
+/**
+ * Get engagement performance summary for the last N days.
+ * Useful for learning which niches/styles generate the most engagement.
+ */
+export function getEngagementSummary(daysBack = 7): {
+    totalChecked: number;
+    avgLikes: number;
+    avgReplies: number;
+    followRate: number;
+    topPerformers: TrackedComment[];
+} {
+    const cutoff = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
+    const comments = loadComments().filter(c =>
+        c.engagement && c.timestamp >= cutoff
+    );
+
+    if (comments.length === 0) {
+        return { totalChecked: 0, avgLikes: 0, avgReplies: 0, followRate: 0, topPerformers: [] };
+    }
+
+    const totalLikes = comments.reduce((s, c) => s + (c.engagement?.likes || 0), 0);
+    const totalReplies = comments.reduce((s, c) => s + (c.engagement?.replies || 0), 0);
+    const follows = comments.filter(c => c.engagement?.followedBack).length;
+
+    // Top performers: comments that got the most engagement
+    const sorted = [...comments].sort((a, b) =>
+        ((b.engagement?.likes || 0) + (b.engagement?.replies || 0) * 3) -
+        ((a.engagement?.likes || 0) + (a.engagement?.replies || 0) * 3)
+    );
+
+    return {
+        totalChecked: comments.length,
+        avgLikes: Math.round((totalLikes / comments.length) * 100) / 100,
+        avgReplies: Math.round((totalReplies / comments.length) * 100) / 100,
+        followRate: Math.round((follows / comments.length) * 100) / 100,
+        topPerformers: sorted.slice(0, 5),
+    };
 }
 
 // ── Session logging ──────────────────────────────────────────────────
