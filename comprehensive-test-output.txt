@@ -1,0 +1,212 @@
+
+> riona-ai-agent@1.0.0 test
+> jest --maxWorkers=1 tests/integration/comprehensive-schema.test.ts
+
+  console.log
+    ≡ƒöù Connected to Supabase
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:21:17)
+
+(node:36052) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  console.log
+    
+    ≡ƒº╣ Cleaning up test data...
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:350:17)
+
+  console.log
+    Γ£à Cleanup complete
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:362:17)
+
+FAIL tests/integration/comprehensive-schema.test.ts
+  Comprehensive Schema Tests - Real Data
+    Schema Verification
+      ├ù should have all 16 core tables (20 ms)
+      ├ù should have materialized views (4 ms)
+    Data Insertion
+      ├ù should create an account (5 ms)
+      ├ù should create an Instagram user (9 ms)
+      ├ù should create an Instagram post (4 ms)
+      ΓêÜ should create a campaign (1 ms)
+      ΓêÜ should create an interaction
+      ΓêÜ should create engagement snapshot
+      ΓêÜ should create engagement tracking
+    Data Retrieval - Rankings
+      ├ù should query comments with engagement (5 ms)
+      ├ù should query top performers (4 ms)
+      ΓêÜ should get engagement snapshots for an interaction
+    Complex Queries
+      ├ù should find posts with high engagement (2 ms)
+      ΓêÜ should get account daily metrics
+      ΓêÜ should filter interactions by campaign (1 ms)
+    JSONB Queries
+      ├ù should query hashtags from posts (4 ms)
+      ├ù should query metadata from interactions (2 ms)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Schema Verification ΓÇ║ should have all 16 core tables
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      48 |             for (const table of expectedTables) {
+      49 |                 const { error } = await supabase.from(table).select('*').limit(0);
+    > 50 |                 expect(error).toBeNull();
+         |                               ^
+      51 |             }
+      52 |         });
+      53 |
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:50:31)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Schema Verification ΓÇ║ should have materialized views
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      59 |             for (const view of views) {
+      60 |                 const { error } = await supabase.from(view).select('*').limit(0);
+    > 61 |                 expect(error).toBeNull();
+         |                               ^
+      62 |             }
+      63 |         });
+      64 |     });
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:61:31)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Data Insertion ΓÇ║ should create an account
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      80 |                 .single();
+      81 |
+    > 82 |             expect(error).toBeNull();
+         |                           ^
+      83 |             expect(data).toBeTruthy();
+      84 |             testData.account_id = data?.id;
+      85 |         });
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:82:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Data Insertion ΓÇ║ should create an Instagram user
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      101 |                 .single();
+      102 |
+    > 103 |             expect(error).toBeNull();
+          |                           ^
+      104 |             expect(data).toBeTruthy();
+      105 |             testData.user_id = data?.id;
+      106 |         });
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:103:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Data Insertion ΓÇ║ should create an Instagram post
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      125 |                 .single();
+      126 |
+    > 127 |             expect(error).toBeNull();
+          |                           ^
+      128 |             expect(data).toBeTruthy();
+      129 |             testData.post_id = data?.id;
+      130 |         });
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:127:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Data Retrieval - Rankings ΓÇ║ should query comments with engagement
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      235 |                 .limit(10);
+      236 |
+    > 237 |             expect(error).toBeNull();
+          |                           ^
+      238 |             expect(Array.isArray(data)).toBe(true);
+      239 |         });
+      240 |
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:237:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Data Retrieval - Rankings ΓÇ║ should query top performers
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      250 |                 .limit(5);
+      251 |
+    > 252 |             expect(error).toBeNull();
+          |                           ^
+      253 |             expect(Array.isArray(data)).toBe(true);
+      254 |         });
+      255 |
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:252:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ Complex Queries ΓÇ║ should find posts with high engagement
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      283 |                 .limit(10);
+      284 |
+    > 285 |             expect(error).toBeNull();
+          |                           ^
+      286 |             expect(Array.isArray(data)).toBe(true);
+      287 |         });
+      288 |
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:285:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ JSONB Queries ΓÇ║ should query hashtags from posts
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      326 |                 .contains('hashtags', ['#test']);
+      327 |
+    > 328 |             expect(error).toBeNull();
+          |                           ^
+      329 |             expect(Array.isArray(data)).toBe(true);
+      330 |         });
+      331 |
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:328:27)
+
+  ΓùÅ Comprehensive Schema Tests - Real Data ΓÇ║ JSONB Queries ΓÇ║ should query metadata from interactions
+
+    expect(received).toBeNull()
+
+    Received: {"code": "PGRST301", "details": null, "hint": null, "message": "JWSError JWSInvalidSignature"}
+
+      339 |                 .limit(5);
+      340 |
+    > 341 |             expect(error).toBeNull();
+          |                           ^
+      342 |             expect(Array.isArray(data)).toBe(true);
+      343 |         });
+      344 |     });
+
+      at Object.<anonymous> (tests/integration/comprehensive-schema.test.ts:341:27)
+
+Test Suites: 1 failed, 1 total
+Tests:       10 failed, 7 passed, 17 total
+Snapshots:   0 total
+Time:        1.744 s
+Ran all test suites matching tests/integration/comprehensive-schema.test.ts.

@@ -1,0 +1,22 @@
+
+> riona-ai-agent@1.0.0 test
+> jest --maxWorkers=1 tests/integration/database.test.ts
+
+FAIL tests/integration/database.test.ts
+  ΓùÅ Test suite failed to run
+
+    tests/integration/database.test.ts:189:17 - error TS2322: Type '"test"' is not assignable to type '"comment" | "like"'.
+
+    189                 type: 'test',
+                        ~~~~
+
+      src/client/Instagram-Core.ts:134:5
+        134     type: 'comment' | 'like';
+                ~~~~
+        The expected type comes from property 'type' which is declared here on type 'BotInteraction'
+
+Test Suites: 1 failed, 1 total
+Tests:       0 total
+Snapshots:   0 total
+Time:        1.805 s
+Ran all test suites matching tests/integration/database.test.ts.

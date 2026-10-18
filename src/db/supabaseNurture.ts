@@ -1,0 +1,219 @@
+/**
+ * Supabase Nurture Sync — Fire-and-forget sync for friendship nurture data.
+ */
+
+import { SupabaseClient } from '@supabase/supabase-js';
+import { getSupabaseClient } from './supabaseClient';
+import { logger } from '../utils/logger';
+import { withRetry, formatError } from '../utils/errors';
+import {
+    NurtureProfile, InterestProfile, CheckInRecord,
+    CrossPlatformIdentity, ConversationDepthMetrics,
+} from '../types/nurture';
+import type { VRContactState } from '../nurture/vr-scheduler';
+import type { DetectedNotification } from '../client/Twitter-Notifications';
+import type { NurtureCommentResult } from '../client/Twitter-Nurture';
+
+function getClient(): SupabaseClient | null {
+    return getSupabaseClient();
+}
+
+export async function syncNurtureProfileToSupabase(profile: NurtureProfile): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await withRetry(async () => {
+            const { error } = await sb.from('nurture_profiles').upsert({
+                username: profile.username,
+                platform: profile.platform,
+                person_id: profile.personId || null,
+                tier: profile.tier,
+                tier_promoted_at: profile.tierPromotedAt || null,
+                depth_score: profile.depth.conversationQualityScore,
+                exchange_count: profile.depth.exchangeCount,
+                interest_count: profile.interests.interests.length,
+                last_check_in: profile.lastCheckIn || null,
+                next_check_in_due: profile.nextCheckInDue || null,
+                created_at: profile.createdAt,
+                metadata: {
+                    tier_history: profile.tierHistory,
+                    interest_performance: profile.interestMessagePerformance,
+                },
+            }, { onConflict: 'username,platform' });
+
+            if (error) throw error;
+        }, { maxRetries: 2, baseDelay: 1000, label: 'syncNurtureProfile' });
+    } catch (e) {
+        logger.warn(`[supabase-nurture] Profile sync failed: ${formatError(e)}`);
+    }
+}
+
+export async function syncInterestProfileToSupabase(profile: InterestProfile): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('interest_profiles').upsert({
+            username: profile.username,
+            platform: profile.platform,
+            interests: profile.interests,
+            last_updated: profile.lastUpdated,
+        }, { onConflict: 'username,platform' });
+    } catch (e) {
+        logger.warn(`[supabase-nurture] Interest sync failed: ${formatError(e)}`);
+    }
+}
+
+export async function syncCheckInToSupabase(record: CheckInRecord): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('check_in_records').insert({
+            username: record.username,
+            platform: record.platform,
+            check_in_type: record.type,
+            scheduled_for: record.scheduledFor,
+            sent_at: record.sentAt || null,
+            content_reference: record.contentReference || null,
+            message_used: record.messageUsed || null,
+            got_reply: record.gotReply || null,
+        });
+    } catch (e) {
+        logger.warn(`[supabase-nurture] Check-in sync failed: ${formatError(e)}`);
+    }
+}
+
+export async function syncCrossIdentityToSupabase(identity: CrossPlatformIdentity): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('cross_platform_identities').upsert({
+            id: identity.id,
+            twitter_handle: identity.twitterHandle || null,
+            instagram_handle: identity.instagramHandle || null,
+            linked_at: identity.linkedAt,
+            link_confidence: identity.linkConfidence,
+            link_evidence: identity.linkEvidence,
+        }, { onConflict: 'id' });
+    } catch (e) {
+        logger.warn(`[supabase-nurture] Cross-identity sync failed: ${formatError(e)}`);
+    }
+}
+
+export async function syncDepthMetricsToSupabase(metrics: ConversationDepthMetrics): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('conversation_depth_metrics').upsert({
+            username: metrics.username,
+            platform: metrics.platform,
+            avg_message_length: metrics.avgMessageLength,
+            topic_variety: metrics.topicVariety,
+            personal_disclosure_level: metrics.personalDisclosureLevel,
+            question_asking_ratio: metrics.questionAskingRatio,
+            conversation_quality_score: metrics.conversationQualityScore,
+            exchange_count: metrics.exchangeCount,
+            last_calculated: metrics.lastCalculated,
+        }, { onConflict: 'username,platform' });
+    } catch (e) {
+        logger.warn(`[supabase-nurture] Depth metrics sync failed: ${formatError(e)}`);
+    }
+}
+
+// ── VR Engagement Syncs ──────────────────────────────────────────────
+
+export async function syncNurtureCommentToSupabase(
+    result: NurtureCommentResult,
+    vrState: VRContactState,
+): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('nurture_comments').insert({
+            username: result.username,
+            platform: 'twitter',
+            tweet_url: result.tweetUrl,
+            tweet_text: result.tweetText?.slice(0, 1000),
+            comment_text: result.commentText,
+            comment_style: result.style,
+            vr_threshold: vrState.nextThreshold,
+            vr_mean_n: vrState.meanN,
+            health_at_time: vrState.health,
+            posted_at: new Date().toISOString(),
+        });
+    } catch (e) {
+        logger.debug(`[supabase-nurture] Comment sync failed (non-fatal): ${formatError(e)}`);
+    }
+}
+
+export async function syncNotificationToSupabase(notif: DetectedNotification): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        await sb.from('notification_replies').insert({
+            notification_type: notif.type,
+            from_username: notif.fromUsername,
+            our_tweet_url: notif.ourTweetUrl || null,
+            their_tweet_url: notif.theirTweetUrl || null,
+            their_text: notif.text?.slice(0, 1000),
+            detected_at: notif.detectedAt,
+            actioned: notif.actioned,
+            actioned_at: notif.actionedAt || null,
+            action_type: notif.actionType || null,
+            action_text: notif.actionText || null,
+        });
+    } catch (e) {
+        logger.debug(`[supabase-nurture] Notification sync failed (non-fatal): ${formatError(e)}`);
+    }
+}
+
+export async function syncVRSnapshotToSupabase(state: VRContactState): Promise<void> {
+    const sb = getClient();
+    if (!sb) return;
+
+    try {
+        const bestArm = state.commentBandit
+            .filter(a => a.pulls > 0)
+            .sort((a, b) => b.avgReward - a.avgReward)[0];
+
+        await sb.from('nurture_vr_snapshots').insert({
+            username: state.username,
+            platform: state.platform,
+            health: state.health,
+            mean_n: state.meanN,
+            total_comments: state.totalComments,
+            total_replies_received: state.totalRepliesReceived,
+            thinning_stage: state.thinningStage,
+            consecutive_ignored: state.consecutiveIgnored,
+            best_comment_style: bestArm?.style || null,
+            snapshot_at: new Date().toISOString(),
+        });
+    } catch (e) {
+        logger.debug(`[supabase-nurture] VR snapshot sync failed (non-fatal): ${formatError(e)}`);
+    }
+}
+
+export async function syncAllVRSnapshots(): Promise<number> {
+    try {
+        const { getAllVRStates } = await import('../nurture/vr-scheduler');
+        const states = getAllVRStates('twitter');
+        let synced = 0;
+
+        for (const state of states) {
+            await syncVRSnapshotToSupabase(state);
+            synced++;
+        }
+
+        logger.info(`[supabase-nurture] Synced ${synced} VR state snapshots`);
+        return synced;
+    } catch (e) {
+        logger.debug(`[supabase-nurture] Batch VR sync failed: ${formatError(e)}`);
+        return 0;
+    }
+}
